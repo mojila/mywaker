@@ -43,9 +43,33 @@ cost-efficient) model across your existing AI providers.
 
 ## Install
 
+Either with plain Cargo:
+
 ```bash
 cargo build --release
 ```
+
+or via the `Makefile` (`make build` + `make install`):
+
+```bash
+make build        # build the release binary
+make install      # install to a system $PATH dir (uses sudo when required)
+make install-user # install to ~/.local/bin (no root)
+make info         # show the detected platform & install path
+```
+
+`make install` picks a sensible default prefix per platform — `/opt/homebrew`
+(macOS arm64 with Homebrew), `/usr/local` (macOS Intel / Linux) — and works on
+macOS, Debian/Ubuntu, Fedora, and Arch. Override it with `PREFIX`/`DESTDIR`:
+
+```bash
+make install PREFIX=/custom/path       # install somewhere else
+make install DESTDIR=/tmp/stage        # stage for packaging
+```
+
+Distro packages are also available via `make pkg-deb` (Debian/Ubuntu),
+`make pkg-rpm` (Fedora/RHEL), and `make pkg-arch` (Arch) — run each on its
+native distro.
 
 ## Run
 

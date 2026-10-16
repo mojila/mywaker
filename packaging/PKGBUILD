@@ -1,0 +1,15 @@
+# Maintainer: mywaker contributors
+pkgname=mywaker
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Run a team of AI employees backed by OpenCode from your terminal"
+arch=('x86_64' 'aarch64')
+url="https://github.com/mojila/mywaker"
+license=('MIT')
+depends=()
+makedepends=('cargo')
+options=('!strip')
+
+package() {
+  install -Dm755 "@BIN@" "$pkgdir/usr/local/bin/mywaker"
+}

@@ -1,0 +1,11 @@
+Package: mywaker
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @DEB_ARCH@
+Maintainer: mywaker contributors
+Description: Run a team of AI employees backed by OpenCode from your terminal
+ mywaker is a Rust TUI that turns OpenCode into a roster of on-screen AI
+ employees, with an animated robot avatar and cross-provider model routing.
+Homepage: https://github.com/mojila/mywaker
+License: MIT
