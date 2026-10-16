@@ -27,7 +27,10 @@ pub enum Message {
         result: Result<SessionInfo, String>,
     },
     /// A session transcript finished loading.
-    TranscriptLoaded(Vec<SessionMessage>),
+    TranscriptLoaded {
+        employee: usize,
+        messages: Vec<SessionMessage>,
+    },
     /// A chat-local `/skill add` install finished (names of installed skills, or the error).
     SkillInstallDone {
         employee: usize,

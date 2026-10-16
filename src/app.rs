@@ -2,7 +2,7 @@ use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::Sender;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::config::Config;
@@ -41,6 +41,54 @@ pub enum TranscriptRole {
     Info,
 }
 
+/// One employee's persistent chat: the OpenCode session backing it plus the
+/// transcript and in-flight streaming text. Kept around after the user leaves
+/// the chat view so re-entering resumes the same session instead of starting a
+/// fresh one (and losing whatever the employee was mid-way through).
+#[derive(Default)]
+struct Chat {
+    /// The OpenCode session backing this chat, once created.
+    session_id: Option<String>,
+    /// True while a `create_session` request for this employee is in flight.
+    creating: bool,
+    transcript: Vec<TranscriptLine>,
+    streaming_text: String,
+}
+
+/// One entry in the chat slash-command autocomplete menu.
+#[derive(Debug, Clone, Copy)]
+pub struct CommandOption {
+    pub command: &'static str,
+    pub description: &'static str,
+    /// Whether selecting this option auto-appends a trailing space (it takes an
+    /// argument the user then types).
+    pub takes_arg: bool,
+}
+
+/// The slash commands offered by the chat completion menu, in display order.
+const CHAT_COMMANDS: &[CommandOption] = &[
+    CommandOption {
+        command: "/help",
+        description: "show chat commands",
+        takes_arg: false,
+    },
+    CommandOption {
+        command: "/skills",
+        description: "list installed skills",
+        takes_arg: false,
+    },
+    CommandOption {
+        command: "/skill add",
+        description: "install & attach a skill",
+        takes_arg: true,
+    },
+    CommandOption {
+        command: "/skill",
+        description: "attach an installed skill",
+        takes_arg: true,
+    },
+];
+
 pub struct App {
     config: Config,
     tx: Sender<Message>,
@@ -69,10 +117,12 @@ pub struct App {
 
     mode: Mode,
     chat_employee: Option<usize>,
-    chat_session_id: Option<String>,
     input: String,
-    transcript: Vec<TranscriptLine>,
-    streaming_text: String,
+    /// Per-employee chat state, keyed by roster index.
+    chats: HashMap<usize, Chat>,
+    /// Selected index in the slash-command autocomplete menu, when it is open
+    /// (i.e. the input starts with `/` and matches one or more commands).
+    command_menu: Option<usize>,
 }
 
 impl App {
@@ -102,10 +152,9 @@ impl App {
             project_selected: 0,
             mode: Mode::Roster,
             chat_employee: None,
-            chat_session_id: None,
             input: String::new(),
-            transcript: Vec::new(),
-            streaming_text: String::new(),
+            chats: HashMap::new(),
+            command_menu: None,
         }
     }
 
@@ -152,8 +201,8 @@ impl App {
             Message::SessionCreated { employee, result } => {
                 self.handle_session_created(employee, result);
             }
-            Message::TranscriptLoaded(messages) => {
-                self.handle_transcript(messages);
+            Message::TranscriptLoaded { employee, messages } => {
+                self.handle_transcript(employee, messages);
             }
             Message::SkillInstallDone { employee, result } => {
                 self.handle_skill_install_done(employee, result);
@@ -203,16 +252,122 @@ impl App {
                 KeyCode::Enter => self.select_project(),
                 _ => {}
             },
-            Mode::Chat => match key.code {
-                KeyCode::Esc => self.close_chat(),
-                KeyCode::Enter => self.send_prompt(),
-                KeyCode::Backspace => {
-                    self.input.pop();
-                }
-                KeyCode::Char(c) => self.input.push(c),
-                _ => {}
-            },
+            Mode::Chat => self.handle_chat_key(key),
         }
+    }
+
+    /// Handle a key press while in chat: slash-command menu navigation first,
+    /// then ordinary input editing.
+    fn handle_chat_key(&mut self, key: KeyEvent) {
+        let menu_open = self.command_menu.is_some();
+        match key.code {
+            KeyCode::Esc => {
+                if menu_open {
+                    // Dismiss the menu and clear the partial command.
+                    self.command_menu = None;
+                    self.input.clear();
+                } else {
+                    self.close_chat();
+                }
+            }
+            KeyCode::Up => {
+                if menu_open {
+                    self.move_command_menu(-1);
+                }
+            }
+            KeyCode::Down => {
+                if menu_open {
+                    self.move_command_menu(1);
+                }
+            }
+            KeyCode::Enter => {
+                if menu_open {
+                    self.complete_command();
+                } else {
+                    self.send_prompt();
+                }
+            }
+            KeyCode::Tab => {
+                if menu_open {
+                    self.complete_command();
+                }
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                self.sync_command_menu();
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.sync_command_menu();
+            }
+            _ => {}
+        }
+    }
+
+    // --- slash-command autocomplete ---
+
+    /// Slash commands matching the current input (independent of menu state).
+    fn matching_commands(&self) -> Vec<CommandOption> {
+        let input = self.input.trim();
+        CHAT_COMMANDS
+            .iter()
+            .filter(|opt| opt.command.starts_with(input))
+            .copied()
+            .collect()
+    }
+
+    /// The open command menu: matching options plus the selected index, or
+    /// `None` when the menu is closed.
+    pub fn command_options(&self) -> Option<(Vec<CommandOption>, usize)> {
+        let selected = self.command_menu?;
+        let options = self.matching_commands();
+        if options.is_empty() {
+            return None;
+        }
+        let selected = selected.min(options.len() - 1);
+        Some((options, selected))
+    }
+
+    /// Reconcile `command_menu` with the current input: open on a match, close
+    /// when nothing matches, and clamp the selection into range.
+    fn sync_command_menu(&mut self) {
+        let options = self.matching_commands();
+        if options.is_empty() {
+            self.command_menu = None;
+        } else {
+            let selected = self.command_menu.unwrap_or(0).min(options.len() - 1);
+            self.command_menu = Some(selected);
+        }
+    }
+
+    /// Move the open menu's selection by `delta` (wrapping).
+    fn move_command_menu(&mut self, delta: isize) {
+        let Some(selected) = self.command_menu else {
+            return;
+        };
+        let count = self.matching_commands().len();
+        if count == 0 {
+            return;
+        }
+        let next = ((selected as isize + delta).rem_euclid(count as isize)) as usize;
+        self.command_menu = Some(next);
+    }
+
+    /// Insert the highlighted command into the input and close the menu. The menu
+    /// stays closed until the next edit (so a completed `/help` isn't re-offered).
+    fn complete_command(&mut self) {
+        let Some(selected) = self.command_menu else {
+            return;
+        };
+        let options = self.matching_commands();
+        let Some(option) = options.get(selected) else {
+            return;
+        };
+        self.input = option.command.to_string();
+        if option.takes_arg {
+            self.input.push(' ');
+        }
+        self.command_menu = None;
     }
 
     // --- chat lifecycle ---
@@ -225,10 +380,27 @@ impl App {
 
         self.mode = Mode::Chat;
         self.chat_employee = Some(employee);
-        self.chat_session_id = None;
         self.input.clear();
-        self.transcript.clear();
-        self.streaming_text.clear();
+        self.command_menu = None;
+
+        let chat = self.chats.entry(employee).or_default();
+
+        // Resume the existing session. Its transcript and status are already kept
+        // current by the event stream (routed per session, not per view), so just
+        // re-enter without resetting anything.
+        if chat.session_id.is_some() {
+            return;
+        }
+
+        // A session is already being created for this employee; just wait.
+        if chat.creating {
+            self.team.set_status(employee, EmployeeStatus::Thinking);
+            return;
+        }
+
+        chat.creating = true;
+        chat.transcript.clear();
+        chat.streaming_text.clear();
         self.team.set_status(employee, EmployeeStatus::Thinking);
 
         let directory = self.workdir();
@@ -250,21 +422,28 @@ impl App {
     ) {
         match result {
             Ok(session) => {
-                self.chat_session_id = Some(session.id.clone());
+                let id = session.id.clone();
                 self.team.set_status(employee, EmployeeStatus::Idle);
-                self.push_log(format!("session {} ready", session.id));
-                self.transcript.push(TranscriptLine {
-                    role: TranscriptRole::Info,
-                    text: format!("session {} — type a task and press Enter", session.id),
-                });
+                self.push_log(format!("session {id} ready"));
+                if let Some(chat) = self.chats.get_mut(&employee) {
+                    chat.creating = false;
+                    chat.session_id = Some(id.clone());
+                    chat.transcript.push(TranscriptLine {
+                        role: TranscriptRole::Info,
+                        text: format!("session {id} — type a task and press Enter"),
+                    });
+                }
             }
             Err(err) => {
                 self.team.set_status(employee, EmployeeStatus::Error);
                 self.push_log(format!("session failed: {err}"));
-                self.transcript.push(TranscriptLine {
-                    role: TranscriptRole::Error,
-                    text: err,
-                });
+                if let Some(chat) = self.chats.get_mut(&employee) {
+                    chat.creating = false;
+                    chat.transcript.push(TranscriptLine {
+                        role: TranscriptRole::Error,
+                        text: err,
+                    });
+                }
             }
         }
     }
@@ -275,6 +454,7 @@ impl App {
             return;
         }
         self.input.clear();
+        self.command_menu = None;
 
         // Chat-local slash commands are handled here and never sent to the
         // OpenCode session (e.g. `/skill add <source>`).
@@ -282,19 +462,25 @@ impl App {
             return;
         }
 
-        let Some(session_id) = self.chat_session_id.clone() else {
-            self.push_log("no active session".to_string());
-            return;
-        };
         let Some(employee) = self.chat_employee else {
             return;
         };
+        let Some(session_id) = self
+            .chats
+            .get(&employee)
+            .and_then(|chat| chat.session_id.clone())
+        else {
+            self.push_log("no active session".to_string());
+            return;
+        };
 
-        self.transcript.push(TranscriptLine {
-            role: TranscriptRole::User,
-            text: text.clone(),
-        });
-        self.streaming_text.clear();
+        if let Some(chat) = self.chats.get_mut(&employee) {
+            chat.transcript.push(TranscriptLine {
+                role: TranscriptRole::User,
+                text: text.clone(),
+            });
+            chat.streaming_text.clear();
+        }
         self.team.set_status(employee, EmployeeStatus::Thinking);
 
         let client = match self.client.clone() {
@@ -319,22 +505,16 @@ impl App {
 
         // `/skills` — list installed skill names into the transcript.
         if rest == "skills" {
-            self.transcript.push(TranscriptLine {
-                role: TranscriptRole::Info,
-                text: format!("⚡ {text}"),
-            });
+            self.push_transcript_line(TranscriptRole::Info, format!("⚡ {text}"));
             let names = crate::skills::installed();
             if names.is_empty() {
-                self.transcript.push(TranscriptLine {
-                    role: TranscriptRole::Info,
-                    text: "no skills installed for this project".to_string(),
-                });
+                self.push_transcript_line(
+                    TranscriptRole::Info,
+                    "no skills installed for this project".to_string(),
+                );
             } else {
                 for name in names {
-                    self.transcript.push(TranscriptLine {
-                        role: TranscriptRole::Info,
-                        text: format!("  • {name}"),
-                    });
+                    self.push_transcript_line(TranscriptRole::Info, format!("  • {name}"));
                 }
             }
             return true;
@@ -350,10 +530,7 @@ impl App {
                 self.push_transcript_error("no employee selected".to_string());
                 return true;
             };
-            self.transcript.push(TranscriptLine {
-                role: TranscriptRole::Info,
-                text: format!("⚡ /skill add {source}"),
-            });
+            self.push_transcript_line(TranscriptRole::Info, format!("⚡ /skill add {source}"));
             self.spawn_skill_install(employee, source.to_string());
             return true;
         }
@@ -370,11 +547,11 @@ impl App {
 
         // `/help` — show the chat-local commands.
         if rest == "help" {
-            self.transcript.push(TranscriptLine {
-                role: TranscriptRole::Info,
-                text: "chat commands:\n  /skill add <source>  install & attach a skill\n  /skill <name>        attach an installed skill\n  /skills              list installed skills"
+            self.push_transcript_line(
+                TranscriptRole::Info,
+                "chat commands:\n  /skill add <source>  install & attach a skill\n  /skill <name>        attach an installed skill\n  /skills              list installed skills"
                     .to_string(),
-            });
+            );
             return true;
         }
 
@@ -396,7 +573,11 @@ impl App {
         let names = match result {
             Ok(names) => names,
             Err(err) => {
-                self.push_transcript_error(format!("skill install failed: {err}"));
+                self.push_to_chat(
+                    employee,
+                    TranscriptRole::Error,
+                    format!("skill install failed: {err}"),
+                );
                 return;
             }
         };
@@ -410,7 +591,11 @@ impl App {
         let employee_id = self.team.employees().get(employee).map(|e| e.id.clone());
 
         let Some(employee_id) = employee_id else {
-            self.push_transcript_error("no such employee".to_string());
+            self.push_to_chat(
+                employee,
+                TranscriptRole::Error,
+                "no such employee".to_string(),
+            );
             return;
         };
 
@@ -418,41 +603,37 @@ impl App {
         for name in &names {
             match self.team.add_skill(&employee_id, name) {
                 Ok(()) => attached.push(name.clone()),
-                Err(err) => self.push_transcript_error(err),
+                Err(err) => self.push_to_chat(employee, TranscriptRole::Error, err),
             }
         }
 
         if let Err(err) = self.persist_team() {
-            self.push_transcript_error(format!("saving team failed: {err}"));
+            self.push_to_chat(
+                employee,
+                TranscriptRole::Error,
+                format!("saving team failed: {err}"),
+            );
             return;
         }
 
-        if attached.len() == 1 {
-            self.transcript.push(TranscriptLine {
-                role: TranscriptRole::Info,
-                text: format!(
-                    "✓ installed & attached '{}' to {employee_name}",
-                    attached[0]
-                ),
-            });
+        let summary = if attached.len() == 1 {
+            format!(
+                "✓ installed & attached '{}' to {employee_name}",
+                attached[0]
+            )
         } else {
-            self.transcript.push(TranscriptLine {
-                role: TranscriptRole::Info,
-                text: format!(
-                    "✓ installed & attached {} skills ({}) to {employee_name}",
-                    attached.len(),
-                    attached.join(", ")
-                ),
-            });
-        }
+            format!(
+                "✓ installed & attached {} skills ({}) to {employee_name}",
+                attached.len(),
+                attached.join(", ")
+            )
+        };
+        self.push_to_chat(employee, TranscriptRole::Info, summary);
     }
 
     /// Attach an already-installed skill (by name) to the current employee.
     fn attach_skill(&mut self, name: String) {
-        self.transcript.push(TranscriptLine {
-            role: TranscriptRole::Info,
-            text: format!("⚡ /skill {name}"),
-        });
+        self.push_transcript_line(TranscriptRole::Info, format!("⚡ /skill {name}"));
 
         let Some(employee) = self.chat_employee else {
             self.push_transcript_error("no employee selected".to_string());
@@ -477,10 +658,10 @@ impl App {
             return;
         }
 
-        self.transcript.push(TranscriptLine {
-            role: TranscriptRole::Info,
-            text: format!("✓ attached '{name}' to {employee_name}"),
-        });
+        self.push_transcript_line(
+            TranscriptRole::Info,
+            format!("✓ attached '{name}' to {employee_name}"),
+        );
     }
 
     /// Persist the roster to its default location.
@@ -490,26 +671,59 @@ impl App {
         self.team.save(&path)
     }
 
-    /// Push an error line into the chat transcript.
+    /// The currently-viewed employee's chat, if any.
+    fn current_chat(&self) -> Option<&Chat> {
+        self.chat_employee
+            .and_then(|employee| self.chats.get(&employee))
+    }
+
+    fn current_chat_mut(&mut self) -> Option<&mut Chat> {
+        self.chat_employee
+            .and_then(|employee| self.chats.get_mut(&employee))
+    }
+
+    /// The employee whose chat is backed by `session_id`, if any.
+    fn employee_for_session(&self, session_id: &str) -> Option<usize> {
+        self.chats.iter().find_map(|(&employee, chat)| {
+            (chat.session_id.as_deref() == Some(session_id)).then_some(employee)
+        })
+    }
+
+    /// Push a line into the currently-viewed chat's transcript.
+    fn push_transcript_line(&mut self, role: TranscriptRole, text: String) {
+        if let Some(chat) = self.current_chat_mut() {
+            chat.transcript.push(TranscriptLine { role, text });
+        }
+    }
+
+    /// Push an error line into the currently-viewed chat's transcript.
     fn push_transcript_error(&mut self, message: String) {
-        self.transcript.push(TranscriptLine {
-            role: TranscriptRole::Error,
-            text: message,
-        });
+        self.push_transcript_line(TranscriptRole::Error, message);
+    }
+
+    /// Push a line into a specific employee's chat transcript (regardless of the
+    /// current view), so async results land in the right conversation.
+    fn push_to_chat(&mut self, employee: usize, role: TranscriptRole, text: String) {
+        if let Some(chat) = self.chats.get_mut(&employee) {
+            chat.transcript.push(TranscriptLine { role, text });
+        }
     }
 
     fn close_chat(&mut self) {
         self.mode = Mode::Roster;
         self.chat_employee = None;
-        self.chat_session_id = None;
         self.input.clear();
-        self.transcript.clear();
-        self.streaming_text.clear();
+        self.command_menu = None;
+        // Leave the chat state (session + transcript) intact so re-entering the
+        // same employee resumes the conversation instead of starting fresh.
     }
 
-    fn handle_transcript(&mut self, messages: Vec<SessionMessage>) {
-        self.transcript = build_transcript(&messages);
-        self.streaming_text.clear();
+    fn handle_transcript(&mut self, employee: usize, messages: Vec<SessionMessage>) {
+        let Some(chat) = self.chats.get_mut(&employee) else {
+            return;
+        };
+        chat.transcript = build_transcript(&messages);
+        chat.streaming_text.clear();
 
         let final_status = messages
             .iter()
@@ -524,9 +738,7 @@ impl App {
             })
             .unwrap_or(EmployeeStatus::Idle);
 
-        if let Some(employee) = self.chat_employee {
-            self.team.set_status(employee, final_status);
-        }
+        self.team.set_status(employee, final_status);
 
         // Fall back across providers when a source reports budget exhaustion.
         let mut newly = false;
@@ -543,53 +755,43 @@ impl App {
         }
     }
 
-    /// Route a streamed OpenCode event into the active chat transcript/status.
+    /// Route a streamed OpenCode event into the owning employee's chat
+    /// transcript and status, keyed by the event's session id so output keeps
+    /// streaming even while the user is on the roster or in another chat.
     fn handle_stream_event(&mut self, event: &Event) {
-        if self.chat_session_id.is_none() {
+        let Some(session_id) = event.session_id() else {
             return;
-        }
-        let active = self.chat_session_id.as_deref().expect("checked above");
-        // Single active conversation: route events that name our session, or that
-        // carry no session id at all (some lifecycle events don't).
-        if let Some(sid) = event.session_id()
-            && sid != active
-        {
+        };
+        let Some(employee) = self.employee_for_session(session_id) else {
             return;
-        }
+        };
 
         match event.event_type.as_str() {
-            "session.reasoning.started" => self.set_chat_status(EmployeeStatus::Thinking),
-            "session.execution.started" => self.set_chat_status(EmployeeStatus::Working),
+            "session.reasoning.started" => self.team.set_status(employee, EmployeeStatus::Thinking),
+            "session.execution.started" => self.team.set_status(employee, EmployeeStatus::Working),
             "session.text.delta" | "message.part.delta" => {
-                if let Some(delta) = event.text_delta() {
-                    self.streaming_text.push_str(delta);
+                if let Some(delta) = event.text_delta()
+                    && let Some(chat) = self.chats.get_mut(&employee)
+                {
+                    chat.streaming_text.push_str(delta);
                 }
             }
             "session.execution.succeeded" => {
-                self.set_chat_status(EmployeeStatus::Done);
-                self.load_transcript();
+                self.team.set_status(employee, EmployeeStatus::Done);
+                self.load_transcript(employee, session_id.to_string());
             }
             "session.execution.failed" | "session.step.failed" => {
-                self.set_chat_status(EmployeeStatus::Error);
+                self.team.set_status(employee, EmployeeStatus::Error);
                 if let Some(reason) = event.error_message() {
                     self.push_log(reason.to_string());
                 }
-                self.load_transcript();
+                self.load_transcript(employee, session_id.to_string());
             }
             _ => {}
         }
     }
 
-    fn set_chat_status(&mut self, status: EmployeeStatus) {
-        if let Some(employee) = self.chat_employee {
-            self.team.set_status(employee, status);
-        }
-    }
-
-    fn load_transcript(&mut self) {
-        let Some(session_id) = self.chat_session_id.clone() else {
-            return;
-        };
+    fn load_transcript(&mut self, employee: usize, session_id: String) {
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -597,7 +799,9 @@ impl App {
         tokio::spawn(async move {
             match client.messages(&session_id).await {
                 Ok(messages) => {
-                    let _ = tx.send(Message::TranscriptLoaded(messages)).await;
+                    let _ = tx
+                        .send(Message::TranscriptLoaded { employee, messages })
+                        .await;
                 }
                 Err(err) => {
                     let _ = tx
@@ -744,11 +948,14 @@ impl App {
     }
 
     pub fn transcript(&self) -> &[TranscriptLine] {
-        &self.transcript
+        static EMPTY: &[TranscriptLine] = &[];
+        self.current_chat()
+            .map_or(EMPTY, |chat| chat.transcript.as_slice())
     }
 
     pub fn streaming_text(&self) -> &str {
-        &self.streaming_text
+        self.current_chat()
+            .map_or("", |chat| chat.streaming_text.as_str())
     }
 
     pub fn projects(&self) -> &[Project] {
@@ -927,7 +1134,7 @@ mod tests {
     fn open_chat(app: &mut App, employee: usize) {
         app.mode = Mode::Chat;
         app.chat_employee = Some(employee);
-        app.chat_session_id = Some("ses_1".into());
+        app.chats.entry(employee).or_default().session_id = Some("ses_1".into());
     }
 
     #[test]
@@ -943,14 +1150,90 @@ mod tests {
             "message.part.delta",
             serde_json::json!({"sessionID":"ses_1","delta":"lo"}),
         ));
-        assert_eq!(app.streaming_text, "Hello");
+        assert_eq!(app.streaming_text(), "Hello");
 
         // A delta for a different session is ignored.
         app.handle_stream_event(&event(
             "session.text.delta",
             serde_json::json!({"sessionID":"ses_9","delta":"x"}),
         ));
-        assert_eq!(app.streaming_text, "Hello");
+        assert_eq!(app.streaming_text(), "Hello");
+    }
+
+    #[test]
+    fn streams_to_owning_employee_even_when_not_viewed() {
+        let (mut app, _rx) = make_app();
+        // The user is viewing employee 0; employee 1 has its own session.
+        open_chat(&mut app, 0);
+        app.chats.entry(1).or_default().session_id = Some("ses_2".into());
+
+        app.handle_stream_event(&event(
+            "session.text.delta",
+            serde_json::json!({"sessionID":"ses_2","delta":"hi from 1"}),
+        ));
+
+        // The viewed employee 0 is untouched; employee 1's chat got the delta.
+        assert_eq!(app.streaming_text(), "");
+        assert_eq!(app.chats[&1].streaming_text, "hi from 1");
+
+        // Status transitions also route to the owning employee, not the viewer.
+        app.handle_stream_event(&event(
+            "session.execution.started",
+            serde_json::json!({"sessionID":"ses_2"}),
+        ));
+        assert_eq!(app.team.employees()[1].status, EmployeeStatus::Working);
+        assert_eq!(app.team.employees()[0].status, EmployeeStatus::Idle);
+    }
+
+    #[test]
+    fn slash_menu_filters_navigates_and_completes() {
+        let (mut app, _rx) = make_app();
+        open_chat(&mut app, 0);
+
+        // Typing '/' opens the menu with all four commands.
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        let (options, selected) = app.command_options().expect("menu open");
+        assert_eq!(options.len(), 4);
+        assert_eq!(options[selected].command, "/help");
+
+        // Typing 's' narrows to the three '/s*' commands.
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let (options, selected) = app.command_options().expect("menu open");
+        assert_eq!(options.len(), 3);
+        assert_eq!(selected, 0);
+        assert_eq!(options[0].command, "/skills");
+
+        // Three downs wrap back to the first option.
+        for _ in 0..3 {
+            app.handle_chat_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let (_, selected) = app.command_options().unwrap();
+        assert_eq!(selected, 0);
+
+        // Enter inserts the highlighted command and closes the menu.
+        app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input, "/skills");
+        assert!(app.command_options().is_none());
+        assert!(app.command_menu.is_none());
+    }
+
+    #[test]
+    fn slash_command_completion_appends_arg_space() {
+        let (mut app, _rx) = make_app();
+        open_chat(&mut app, 0);
+
+        for c in "/skill add".chars() {
+            app.handle_chat_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        // input "/skill add" matches only itself.
+        let (options, selected) = app.command_options().unwrap();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[selected].command, "/skill add");
+
+        // Completing an arg-taking command appends a trailing space for the arg.
+        app.handle_chat_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input, "/skill add ");
+        assert!(app.command_menu.is_none());
     }
 
     #[test]
@@ -993,12 +1276,12 @@ mod tests {
             ]}))
             .unwrap();
 
-        app.handle_transcript(response.data);
+        app.handle_transcript(2, response.data);
 
         assert_eq!(app.team.employees()[2].status, EmployeeStatus::Done);
-        assert_eq!(app.transcript.len(), 2);
-        assert_eq!(app.transcript[0].role, TranscriptRole::User);
-        assert_eq!(app.transcript[1].text, "hello world");
+        assert_eq!(app.transcript().len(), 2);
+        assert_eq!(app.transcript()[0].role, TranscriptRole::User);
+        assert_eq!(app.transcript()[1].text, "hello world");
     }
 
     #[test]
@@ -1087,12 +1370,25 @@ mod tests {
     fn renders_in_chat_mode() {
         let (mut app, _rx) = make_app();
         open_chat(&mut app, 0);
-        app.transcript.push(TranscriptLine {
+        let chat = app.chats.get_mut(&0).unwrap();
+        chat.transcript.push(TranscriptLine {
             role: TranscriptRole::User,
             text: "hi".into(),
         });
-        app.streaming_text = "wor".into();
+        chat.streaming_text = "wor".into();
         app.input = "reply".into();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    }
+
+    #[test]
+    fn renders_slash_command_menu_without_panicking() {
+        let (mut app, _rx) = make_app();
+        open_chat(&mut app, 0);
+        app.input = "/s".into();
+        app.command_menu = Some(1);
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
