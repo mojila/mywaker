@@ -60,10 +60,14 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config, tx: Sender<Message>) -> Self {
+        Self::with_team(config, tx, Team::starter())
+    }
+
+    pub fn with_team(config: Config, tx: Sender<Message>, team: Team) -> Self {
         Self {
             config,
             tx,
-            team: Team::starter(),
+            team,
             selected: 0,
             client: None,
             server_info: None,

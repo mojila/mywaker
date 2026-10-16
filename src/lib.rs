@@ -14,6 +14,7 @@ pub mod kenari;
 pub mod logging;
 pub mod message;
 pub mod opencode;
+pub mod skills;
 pub mod team;
 pub mod tui;
 pub mod ui;

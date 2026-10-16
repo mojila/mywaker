@@ -56,11 +56,17 @@ fn employee_line(index: usize, employee: &Employee) -> Line<'static> {
             format!(" · {}", employee.model.as_deref().unwrap_or("default")),
             Color::Gray,
         ),
-        Span::styled(
-            format!(" · onboard {}", employee.onboarded),
-            Color::DarkGray,
-        ),
     ];
+    if !employee.skills.is_empty() {
+        spans.push(Span::styled(
+            format!(" · #{}", employee.skills.join(",")),
+            Color::DarkGray,
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" · onboard {}", employee.onboarded),
+        Color::DarkGray,
+    ));
     if let Some(task) = &employee.current_task {
         spans.push(Span::styled(format!(" · {task}"), Color::DarkGray));
     }

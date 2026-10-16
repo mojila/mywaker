@@ -79,6 +79,26 @@ cargo run -- models  # route each employee to its best model
 cargo run -- route "research the best async runtime"  # pick a model for a task
 ```
 
+## Manage employees & skills
+
+The roster is persisted to `team.toml` (under your config dir) and used by both
+the TUI and the CLI.
+
+```bash
+# employees
+mywaker employee list
+mywaker employee add qa -n Quinn -r Tester -m openai/gpt-6-luna-pro
+mywaker employee set qa --role "QA lead"
+mywaker employee skill qa playwright     # attach an installed skill
+mywaker employee unskill qa playwright   # detach a skill
+mywaker employee rm qa
+
+# skills (delegates to `npx skills`)
+mywaker skills find react testing        # search the ecosystem (interactive)
+mywaker skills list                      # list installed skills
+mywaker skills add vercel-labs/agent-skills@react-best-practices -g  # install
+```
+
 ## Controls
 
 | Key | Action |
