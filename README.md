@@ -31,10 +31,10 @@ cost-efficient) model across your existing AI providers.
   works, and wraps up in real time as streaming deltas arrive.
 - **Chat & live streaming** — talk to an employee and watch the response stream
   in over SSE, edge-cased to the parts OpenCode actually emits.
-- **Cross-provider model routing** — a built-in router reads Kenari's public
-  catalog plus your existing OpenCode providers, normalizes them, and scores
-  every model by capability vs. cost. Task complexity (simple → cheap,
-  hard → top-tier) and employee role set the budget band.
+- **Cross-provider model routing** — a provider-agnostic router merges Kenari's
+  public catalog with your existing OpenCode providers, normalizes them, and
+  scores every model by capability vs. cost. Task role and complexity are
+  inferred locally (no provider dependency); simple → cheap, hard → top-tier.
 
 ## Requirements
 
@@ -110,9 +110,9 @@ mywaker skills add vercel-labs/agent-skills@react-best-practices -g  # install
 
 ## Cross-provider routing
 
-The router (`src/kenari/`) merges models from **Kenari's public catalog**
-(`GET /v1/models`, IDR pricing) and your **existing OpenCode providers**
-(`GET /api/model`, USD → IDR) into one normalized list. It filters to
+The provider-agnostic router (`src/route/`) merges models from **Kenari's
+public catalog** (`GET /v1/models`, IDR pricing) and your **existing OpenCode
+providers** (`GET /api/model`, USD → IDR) into one normalized list. It filters to
 chat-capable tool-using models and ranks them on a weighted score that balances
 capability (provider tier + reasoning + context + vision) against cost:
 
@@ -123,6 +123,23 @@ Bruno (writer)   → openai/gpt-6-luna-pro      [openai]    — writer/medium: r
 Cleo (reviewer)  → openai/gpt-6-luna-pro      [openai]    — reviewer/medium: reasoning, vision · Rp1600/1M in
 Dex (planner)    → anthropic/claude-opus-5.5 [anthropic] — planner/medium: reasoning, vision · Rp64000/1M in
 ```
+
+### Optional Jev classifier
+
+Task classification is a local heuristic (provider-agnostic). As an *option*, you
+can point a Jev (System One) classifier at any compatible endpoint from
+`~/.config/mywaker/config.toml`:
+
+```toml
+[jev]
+endpoint = "https://kenari.id/v1/systemone"   # any System One-compatible endpoint
+model = "jev-1-13-free"                        # decision model id
+api_key = "kn-…"                               # or leave unset to use KENARI_API_KEY
+```
+
+`endpoint`, `model`, and `api_key` are all optional and default to Kenari's public
+endpoint; they can also be set via `MYWAKER_JEV_ENDPOINT`, `MYWAKER_JEV_MODEL`, and
+`MYWAKER_JEV_API_KEY`. With no API key available, Jev is simply disabled.
 
 ## Architecture
 

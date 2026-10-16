@@ -32,10 +32,12 @@ mywaker/
     ├── config.rs             load ~/.config/mywaker/config.toml (tick_rate)
     ├── logging.rs            tracing → file
     ├── team.rs               Employee/roster model (maps to OpenCode agents)
-    ├── kenari/
-    │   ├── mod.rs            client (GET /v1/models) + route_roster
+    ├── route/                cross-provider router (provider-agnostic)
+    │   ├── mod.rs            orchestration (gather_candidates, route_roster, auto_route)
     │   ├── models.rs         serde types (ModelInfo, Pricing, Modalities)
-    │   └── router.rs         Role, RoleProfile, Router, ModelChoice
+    │   ├── router.rs         Role, TaskComplexity, Router, ModelChoice, TaskClass
+    │   ├── sources.rs        OpenCode provider model → ModelInfo adapter
+    │   └── kenari.rs         Kenari adapter: catalog client + optional Jev classifier
     ├── task.rs               (planned M6) Task model, queue, retry, state machine
     ├── persistence.rs        (planned M6) JSON store (tasks, memory)
     ├── scheduler.rs          (planned M7) cron → dispatch events
@@ -261,10 +263,14 @@ load (serde `deny_unknown_fields`).
 
 ---
 
-## 9. Kenari model router (`src/kenari/`)
+## 9. Cross-provider model router (`src/route/`)
 
-`mywaker` routes each employee to a **Kenari** model (LLM gateway, billed in IDR)
-chosen live from the catalog rather than hardcoding ids.
+`mywaker` routes each employee to the best model across **providers** — Kenari's
+catalog plus the user's existing OpenCode providers (OpenRouter, Clario, local
+MLX, …) — chosen live rather than hardcoding ids. The router is
+provider-agnostic: every model is normalized into a single `ModelInfo` shape
+and scored the same way regardless of which gateway it came from, and task
+classification is a local heuristic (no network, no provider dependency).
 
 - **Catalog** — `GET https://kenari.id/v1/models` (public, no API key) returns
   `{ object:"list", data:[…] }`. Per model: `id`, `owned_by` (provider),
@@ -304,13 +310,17 @@ chosen live from the catalog rather than hardcoding ids.
   quality, execution roles stay cheap). Weights/caps are tunable in
   `RoleProfile::for_role`/`for_task`.
 
-- **Auto-route** — `kenari::auto_route(goal)` fetches the catalog, infers role +
-  complexity from the description, and returns the top pick; `Router::auto_route`
-  does the same over an already-fetched model list.
+- **Auto-route** — `route::auto_route(goal)` gathers candidates and classifies the
+  task in one step; the classification is `TaskClass::infer(goal)`, a local
+  heuristic (`Role::from_goal` + `TaskComplexity::infer`) with **no network or
+  provider dependency**. `Router::auto_route` does the same over an
+  already-fetched model list. Kenari's Jev (System One) classifier survives as an
+  *optional* adapter (`route::kenari::JevClient`) a caller may overlay out of
+  band — it is **not** on the default routing path.
 
-- **Wiring** — `KenariClient::list_models()` (needs reqwest `rustls`; added in this
-  milestone so the client speaks HTTPS) and `route_roster(employees)` glue the results
-  to the roster. The TUI assigns on `AgentsLoaded` (`Message::ModelsAssigned`) so each
+- **Wiring** — `KenariClient::list_models()` (`route::kenari`, needs reqwest
+  `rustls`; added in this milestone so the client speaks HTTPS) and
+  `route_roster(employees)` glue the results to the roster. The TUI assigns on `AgentsLoaded` (`Message::ModelsAssigned`) so each
   employee's `model` shows in the dashboard; `mywaker models` prints the live routing
   and `mywaker route "<task>"` prints the auto-route for a task description, both
   without starting the TUI.
