@@ -22,6 +22,12 @@ pub struct ModelInfo {
     pub owned_by: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// Routing provenance: which gateway/provider this model was sourced from
+    /// (e.g. `"kenari"`, `"openrouter"`, `"clario"`, `"mlx"`). `"kenari"` for
+    /// the native catalog. Drives the budget fallback — an exhausted gateway is
+    /// skipped as a whole.
+    #[serde(default = "default_source")]
+    pub source: String,
     #[serde(default)]
     pub context_length: Option<u64>,
     #[serde(default)]
@@ -105,6 +111,11 @@ impl ModelInfo {
 
 fn micro_to_idr(micro: u64) -> u64 {
     micro / 1_000_000
+}
+
+/// Default routing source: the native Kenari catalog.
+fn default_source() -> String {
+    "kenari".to_string()
 }
 
 /// Accepted/rejected input & output modalities.

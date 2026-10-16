@@ -2,7 +2,7 @@
 //! `GET /api/model`) into the router's normalized [`ModelInfo`] shape, so
 //! [`super::auto_route`] can rank across providers — not just Kenari's catalog.
 
-use crate::kenari::models::{Modalities, ModelInfo, Pricing};
+use super::models::{Modalities, ModelInfo, Pricing};
 use crate::opencode::models::ProviderModel;
 
 /// Assumed FX rate for normalizing OpenCode provider costs (USD per 1M tokens)
@@ -67,6 +67,10 @@ pub fn from_provider_model(model: &ProviderModel) -> Option<ModelInfo> {
         object: Some("model".to_string()),
         owned_by: Some(model.vendor()),
         name: Some(model.name.clone().unwrap_or_else(|| model.id.clone())),
+        source: model
+            .provider_id
+            .clone()
+            .unwrap_or_else(|| "opencode".to_string()),
         context_length: model.context_length(),
         max_output_tokens: model.limit.as_ref().and_then(|l| l.output),
         endpoints: vec!["chat".to_string()],

@@ -2,10 +2,14 @@ use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::Sender;
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use crate::config::Config;
 use crate::event::EventHandler;
 use crate::message::Message;
 use crate::opencode::{AgentInfo, Event, OpenCode, ServerInfo, SessionMessage};
+use crate::projects::{self, Project};
 use crate::team::{EmployeeStatus, Team, move_selection};
 use crate::tui::Tui;
 use crate::ui;
@@ -18,6 +22,7 @@ const LOG_LIMIT: usize = 64;
 pub enum Mode {
     Roster,
     Chat,
+    Projects,
 }
 
 /// A rendered conversation line.
@@ -43,12 +48,23 @@ pub struct App {
     client: Option<OpenCode>,
     server_info: Option<ServerInfo>,
     agents: Vec<AgentInfo>,
+    /// Providers (sources) that hit a budget/quota limit; skipped on re-route.
+    exhausted_sources: HashSet<String>,
     connection_error: Option<String>,
     event_count: u64,
     last_event: Option<String>,
     log: Vec<String>,
     frame: u64,
     should_quit: bool,
+
+    /// Projects discovered under the projects root (refreshed on entry).
+    projects: Vec<Project>,
+    /// The directories scanned for projects (refreshed alongside `projects`).
+    project_roots: Vec<PathBuf>,
+    /// The project currently selected as the session working directory.
+    active_project: Option<Project>,
+    /// Selection index in the project-picker list.
+    project_selected: usize,
 
     mode: Mode,
     chat_employee: Option<usize>,
@@ -72,12 +88,17 @@ impl App {
             client: None,
             server_info: None,
             agents: Vec::new(),
+            exhausted_sources: HashSet::new(),
             connection_error: None,
             event_count: 0,
             last_event: None,
             log: vec!["connecting to OpenCode…".into()],
             frame: 0,
             should_quit: false,
+            projects: Vec::new(),
+            project_roots: Vec::new(),
+            active_project: None,
+            project_selected: 0,
             mode: Mode::Roster,
             chat_employee: None,
             chat_session_id: None,
@@ -138,7 +159,7 @@ impl App {
                 for (index, model) in assigned {
                     self.team.set_model(index, model);
                 }
-                self.push_log(format!("routed {count} employees to Kenari models"));
+                self.push_log(format!("routed {count} employees to models"));
             }
             Message::Log(line) => self.push_log(line),
             Message::Quit => self.should_quit = true,
@@ -162,6 +183,20 @@ impl App {
                     self.selected = move_selection(self.selected, 1, self.team.len());
                 }
                 KeyCode::Enter => self.start_chat(self.selected),
+                KeyCode::Char('p') | KeyCode::Char('P') => self.open_projects(),
+                _ => {}
+            },
+            Mode::Projects => match key.code {
+                KeyCode::Esc => self.mode = Mode::Roster,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.project_selected =
+                        move_selection(self.project_selected, -1, self.projects.len());
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.project_selected =
+                        move_selection(self.project_selected, 1, self.projects.len());
+                }
+                KeyCode::Enter => self.select_project(),
                 _ => {}
             },
             Mode::Chat => match key.code {
@@ -293,6 +328,20 @@ impl App {
         if let Some(employee) = self.chat_employee {
             self.team.set_status(employee, final_status);
         }
+
+        // Fall back across providers when a source reports budget exhaustion.
+        let mut newly = false;
+        for source in exhausted_sources_in(&messages) {
+            if self.exhausted_sources.insert(source.clone()) {
+                self.push_log(format!(
+                    "budget exhausted on provider '{source}' — falling back"
+                ));
+                newly = true;
+            }
+        }
+        if newly {
+            self.route_team_models();
+        }
     }
 
     /// Route a streamed OpenCode event into the active chat transcript/status.
@@ -360,13 +409,15 @@ impl App {
         });
     }
 
-    /// Kick off a background Kenari fetch that routes each employee to a model,
-    /// then assigns the results back through the event channel.
+    /// Kick off a background cross-provider fetch that routes each employee to a
+    /// model (skipping budget-exhausted sources), then assigns the results back
+    /// through the event channel.
     fn route_team_models(&self) {
         let roster = self.team.employees().to_vec();
+        let exhausted = self.exhausted_sources.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            match crate::kenari::route_roster(&roster).await {
+            match crate::route::route_roster_excluding(&roster, &exhausted).await {
                 Ok(selections) => {
                     let assigned: Vec<(usize, String)> = selections
                         .into_iter()
@@ -379,7 +430,7 @@ impl App {
                 }
                 Err(err) => {
                     let _ = tx
-                        .send(Message::Log(format!("kenari route failed: {err}")))
+                        .send(Message::Log(format!("model route failed: {err}")))
                         .await;
                 }
             }
@@ -387,12 +438,48 @@ impl App {
     }
 
     fn workdir(&self) -> String {
+        if let Some(project) = &self.active_project {
+            return project.path.to_string_lossy().into_owned();
+        }
         self.config
             .workdir
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .to_string_lossy()
-            .to_string()
+            .into_owned()
+    }
+
+    // --- project discovery ---
+
+    /// Refresh the project list and open the picker, starting on the active
+    /// project (if it is still present).
+    fn open_projects(&mut self) {
+        self.project_roots = projects::scan_roots();
+        self.projects = projects::discover_all().unwrap_or_default();
+        self.project_selected = self
+            .active_project
+            .as_ref()
+            .and_then(|active| self.projects.iter().position(|p| p.path == active.path))
+            .unwrap_or(0);
+        if self.projects.is_empty() {
+            let roots = self
+                .project_roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.push_log(format!("no projects under {roots}"));
+        }
+        self.mode = Mode::Projects;
+    }
+
+    /// Adopt the highlighted project as the session working directory.
+    fn select_project(&mut self) {
+        if let Some(project) = self.projects.get(self.project_selected).cloned() {
+            self.push_log(format!("project → {}", project.name));
+            self.active_project = Some(project);
+        }
+        self.mode = Mode::Roster;
     }
 
     fn push_log(&mut self, line: String) {
@@ -435,6 +522,22 @@ impl App {
 
     pub fn streaming_text(&self) -> &str {
         &self.streaming_text
+    }
+
+    pub fn projects(&self) -> &[Project] {
+        &self.projects
+    }
+
+    pub fn project_roots(&self) -> &[PathBuf] {
+        &self.project_roots
+    }
+
+    pub fn active_project(&self) -> Option<&Project> {
+        self.active_project.as_ref()
+    }
+
+    pub fn project_selected(&self) -> usize {
+        self.project_selected
     }
 
     pub fn chat_employee_name(&self) -> Option<&str> {
@@ -492,6 +595,26 @@ fn build_transcript(messages: &[SessionMessage]) -> Vec<TranscriptLine> {
             TranscriptLine { role, text }
         })
         .collect()
+}
+
+/// Providers (by `model.providerID`) that reported a budget/quota exhaustion in
+/// this transcript. These become fallback exclusions on the next re-route.
+fn exhausted_sources_in(messages: &[SessionMessage]) -> HashSet<String> {
+    let mut sources = HashSet::new();
+    for message in messages {
+        if message
+            .error
+            .as_ref()
+            .is_some_and(|e| e.is_budget_exhausted())
+            && let Some(source) = message
+                .model
+                .as_ref()
+                .and_then(|m| m.provider_id.as_deref())
+        {
+            sources.insert(source.to_string());
+        }
+    }
+    sources
 }
 
 /// Connect to OpenCode and forward live events + status to the app channel.
@@ -643,6 +766,41 @@ mod tests {
     }
 
     #[test]
+    fn budget_error_excludes_provider_source() {
+        use crate::opencode::models::{MessageError, ModelRef, SessionMessage};
+
+        // A failed assistant message carries a budget error plus its provider.
+        let messages = vec![SessionMessage {
+            error: Some(MessageError {
+                error_type: Some("provider.auth".into()),
+                message: Some("Budget limit exceeded".into()),
+                status: Some(403),
+            }),
+            model: Some(ModelRef {
+                id: "anthropic/claude-opus-5.5".into(),
+                provider_id: Some("openrouter".into()),
+            }),
+            ..serde_json::from_value(serde_json::json!({
+                "id":"m2","time":{"created":1,"completed":2},"type":"assistant"
+            }))
+            .unwrap()
+        }];
+
+        let sources = exhausted_sources_in(&messages);
+        assert_eq!(sources.len(), 1);
+        assert!(sources.contains("openrouter"));
+
+        // Non-budget errors do NOT yield an exclusion.
+        let mut other = messages.clone();
+        other[0].error = Some(MessageError {
+            error_type: Some("provider.auth".into()),
+            message: Some("invalid api key".into()),
+            status: Some(401),
+        });
+        assert!(exhausted_sources_in(&other).is_empty());
+    }
+
+    #[test]
     fn renders_in_chat_mode() {
         let (mut app, _rx) = make_app();
         open_chat(&mut app, 0);
@@ -652,6 +810,26 @@ mod tests {
         });
         app.streaming_text = "wor".into();
         app.input = "reply".into();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    }
+
+    #[test]
+    fn renders_projects_mode() {
+        let (mut app, _rx) = make_app();
+        app.mode = Mode::Projects;
+        app.projects.push(Project {
+            name: "alpha".into(),
+            path: "/tmp/alpha".into(),
+        });
+        app.projects.push(Project {
+            name: "beta".into(),
+            path: "/tmp/beta".into(),
+        });
+        app.active_project = app.projects.first().cloned();
+        app.project_selected = 0;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

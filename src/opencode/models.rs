@@ -132,6 +132,11 @@ impl Event {
             .and_then(|error| error.get("message"))
             .and_then(|v| v.as_str())
     }
+
+    /// True if this event's error signals a provider budget/quota exhaustion.
+    pub fn is_budget_exhausted(&self) -> bool {
+        self.error_message().is_some_and(is_budget_message)
+    }
 }
 
 /// Creation/completion timestamps carried by messages and parts.
@@ -162,6 +167,50 @@ pub struct MessageError {
     pub message: Option<String>,
     #[serde(default)]
     pub status: Option<u64>,
+}
+
+impl MessageError {
+    /// True if this error means a provider is out of budget/quota, where the
+    /// right move is to route the task through a different provider rather than
+    /// retrying the same one.
+    pub fn is_budget_exhausted(&self) -> bool {
+        let by_status = matches!(self.status, Some(402 | 429));
+        let by_type = self.error_type.as_deref().is_some_and(budget_related_type);
+        let by_message = self.message.as_deref().is_some_and(is_budget_message);
+        by_status || by_type || by_message
+    }
+}
+
+/// True if an error *type* names a budget/quota/billing condition.
+fn budget_related_type(error_type: &str) -> bool {
+    let lower = error_type.to_ascii_lowercase();
+    [
+        "budget",
+        "quota",
+        "billing",
+        "payment",
+        "insufficient",
+        "rate_limit",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+/// Case-insensitive keyword match for budget/quota-exhaustion messages.
+fn is_budget_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "budget",
+        "quota",
+        "insufficient",
+        "rate limit",
+        "billing",
+        "payment",
+        "credit",
+        "fund",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
 }
 
 /// A single content part of an assistant message (text, tool, step, …).
@@ -506,5 +555,44 @@ mod tests {
                 .unwrap();
         assert_eq!(part.session_id(), Some("ses_1"));
         assert_eq!(part.part().unwrap()["text"], "full");
+    }
+
+    #[test]
+    fn detects_budget_exhaustion() {
+        let budget: MessageError = serde_json::from_str(
+            r#"{"type":"provider.auth","message":"Budget limit exceeded","status":403}"#,
+        )
+        .unwrap();
+        assert!(budget.is_budget_exhausted());
+
+        let quota: MessageError =
+            serde_json::from_str(r#"{"type":"rate_limit","message":"429 too many requests"}"#)
+                .unwrap();
+        assert!(quota.is_budget_exhausted());
+
+        let quota_msg: MessageError =
+            serde_json::from_str(r#"{"type":"insufficient_quota","message":"quota exceeded"}"#)
+                .unwrap();
+        assert!(quota_msg.is_budget_exhausted());
+
+        // A normal auth failure (bad key) is NOT treated as budget exhaustion.
+        let auth: MessageError = serde_json::from_str(
+            r#"{"type":"provider.auth","message":"invalid api key","status":401}"#,
+        )
+        .unwrap();
+        assert!(!auth.is_budget_exhausted());
+
+        // A generic failure is NOT budget exhaustion.
+        let generic: MessageError =
+            serde_json::from_str(r#"{"type":"model.not_found","message":"no such model"}"#)
+                .unwrap();
+        assert!(!generic.is_budget_exhausted());
+
+        // An event carrying a budget message is detected too.
+        let event: Event = serde_json::from_str(
+            r#"{"id":"e","type":"session.execution.failed","data":{"error":{"message":"Budget limit exceeded"}}}"#,
+        )
+        .unwrap();
+        assert!(event.is_budget_exhausted());
     }
 }

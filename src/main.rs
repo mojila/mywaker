@@ -30,7 +30,17 @@ enum Command {
     /// Route each employee to the best model (live catalog + existing providers).
     Models,
     /// Auto-find the best cross-provider model for a task description.
-    Route { goal: String },
+    Route {
+        goal: String,
+        /// Providers/sources to skip (e.g. one that hit its budget limit).
+        #[arg(short, long)]
+        exclude: Vec<String>,
+    },
+    /// Discover projects under ~/Projects (and any configured scan dirs).
+    Projects {
+        #[command(subcommand)]
+        cmd: Option<ProjectsCmd>,
+    },
     /// Manage the employee roster.
     Employee {
         #[command(subcommand)]
@@ -89,6 +99,27 @@ enum SkillsCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum ProjectsCmd {
+    /// List projects discovered across all configured scan dirs.
+    List,
+    /// Manage the directories scanned for projects.
+    Dirs {
+        #[command(subcommand)]
+        cmd: DirsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DirsCmd {
+    /// List the directories currently scanned for projects.
+    List,
+    /// Add one or more directories to scan.
+    Add { dirs: Vec<std::path::PathBuf> },
+    /// Remove one or more directories from the scan list.
+    Rm { dirs: Vec<std::path::PathBuf> },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -97,7 +128,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Models) => return run_models().await,
-        Some(Command::Route { goal }) => return run_route(&goal).await,
+        Some(Command::Route { goal, exclude }) => return run_route(&goal, &exclude).await,
+        Some(Command::Projects { cmd }) => return run_projects(cmd),
         Some(Command::Employee { cmd }) => return run_employee(cmd),
         Some(Command::Skills { cmd }) => return run_skills(cmd),
         None => {}
@@ -124,22 +156,106 @@ async fn main() -> Result<()> {
     result
 }
 
-/// `mywaker models`: fetch the live Kenari catalog and route each employee.
+/// `mywaker projects [list|dirs …]`: list projects, or manage the scan dirs.
+fn run_projects(cmd: Option<ProjectsCmd>) -> Result<()> {
+    match cmd {
+        Some(ProjectsCmd::List) | None => list_projects(),
+        Some(ProjectsCmd::Dirs { cmd }) => match cmd {
+            DirsCmd::List => list_scan_dirs(),
+            DirsCmd::Add { dirs } => add_scan_dirs(dirs),
+            DirsCmd::Rm { dirs } => rm_scan_dirs(dirs),
+        },
+    }
+}
+
+/// List projects discovered across all configured scan dirs.
+fn list_projects() -> Result<()> {
+    let discovered = mywaker::projects::discover_all()?;
+    if discovered.is_empty() {
+        let roots = mywaker::projects::scan_roots();
+        let joined = roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("no projects under {joined}");
+        return Ok(());
+    }
+
+    for project in &discovered {
+        println!("{}  {}", project.name, project.path.display());
+    }
+    Ok(())
+}
+
+/// List the directories currently scanned for projects.
+fn list_scan_dirs() -> Result<()> {
+    for root in mywaker::projects::scan_roots() {
+        println!("{}", root.display());
+    }
+    Ok(())
+}
+
+fn add_scan_dirs(dirs: Vec<std::path::PathBuf>) -> Result<()> {
+    use mywaker::projects::{ScanDirs, default_roots};
+
+    let path = ScanDirs::default_path().ok_or_else(|| eyre!("no config directory found"))?;
+    let mut scan = ScanDirs::load(&path).unwrap_or_default();
+
+    // On first use, keep the default (~/Projects) so `add` extends rather than
+    // silently replaces the implicit default.
+    if scan.dirs.is_empty() {
+        for root in default_roots() {
+            scan.add(root);
+        }
+    }
+
+    for dir in dirs {
+        let added = scan.add(dir.clone());
+        println!(
+            "{} {}",
+            if added { "added" } else { "already present" },
+            dir.display()
+        );
+    }
+    scan.save(&path)?;
+    Ok(())
+}
+
+fn rm_scan_dirs(dirs: Vec<std::path::PathBuf>) -> Result<()> {
+    use mywaker::projects::ScanDirs;
+
+    let path = ScanDirs::default_path().ok_or_else(|| eyre!("no config directory found"))?;
+    let mut scan = ScanDirs::load(&path).unwrap_or_default();
+    for dir in dirs {
+        let removed = scan.remove(&dir);
+        println!(
+            "{} {}",
+            if removed { "removed" } else { "not present" },
+            dir.display()
+        );
+    }
+    scan.save(&path)?;
+    Ok(())
+}
+
+/// `mywaker models`: fetch the live model catalog(s) and route each employee.
 async fn run_models() -> Result<()> {
     use mywaker::team::Team;
 
     let team = Team::load_or_starter();
-    let selections = mywaker::kenari::route_roster(team.employees()).await?;
+    let selections = mywaker::route::route_roster(team.employees()).await?;
 
     for selection in &selections {
         match &selection.choice {
             Some(choice) => {
                 println!(
-                    "{} ({}) → {} [{}] — {}",
+                    "{} ({}) → {} [{} via {}] — {}",
                     selection.name,
                     selection.employee_id,
                     choice.id,
                     choice.provider,
+                    choice.source,
                     choice.reason,
                 );
             }
@@ -155,28 +271,36 @@ async fn run_models() -> Result<()> {
     Ok(())
 }
 
-/// `mywaker route "<task>"`: infer role + complexity and pick the best model.
-async fn run_route(goal: &str) -> Result<()> {
-    use mywaker::kenari::{Role, TaskComplexity};
-
-    let role = Role::from_goal(goal);
-    let complexity = TaskComplexity::infer(goal);
-    let choice = mywaker::kenari::auto_route(goal).await?;
+/// `mywaker route "<task>"`: infer role + complexity with the provider-agnostic
+/// local classifier and pick the best model, printing the cross-provider
+/// fallback chain too.
+async fn run_route(goal: &str, excluded: &[String]) -> Result<()> {
+    let class = mywaker::route::TaskClass::infer(goal);
+    let mut plan = mywaker::route::auto_route_plan_with(class).await?;
+    for source in excluded {
+        plan.exclude(source);
+    }
 
     println!("task: {goal}");
     println!(
         "inferred: role={} complexity={}",
-        role.label(),
-        complexity.label()
+        class.role.label(),
+        class.complexity.label(),
     );
-    match choice {
+    match plan.best() {
         Some(choice) => {
             println!(
-                "model: {} [{}] — {}",
-                choice.id, choice.provider, choice.reason
+                "model: {} [{} via {}] — {}",
+                choice.id, choice.provider, choice.source, choice.reason
             );
         }
         None => println!("model: none"),
+    }
+
+    // Show the cross-provider fallback chain (next distinct sources in order).
+    let chain: Vec<String> = plan.selectable_sources().into_iter().skip(1).collect();
+    if !chain.is_empty() {
+        println!("fallback providers: {}", chain.join(", "));
     }
 
     Ok(())

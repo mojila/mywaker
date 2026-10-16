@@ -1,13 +1,17 @@
-//! Model routing: pick the most efficient Kenari model for a task.
+//! Model routing: pick the most cost-effective model for a task.
 //!
 //! The catalog is read live (never hardcoded); the router filters chat-capable
 //! tool-using models and ranks them with a weighted score that balances a
 //! *capability* signal (provider tier + reasoning + context + vision) against
 //! cost. [`TaskComplexity`] drives the budget band (simple → cheap, hard →
 //! top-tier) while [`Role`] sets trait preferences; [`Router::auto_route`]
-//! infers both from a free-form task description.
+//! infers both from a free-form task description. The router is
+//! provider-agnostic: it scores any normalized [`ModelInfo`] regardless of
+//! which gateway (`source`) the model came from.
 
-use crate::kenari::models::ModelInfo;
+use std::collections::HashSet;
+
+use super::models::ModelInfo;
 
 /// A task role an employee can have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +25,13 @@ pub enum Role {
 
 impl Role {
     pub fn from_employee_id(id: &str) -> Role {
-        match id {
+        Self::from_label(id)
+    }
+
+    /// Parse a role from its label (`"planner"`, `"researcher"`, `"writer"`,
+    /// `"reviewer"`). Unknown labels map to [`Role::General`].
+    pub fn from_label(label: &str) -> Role {
+        match label {
             "planner" => Role::Planner,
             "researcher" => Role::Researcher,
             "writer" => Role::Writer,
@@ -161,6 +171,29 @@ impl TaskComplexity {
     }
 }
 
+/// A classified task: the role that should do it and how demanding it is.
+///
+/// This is the router's provider-agnostic first layer — inferred locally from
+/// cue words ([`Role::from_goal`] + [`TaskComplexity::infer`]) with no network
+/// or provider dependency. An optional gateway classifier (e.g. Kenari's
+/// [`JevClient`](super::kenari::JevClient)) can refine a [`TaskClass`] out of
+/// band, but the router never requires one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskClass {
+    pub role: Role,
+    pub complexity: TaskComplexity,
+}
+
+impl TaskClass {
+    /// Infer a task's role and complexity from its description.
+    pub fn infer(goal: &str) -> Self {
+        Self {
+            role: Role::from_goal(goal),
+            complexity: TaskComplexity::infer(goal),
+        }
+    }
+}
+
 /// Constraints and scoring weights for a role (tuned for a task complexity).
 #[derive(Debug, Clone)]
 pub struct RoleProfile {
@@ -275,7 +308,12 @@ impl RoleProfile {
 #[derive(Debug, Clone)]
 pub struct ModelChoice {
     pub id: String,
+    /// Underlying model vendor (e.g. "anthropic", "openai").
     pub provider: String,
+    /// Routing provenance: the gateway this model was sourced from
+    /// (e.g. "kenari", "openrouter", "clario"). The budget fallback skips an
+    /// exhausted `source` as a whole.
+    pub source: String,
     pub context_length: u64,
     pub reasoning: bool,
     pub vision: bool,
@@ -289,6 +327,55 @@ pub struct ModelChoice {
 /// Normalization caps for scoring.
 const CONTEXT_CAP: u64 = 1_000_000;
 const PRICE_CAP: u64 = 200_000; // IDR/1M past which models are "top of market"
+
+/// A ranked selection plus the budget-fallback chain.
+///
+/// [`Router::plan`] returns one. The caller runs [`RoutePlan::best`]; on a
+/// budget/quota error it calls [`RoutePlan::exclude`] with the exhausted
+/// `source` and picks the new best — which is guaranteed to come from a
+/// *different* gateway (`source`), not just another model on the same one.
+#[derive(Debug, Clone)]
+pub struct RoutePlan {
+    pub role: Role,
+    pub complexity: TaskComplexity,
+    /// All passing models, best first.
+    pub choices: Vec<ModelChoice>,
+    /// Sources (gateways) known to be out of budget; skipped by [`Self::best`].
+    pub exhausted: HashSet<String>,
+}
+
+impl RoutePlan {
+    /// The best selectable choice, skipping exhausted sources.
+    pub fn best(&self) -> Option<&ModelChoice> {
+        self.choices
+            .iter()
+            .find(|c| !self.exhausted.contains(&c.source))
+    }
+
+    /// The best choice that would be used if `source` is additionally excluded
+    /// — i.e. the fallback for that source (also skips already-exhausted ones).
+    pub fn fallback(&self, source: &str) -> Option<&ModelChoice> {
+        self.choices
+            .iter()
+            .find(|c| c.source != source && !self.exhausted.contains(&c.source))
+    }
+
+    /// Mark a source as exhausted; returns true if it was newly added.
+    pub fn exclude(&mut self, source: &str) -> bool {
+        self.exhausted.insert(source.to_string())
+    }
+
+    /// Ordered list of currently selectable sources (for display).
+    pub fn selectable_sources(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for choice in &self.choices {
+            if !self.exhausted.contains(&choice.source) && !seen.contains(&choice.source) {
+                seen.push(choice.source.clone());
+            }
+        }
+        seen
+    }
+}
 
 pub struct Router;
 
@@ -328,6 +415,25 @@ impl Router {
         Self::route_with(role, complexity, models)
             .into_iter()
             .next()
+    }
+
+    /// Build a ranked [`RoutePlan`] for a task: infer complexity and keep the
+    /// full, best-first list so callers can walk a fallback chain when a
+    /// source hits its budget limit.
+    pub fn plan(role: Role, goal: &str, models: &[ModelInfo]) -> RoutePlan {
+        Self::plan_with(role, TaskComplexity::infer(goal), models)
+    }
+
+    /// Build a [`RoutePlan`] from an already-classified task (e.g. the first
+    /// layer — Jev — decided role + complexity before we scored models).
+    pub fn plan_with(role: Role, complexity: TaskComplexity, models: &[ModelInfo]) -> RoutePlan {
+        let choices = Self::route_with(role, complexity, models);
+        RoutePlan {
+            role,
+            complexity,
+            choices,
+            exhausted: HashSet::new(),
+        }
     }
 
     fn passes(model: &ModelInfo, profile: &RoleProfile) -> bool {
@@ -376,6 +482,7 @@ impl Router {
         ModelChoice {
             id: model.id.clone(),
             provider: model.owned_by.clone().unwrap_or_default(),
+            source: model.source.clone(),
             context_length: model.context_length(),
             reasoning: model.reasoning,
             vision: model.is_vision(),
@@ -482,7 +589,7 @@ fn reason(model: &ModelInfo, role: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kenari::models::{Modalities, Pricing};
+    use crate::route::models::{Modalities, Pricing};
 
     #[allow(clippy::too_many_arguments)]
     fn m(
@@ -500,6 +607,7 @@ mod tests {
             object: Some("model".into()),
             owned_by: Some(provider.into()),
             name: Some(id.into()),
+            source: "kenari".to_string(),
             context_length: Some(context),
             max_output_tokens: None,
             endpoints: vec!["chat".into()],
@@ -538,6 +646,12 @@ mod tests {
 
     fn first(role: Role, models: &[ModelInfo]) -> Option<ModelChoice> {
         Router::route(role, models).into_iter().next()
+    }
+
+    /// Re-tag a model's routing source (gateway) for fallback tests.
+    fn src(mut model: ModelInfo, source: &str) -> ModelInfo {
+        model.source = source.to_string();
+        model
     }
 
     #[test]
@@ -679,6 +793,16 @@ mod tests {
     }
 
     #[test]
+    fn task_class_inferred_locally() {
+        let class = TaskClass::infer("design a roadmap for the migration");
+        assert_eq!(class.role, Role::Planner);
+        assert_eq!(class.complexity, TaskComplexity::High);
+
+        let quick = TaskClass::infer("rename the variable");
+        assert_eq!(quick.complexity, TaskComplexity::Low);
+    }
+
+    #[test]
     fn complexity_selects_price_tier() {
         let models = vec![
             m(
@@ -731,5 +855,98 @@ mod tests {
 
         let high = Router::route_with(Role::Planner, TaskComplexity::High, &models);
         assert_eq!(high[0].id, "opus");
+    }
+
+    #[test]
+    fn fallback_skips_exhausted_source_for_another_provider() {
+        // Three sources: kenari (best), openrouter, clario. The best two models
+        // are on kenari; the budget fallback must jump to a *different* gateway.
+        let models = vec![
+            src(
+                m(
+                    "kenari-a",
+                    "anthropic",
+                    1_000_000,
+                    true,
+                    true,
+                    false,
+                    20_000,
+                    100_000,
+                ),
+                "kenari",
+            ),
+            src(
+                m(
+                    "kenari-b", "openai", 1_000_000, true, true, false, 30_000, 150_000,
+                ),
+                "kenari",
+            ),
+            src(
+                m(
+                    "openrouter-a",
+                    "openai",
+                    1_000_000,
+                    true,
+                    true,
+                    false,
+                    34_000,
+                    170_000,
+                ),
+                "openrouter",
+            ),
+            src(
+                m(
+                    "clario-a", "deepseek", 1_000_000, true, false, false, 10_000, 20_000,
+                ),
+                "clario",
+            ),
+        ];
+
+        let mut plan = Router::plan(Role::Planner, "design the architecture", &models);
+        assert_eq!(plan.best().map(|c| c.source.as_str()), Some("kenari"));
+
+        // Marking kenari exhausted moves to the next distinct source.
+        assert!(plan.exclude("kenari"));
+        assert_eq!(plan.best().map(|c| c.source.as_str()), Some("openrouter"));
+
+        // The fallback for the top source is a different source, and never the
+        // same source again.
+        let fb = plan.fallback("kenari");
+        assert!(fb.is_some());
+        assert_ne!(fb.unwrap().source, "kenari");
+    }
+
+    #[test]
+    fn plan_reports_selectable_sources_and_exhausts_idempotently() {
+        let models = vec![
+            src(
+                m(
+                    "a",
+                    "anthropic",
+                    1_000_000,
+                    true,
+                    true,
+                    false,
+                    20_000,
+                    100_000,
+                ),
+                "kenari",
+            ),
+            src(
+                m("b", "openai", 1_000_000, true, true, false, 30_000, 150_000),
+                "openrouter",
+            ),
+        ];
+        let mut plan = Router::plan(Role::Planner, "roadmap", &models);
+        assert_eq!(plan.selectable_sources(), vec!["kenari", "openrouter"]);
+
+        assert!(plan.exclude("kenari"));
+        assert!(!plan.exclude("kenari")); // already exhausted
+        assert_eq!(plan.selectable_sources(), vec!["openrouter"]);
+        assert_eq!(plan.best().map(|c| c.source.as_str()), Some("openrouter"));
+
+        // Exhausting everything leaves nothing selectable.
+        assert!(plan.exclude("openrouter"));
+        assert!(plan.best().is_none());
     }
 }

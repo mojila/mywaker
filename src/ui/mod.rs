@@ -2,6 +2,7 @@
 
 mod chat;
 mod dashboard;
+mod projects;
 mod robot;
 
 use ratatui::{
@@ -35,19 +36,25 @@ fn render_title(frame: &mut Frame, app: &App, area: Rect) {
     let [left, right] =
         Layout::horizontal([Constraint::Min(24), Constraint::Length(32)]).areas(area);
 
-    let title = Line::from(vec![
-        Span::styled(
-            " mywaker ",
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " a team of AI employees ",
-            Style::default().add_modifier(Modifier::DIM),
-        ),
-    ]);
+    let title = Line::from({
+        let mut spans = vec![
+            Span::styled(
+                " mywaker ",
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " a team of AI employees ",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ];
+        if let Some(project) = app.active_project() {
+            spans.push(Span::styled(format!(" · {}", project.name), Color::Gray));
+        }
+        spans
+    });
     frame.render_widget(Paragraph::new(title), left);
 
     frame.render_widget(
@@ -79,6 +86,7 @@ fn connection_line(app: &App) -> Line<'static> {
 fn render_main(frame: &mut Frame, app: &App, area: Rect) {
     match app.mode() {
         Mode::Chat => chat::render(frame, app, area),
+        Mode::Projects => projects::render(frame, app, area),
         Mode::Roster => {
             let [robot_area, team_area] =
                 Layout::horizontal([Constraint::Length(24), Constraint::Fill(1)]).areas(area);
@@ -151,8 +159,20 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             "move ".dim(),
             " Enter ".bold().cyan(),
             "chat ".dim(),
+            " p ".bold().cyan(),
+            "projects ".dim(),
             " q ".bold().cyan(),
             "quit ".dim(),
+        ]),
+        Mode::Projects => Line::from(vec![
+            " ↑/k ".bold().cyan(),
+            "move ".dim(),
+            " ↓/j ".bold().cyan(),
+            "move ".dim(),
+            " Enter ".bold().cyan(),
+            "select ".dim(),
+            " Esc ".bold().cyan(),
+            "back ".dim(),
         ]),
         Mode::Chat => Line::from(vec![
             " Enter ".bold().cyan(),

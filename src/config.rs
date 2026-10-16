@@ -12,6 +12,21 @@ pub struct Config {
     /// Working directory OpenCode sessions are rooted at. Defaults to the
     /// current directory when unset.
     pub workdir: Option<PathBuf>,
+    /// Optional Jev (System One) classifier settings.
+    pub jev: JevConfig,
+}
+
+/// Jev (System One) classifier settings. Jev is an *optional* classifier — it is
+/// disabled unless an API key is available (here or via `KENARI_API_KEY`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct JevConfig {
+    /// System One endpoint override (defaults to Kenari's public endpoint).
+    pub endpoint: Option<String>,
+    /// Decision model id (defaults to `jev-1-13-free`).
+    pub model: Option<String>,
+    /// API key; falls back to the `KENARI_API_KEY` env var when unset.
+    pub api_key: Option<String>,
 }
 
 impl Default for Config {
@@ -19,6 +34,7 @@ impl Default for Config {
         Self {
             tick_rate: Duration::from_millis(100),
             workdir: None,
+            jev: JevConfig::default(),
         }
     }
 }
@@ -67,5 +83,36 @@ mod humantime_serde {
     {
         let s = String::deserialize(deserializer)?;
         humantime::parse_duration(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jev_defaults_to_none() {
+        let cfg = Config::default();
+        assert!(cfg.jev.endpoint.is_none());
+        assert!(cfg.jev.model.is_none());
+        assert!(cfg.jev.api_key.is_none());
+    }
+
+    #[test]
+    fn deserializes_jev_overrides() {
+        let text = r#"
+            tick_rate = "100ms"
+            [jev]
+            endpoint = "https://example.test/v1/systemone"
+            model = "custom-decision-model"
+            api_key = "sk-test"
+        "#;
+        let cfg: Config = toml::from_str(text).expect("parse config");
+        assert_eq!(
+            cfg.jev.endpoint.as_deref(),
+            Some("https://example.test/v1/systemone")
+        );
+        assert_eq!(cfg.jev.model.as_deref(), Some("custom-decision-model"));
+        assert_eq!(cfg.jev.api_key.as_deref(), Some("sk-test"));
     }
 }
