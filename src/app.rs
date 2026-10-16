@@ -10,6 +10,7 @@ use crate::event::EventHandler;
 use crate::message::Message;
 use crate::opencode::{AgentInfo, Event, OpenCode, ServerInfo, SessionMessage};
 use crate::projects::{self, Project};
+use crate::route::Role;
 use crate::team::{EmployeeStatus, Team, move_selection};
 use crate::tui::Tui;
 use crate::ui;
@@ -176,11 +177,11 @@ impl App {
         match self.mode {
             Mode::Roster => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected = move_selection(self.selected, -1, self.team.len());
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
+                    self.move_selection_stage(-1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.selected = move_selection(self.selected, 1, self.team.len());
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
+                    self.move_selection_stage(1);
                 }
                 KeyCode::Enter => self.start_chat(self.selected),
                 KeyCode::Char('p') | KeyCode::Char('P') => self.open_projects(),
@@ -447,6 +448,34 @@ impl App {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .to_string_lossy()
             .into_owned()
+    }
+
+    // --- workflow pipeline (roster ordering) ---
+
+    /// Employee storage indices in canonical workflow order (plan → research →
+    /// write → review → general), stable by name within a stage. The roster
+    /// renders (and the cursor moves) in this order rather than storage order.
+    pub fn workflow_order(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..self.team.len()).collect();
+        indices.sort_by_key(|&i| {
+            let employee = &self.team.employees()[i];
+            (
+                Role::from_label(&employee.id).order(),
+                employee.name.clone(),
+            )
+        });
+        indices
+    }
+
+    /// Move the roster cursor one workflow stage (per [`Self::workflow_order`]).
+    fn move_selection_stage(&mut self, delta: isize) {
+        let order = self.workflow_order();
+        if order.is_empty() {
+            return;
+        }
+        let position = order.iter().position(|&i| i == self.selected).unwrap_or(0);
+        let next = (position as isize + delta).clamp(0, order.len() as isize - 1) as usize;
+        self.selected = order[next];
     }
 
     // --- project discovery ---
@@ -798,6 +827,32 @@ mod tests {
             status: Some(401),
         });
         assert!(exhausted_sources_in(&other).is_empty());
+    }
+
+    #[test]
+    fn workflow_order_sorts_by_stage_then_name() {
+        let (app, _rx) = make_app();
+        // Starter storage order: researcher(0), writer(1), reviewer(2),
+        // planner(3). Workflow order should be planner → researcher → writer →
+        // reviewer.
+        let ids: Vec<&str> = app
+            .workflow_order()
+            .iter()
+            .map(|&i| app.team.employees()[i].id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["planner", "researcher", "writer", "reviewer"]);
+    }
+
+    #[test]
+    fn renders_pipeline_with_mixed_statuses() {
+        let (mut app, _rx) = make_app();
+        app.team.set_status(3, EmployeeStatus::Thinking); // planner
+        app.team.set_status(0, EmployeeStatus::Working); // researcher
+        app.selected = 3;
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(frame, &app)).unwrap();
     }
 
     #[test]

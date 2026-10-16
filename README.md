@@ -8,25 +8,27 @@ task stream, and a smart router that dispatches every task to the best (and most
 cost-efficient) model across your existing AI providers.
 
 ```
-┌─ mywaker · team: 4 employees ────────────────────────────┐
-│      ┌─[◉ ◉]─┐                                          │
-│      │  ───  │   ██ thinking… ▓▓▓▓▓▓░░░░ (researcher)   │
-│      ├──┬─┬──┤                                          │
-├───────┴───────┴──────────────────────────────────────────┤
-│  EMPLOYEES            │  TASK STREAM                     │
-│  ● researcher   ▸ on  │  > turn last meeting into a plan │
-│  ● writer       ▸ busy│  ✓ read context (3 files)        │
-│  ○ reviewer     idle  │  ▶ drafting outline…             │
-│  ○ planner      idle  │                                  │
-├────────────────────────┴─────────────────────────────────┤
-│  q quit │ ↑↓ select │ Enter chat │ d dispatch │ r retry   │
-└───────────────────────────────────────────────────────────┘
+┌─ mywaker · project: acme ───────────────────────────────────────┐
+│       ┌─[◌ ◌]─┐                                                 │
+│       │  ───  │   ┌─ PLANNER ─┐   ┌ RESEARCHER ─┐   ┌ WRITER ┐ │
+│       ├──┬─┬──┤   │  ● Dex    │─▶ │  ◔ Aria     │─▶ │○ Bruno │ │
+├────────┴───────┴──┴───────────┴───┴─────────────┴───┴────────┴─┤
+│  log ┃ stream 4 agents · 132 events · connected                │
+├─────────────────────────────────────────────────────────────────┤
+│  ←/→ stage │ Enter chat │ p projects │ q quit                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+The team renders as a **workflow pipeline** — a left → right diagram ordered
+plan → research → write → review. Each stage is a box (name, role, live status,
+model) that lights up in its status colour (yellow thinking, cyan working,
+green done) while the robot avatar mirrors the aggregate state.
 
 ## What it does
 
-- **Employee roster** — a team of AI employees (researcher, writer, reviewer,
-  planner) mapped 1:1 to OpenCode agents, each shown with live status.
+- **Workflow pipeline** — the team rendered as a left → right diagram (plan →
+  research → write → review), one stage box per employee with live status +
+  model; the running stage lights up in its status colour.
 - **Animated robot avatar** — a state-driven ASCII robot that idles, thinks,
   works, and wraps up in real time as streaming deltas arrive.
 - **Chat & live streaming** — talk to an employee and watch the response stream

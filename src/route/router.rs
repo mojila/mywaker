@@ -50,6 +50,18 @@ impl Role {
         }
     }
 
+    /// Position in the canonical plan → research → write → review workflow,
+    /// used to order the team as a pipeline in the UI.
+    pub fn order(self) -> u8 {
+        match self {
+            Role::Planner => 0,
+            Role::Researcher => 1,
+            Role::Writer => 2,
+            Role::Reviewer => 3,
+            Role::General => 4,
+        }
+    }
+
     /// Infer the role best suited to a free-form task description (cue words).
     pub fn from_goal(goal: &str) -> Role {
         let text = goal.to_ascii_lowercase();
@@ -790,6 +802,14 @@ mod tests {
         assert_eq!(Role::from_goal("review this pull request"), Role::Reviewer);
         assert_eq!(Role::from_goal("design a roadmap"), Role::Planner);
         assert_eq!(Role::from_goal("do something"), Role::General);
+    }
+
+    #[test]
+    fn role_workflow_order_is_canonical() {
+        assert!(Role::Planner.order() < Role::Researcher.order());
+        assert!(Role::Researcher.order() < Role::Writer.order());
+        assert!(Role::Writer.order() < Role::Reviewer.order());
+        assert!(Role::Reviewer.order() < Role::General.order());
     }
 
     #[test]

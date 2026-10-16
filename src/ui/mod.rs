@@ -1,7 +1,7 @@
-//! The ratatui renderer: title bar, robot avatar, team dashboard, chat, log, help.
+//! The ratatui renderer: title bar, robot avatar, team pipeline, chat, log, help.
 
 mod chat;
-mod dashboard;
+mod pipeline;
 mod projects;
 mod robot;
 
@@ -91,7 +91,7 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
             let [robot_area, team_area] =
                 Layout::horizontal([Constraint::Length(24), Constraint::Fill(1)]).areas(area);
             render_robot_widget(frame, app, robot_area);
-            dashboard::render(frame, app, team_area);
+            pipeline::render(frame, app, team_area);
         }
     }
 }
@@ -153,10 +153,8 @@ fn stream_stats(app: &App) -> Line<'static> {
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let help = match app.mode() {
         Mode::Roster => Line::from(vec![
-            " ↑/k ".bold().cyan(),
-            "move ".dim(),
-            " ↓/j ".bold().cyan(),
-            "move ".dim(),
+            " ←/→ ".bold().cyan(),
+            "stage ".dim(),
             " Enter ".bold().cyan(),
             "chat ".dim(),
             " p ".bold().cyan(),
