@@ -13,6 +13,7 @@ use serde_json::Value;
 use super::models::{ModelInfo, ModelList};
 use super::router::{ModelChoice, Role, Router, TaskComplexity};
 use crate::config::JevConfig;
+use crate::opencode::QuestionInfo;
 
 /// Kenari model catalog endpoint (public; no API key).
 const DEFAULT_MODELS_URL: &str = "https://kenari.id/v1/models";
@@ -224,6 +225,140 @@ impl JevClient {
         }
         Some(JevTask { role, complexity })
     }
+
+    /// Answer a single multiple-choice [`QuestionInfo`] with System One.
+    ///
+    /// The question's options become the choice criteria and the chosen label is
+    /// returned. `Ok(None)` means Jev had no confident answer (caller should fall
+    /// back to [`default_answer`]); `Err` is a transport/HTTP error.
+    pub async fn answer_question(&self, question: &QuestionInfo) -> Result<Option<String>> {
+        if question.options.is_empty() {
+            return Ok(None);
+        }
+
+        let criteria = question
+            .options
+            .iter()
+            .map(|option| {
+                let description = if option.description.is_empty() {
+                    option.label.clone()
+                } else {
+                    option.description.clone()
+                };
+                (option.label.clone(), Value::String(description))
+            })
+            .collect::<serde_json::Map<String, Value>>();
+
+        let body = serde_json::json!({
+            "model": self.model,
+            "state": question.question,
+            "questions": {
+                "answer": {
+                    "type": "choice",
+                    "instructions": "Choose the single best answer to the question.",
+                    "criteria": criteria,
+                }
+            }
+        });
+
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("POST systemone")?
+            .error_for_status()
+            .wrap_err("POST systemone")?;
+
+        let json: Value = response.json().await.wrap_err("decode systemone answer")?;
+        let Some(answer) = json.get("answers").and_then(|a| a.get("answer")) else {
+            return Ok(None);
+        };
+        let confidence = answer
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+        if confidence < MIN_CONFIDENCE {
+            return Ok(None);
+        }
+        Ok(answer
+            .get("choice")
+            .and_then(|v| v.as_str())
+            .map(str::to_string))
+    }
+
+    /// Answer a free-form yes/no question as a binary `choice` ("yes" / "no").
+    ///
+    /// Jev is a *typed decider*, not a chat model, so a free question is framed
+    /// as a confident yes/no verdict. `Ok(None)` means Jev was unavailable or
+    /// uncertain — callers fall back to a deterministic affirmative.
+    pub async fn answer_text(&self, question: &str) -> Result<Option<String>> {
+        let body = serde_json::json!({
+            "model": self.model,
+            "state": question,
+            "questions": {
+                "answer": {
+                    "type": "choice",
+                    "instructions": "Answer the question with a confident yes or no verdict.",
+                    "criteria": {
+                        "yes": "affirmative — the answer is yes / true / proceed / correct",
+                        "no": "negative — the answer is no / false / stop / incorrect"
+                    }
+                }
+            }
+        });
+
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("POST systemone")?
+            .error_for_status()
+            .wrap_err("POST systemone")?;
+
+        let json: Value = response.json().await.wrap_err("decode systemone answer")?;
+        Ok(parse_yes_no(&json))
+    }
+}
+
+/// Parse a binary yes/no `choice` verdict from a System One answer envelope.
+fn parse_yes_no(json: &Value) -> Option<String> {
+    let answer = json.get("answers")?.get("answer")?;
+    let confidence = answer
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    if confidence < MIN_CONFIDENCE {
+        return None;
+    }
+    answer
+        .get("choice")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+}
+
+/// A deterministic answer for a question when Jev is unavailable or uncertain —
+/// prefer an affirmative option, else the first option, else a neutral "continue".
+pub fn default_answer(question: &QuestionInfo) -> String {
+    let affirmative = [
+        "yes", "ok", "okay", "continue", "proceed", "allow", "confirm", "approve", "accept",
+    ];
+    if let Some(option) = question
+        .options
+        .iter()
+        .find(|o| affirmative.contains(&o.label.to_ascii_lowercase().as_str()))
+    {
+        return option.label.clone();
+    }
+    if let Some(first) = question.options.first() {
+        return first.label.clone();
+    }
+    "continue".to_string()
 }
 
 /// Map Jev's 0–4 score to the router's [`TaskComplexity`] band. The five
@@ -331,5 +466,43 @@ mod tests {
             api_key: Some("   ".to_string()),
         };
         assert!(JevClient::settings(&cfg).is_none());
+    }
+
+    #[test]
+    fn default_answer_prefers_affirmative_then_first() {
+        let q = |labels: &[&str]| QuestionInfo {
+            question: "continue?".into(),
+            header: "h".into(),
+            options: labels
+                .iter()
+                .map(|l| crate::opencode::QuestionOption {
+                    label: (*l).into(),
+                    description: String::new(),
+                })
+                .collect(),
+            multiple: false,
+            custom: true,
+        };
+        assert_eq!(default_answer(&q(&["Cancel", "Proceed"])), "Proceed");
+        assert_eq!(default_answer(&q(&["No", "Yes"])), "Yes");
+        assert_eq!(default_answer(&q(&["Alpha", "Beta"])), "Alpha");
+        assert_eq!(default_answer(&q(&[])), "continue");
+    }
+
+    #[test]
+    fn parse_yes_no_reads_binary_choice_and_gates_confidence() {
+        let confident = serde_json::json!({
+            "answers": { "answer": { "type": "choice", "choice": "yes", "confidence": 0.9 } }
+        });
+        assert_eq!(parse_yes_no(&confident).as_deref(), Some("yes"));
+
+        // Confidence below the threshold yields no answer (caller falls back).
+        let unsure = serde_json::json!({
+            "answers": { "answer": { "type": "choice", "choice": "no", "confidence": 0.1 } }
+        });
+        assert_eq!(parse_yes_no(&unsure), None);
+
+        // Missing answer envelope is None.
+        assert_eq!(parse_yes_no(&serde_json::json!({})), None);
     }
 }

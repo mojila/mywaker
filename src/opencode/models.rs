@@ -98,6 +98,10 @@ pub struct Event {
     pub location: Option<Location>,
     #[serde(default)]
     pub data: serde_json::Value,
+    /// V2 events carry their payload under `properties` (e.g. `question.asked`)
+    /// rather than `data`; kept raw so both surfaces are tolerated.
+    #[serde(default)]
+    pub properties: serde_json::Value,
 }
 
 impl Event {
@@ -133,9 +137,46 @@ impl Event {
             .and_then(|v| v.as_str())
     }
 
+    /// Best-effort human label for a tool-activity event (`session.tool.*`).
+    /// Prefers an explicit tool/name/title field, then a file path.
+    pub fn tool_label(&self) -> Option<String> {
+        for key in ["tool", "name", "title"] {
+            if let Some(value) = self.data.get(key).and_then(|v| v.as_str())
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
+            }
+        }
+        self.data
+            .get("file")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
     /// True if this event's error signals a provider budget/quota exhaustion.
     pub fn is_budget_exhausted(&self) -> bool {
         self.error_message().is_some_and(is_budget_message)
+    }
+
+    /// True when this is a `question.asked` event (the session paused waiting
+    /// on the user to answer one or more questions).
+    pub fn is_question(&self) -> bool {
+        self.event_type == "question.asked"
+    }
+
+    /// The question request this event carries, if any. The payload lives under
+    /// `properties` on the v2 surface and `data` on the m5 surface; we accept
+    /// whichever is populated.
+    pub fn question_request(&self) -> Option<QuestionRequest> {
+        let payload = if !self.properties.is_null() {
+            &self.properties
+        } else {
+            &self.data
+        };
+        if payload.is_null() {
+            return None;
+        }
+        serde_json::from_value(payload.clone()).ok()
     }
 }
 
@@ -276,15 +317,17 @@ impl SessionMessage {
         {
             return text.clone();
         }
-        let mut parts: Vec<&str> = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
         for part in &self.content {
             match part.part_type.as_str() {
                 "text" => {
                     if let Some(text) = part.text.as_deref() {
-                        parts.push(text);
+                        parts.push(text.to_string());
                     }
                 }
-                "tool" | "step" | "reasoning" => parts.push("·"),
+                "tool" => parts.push(part_tool_label(part)),
+                "step" => parts.push("[step]".to_string()),
+                "reasoning" => parts.push("[thinking]".to_string()),
                 _ => {}
             }
         }
@@ -299,6 +342,60 @@ impl SessionMessage {
                 .as_deref()
                 .is_none_or(|f| f == "error" || f == "unknown")
     }
+}
+
+/// Best-effort label for a tool part, e.g. `[tool: read]`.
+fn part_tool_label(part: &Part) -> String {
+    if let Some(name) = part.extra.get("tool").and_then(|v| v.as_str())
+        && !name.is_empty()
+    {
+        format!("[tool: {name}]")
+    } else {
+        "[tool]".to_string()
+    }
+}
+
+/// One choice offered by a [`QuestionInfo`] (`{ label, description }`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionOption {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A single question in a [`QuestionRequest`] (`question.asked`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionInfo {
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multiple: bool,
+    #[serde(default = "default_true")]
+    pub custom: bool,
+}
+
+/// A pending question request: `{ id, sessionID, questions, tool? }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuestionRequest {
+    /// The request id (`queue_…`); the reply endpoint is scoped by it.
+    #[serde(default, rename = "id")]
+    pub request_id: Option<String>,
+    #[serde(default, rename = "sessionID")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub questions: Vec<QuestionInfo>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Pagination cursor for message-list responses, carried as `{ previous, next }`.

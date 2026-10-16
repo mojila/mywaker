@@ -11,6 +11,8 @@ pub enum Message {
     Tick,
     /// A terminal key press.
     Key(KeyEvent),
+    /// A bracketed paste from the terminal.
+    Paste(String),
     /// Terminal resize (width, height).
     Resize(u16, u16),
     /// Connected to the OpenCode service.
@@ -38,6 +40,8 @@ pub enum Message {
     },
     /// Kenari routed models for `(employee index, model id)` pairs.
     ModelsAssigned(Vec<(usize, String)>),
+    /// Jev answered a delegated `@jev` question (for `employee`, who asked).
+    JevAnswer { employee: usize, answer: String },
     /// A free-form line for the status log.
     Log(String),
     /// Quit the application.

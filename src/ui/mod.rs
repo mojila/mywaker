@@ -175,12 +175,16 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Chat => Line::from(vec![
             " Enter ".bold().cyan(),
             "send ".dim(),
-            " /skill add ".bold().cyan(),
-            "skill ".dim(),
+            " ↑/↓ ".bold().cyan(),
+            "history ".dim(),
+            " PgUp/PgDn ".bold().cyan(),
+            "scroll ".dim(),
+            " /help ".bold().cyan(),
+            "cmds ".dim(),
             " Esc ".bold().cyan(),
             "back ".dim(),
             " Ctrl-C ".bold().cyan(),
-            "quit ".dim(),
+            "stop ".dim(),
         ]),
     };
     frame.render_widget(Paragraph::new(help), area);

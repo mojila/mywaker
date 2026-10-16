@@ -1,10 +1,11 @@
-//! The team pipeline: a left → right workflow diagram (plan → research →
-//! write → review → …), one stage box per employee with a live status and
-//! spinner, connected by arrows. Replaces the flat roster list.
+//! The team pipeline: a top-down tree diagram — the planner on top, **Jev**
+//! (the question answerer) in the middle, and the remaining employees
+//! (researcher, writer, reviewer, …) fanned out along the bottom. One box per
+//! employee with a live status and spinner. Jev is a shared, non-employee node
+//! every employee delegates questions to via `@jev`.
 //!
-//! Stages are ordered by routing role ([`Role::order`]), so the running task
-//! is always laid out along the canonical workflow regardless of the order in
-//! which employees were added to `team.toml`.
+//! Stages are ordered by routing role ([`Role::order`]): the first stage (the
+//! planner) is the tree's root and the rest form the leaf row.
 
 use ratatui::{
     Frame,
@@ -38,43 +39,84 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Horizontal row: [stage, arrow, stage, arrow, …].
-    let steps = order.len();
-    let mut constraints = Vec::with_capacity(steps * 2 - 1);
-    for step in 0..steps {
-        constraints.push(Constraint::Fill(1));
-        if step + 1 < steps {
-            constraints.push(Constraint::Length(3));
-        }
+    // Root = the planner (first stage); leaves = everyone else.
+    let top = order[0];
+    let bottom = &order[1..];
+    render_tree(frame, app, area, top, bottom, employees);
+}
+
+/// Number of content rows inside a stage box (plus two border rows).
+const CONTENT_LINES: u16 = 3;
+const STAGE_HEIGHT: u16 = CONTENT_LINES + 2;
+
+/// Maximum width of a single node box (the root and Jev node are centred to
+/// this, while leaf nodes share the full row).
+const MAX_NODE_WIDTH: u16 = 42;
+
+fn render_tree(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    top: usize,
+    bottom: &[usize],
+    employees: &[Employee],
+) {
+    let has_bottom = !bottom.is_empty();
+    let node_width = (area.width / (bottom.len().max(1) as u16)).clamp(14, MAX_NODE_WIDTH);
+
+    // Rows (top → bottom): [fill, planner, arrow, jev, arrow, leaves, fill].
+    let mut constraints = vec![
+        Constraint::Fill(1),
+        Constraint::Length(STAGE_HEIGHT), // planner
+        Constraint::Length(1),            // arrow
+        Constraint::Length(STAGE_HEIGHT), // jev
+    ];
+    if has_bottom {
+        constraints.push(Constraint::Length(1)); // arrow
+        constraints.push(Constraint::Length(STAGE_HEIGHT)); // leaves
     }
+    constraints.push(Constraint::Fill(1));
 
-    // Vertically centre the row within the main area.
-    let [_, row_area, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(STAGE_HEIGHT),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
+    let rows = Layout::vertical(constraints).split(area);
 
-    let columns = Layout::horizontal(constraints).split(row_area);
+    render_stage(
+        frame,
+        app,
+        &employees[top],
+        centered(rows[1], node_width),
+        top == app.selected(),
+    );
+    render_arrow_down(frame, rows[2]);
+    render_jev_stage(frame, app, centered(rows[3], node_width));
 
-    let mut column = 0;
-    for (step, &employee_index) in order.iter().enumerate() {
-        let employee = &employees[employee_index];
-        let selected = employee_index == app.selected();
-        render_stage(frame, app, employee, columns[column], selected);
-        column += 1;
-
-        if step + 1 < steps {
-            render_arrow(frame, columns[column]);
-            column += 1;
+    if has_bottom {
+        render_arrow_down(frame, rows[4]);
+        let leaves = Layout::horizontal(vec![Constraint::Fill(1); bottom.len()]).split(rows[5]);
+        for (i, &employee_index) in bottom.iter().enumerate() {
+            render_stage(
+                frame,
+                app,
+                &employees[employee_index],
+                leaves[i],
+                employee_index == app.selected(),
+            );
         }
     }
 }
 
-/// Number of content rows inside a stage box (plus two border rows).
-const CONTENT_LINES: u16 = 4;
-const STAGE_HEIGHT: u16 = CONTENT_LINES + 2;
+/// Centre `area` to `width` columns (leaving it untouched when narrower).
+fn centered(area: Rect, width: u16) -> Rect {
+    if area.width <= width {
+        return area;
+    }
+    let [_, center, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(width),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    center
+}
 
 /// The workflow stage label for an employee, from their routing role.
 fn stage_label(employee: &Employee) -> String {
@@ -121,10 +163,6 @@ fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, s
             Color::DarkGray,
         )),
         status_label(employee.status),
-        Line::from(Span::styled(
-            truncate(employee.model.as_deref().unwrap_or("no model"), width),
-            Color::DarkGray,
-        )),
     ];
 
     let paragraph = Paragraph::new(lines)
@@ -134,21 +172,59 @@ fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, s
     frame.render_widget(paragraph, area);
 }
 
-fn render_arrow(frame: &mut Frame, area: Rect) {
-    let [_, arrow_row, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
+/// The Jev (System One) answerer node — a shared, non-employee stage every
+/// employee delegates questions to via `@jev`. Styled distinctly from employees.
+fn render_jev_stage(frame: &mut Frame, app: &App, area: Rect) {
+    let enabled = app.jev_enabled();
+    let accent = if enabled {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
 
+    let title = Span::styled(
+        " jev ",
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .title(title);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("◆", accent),
+            Span::raw(" "),
+            Span::styled("jev", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(Span::styled("answers questions", Color::DarkGray)),
+        Span::styled(
+            if enabled { "on — @jev" } else { "off" },
+            if enabled {
+                Color::Green
+            } else {
+                Color::DarkGray
+            },
+        )
+        .into(),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Left);
+
+    frame.render_widget(paragraph, area);
+}
+
+/// A downward connector (planner → jev → leaves).
+fn render_arrow_down(frame: &mut Frame, area: Rect) {
     let arrow = Paragraph::new(Line::from(Span::styled(
-        "─▶",
+        "▼",
         Style::default().fg(Color::DarkGray),
     )))
     .alignment(Alignment::Center);
 
-    frame.render_widget(arrow, arrow_row);
+    frame.render_widget(arrow, area);
 }
 
 fn status_color(status: EmployeeStatus) -> Color {

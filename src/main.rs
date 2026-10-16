@@ -142,12 +142,16 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<Message>(256);
 
-    // Connect to OpenCode and forward live events in the background.
-    tokio::spawn(opencode_background(tx.clone()));
+    // Connect to OpenCode and forward live events in the background. A Jev
+    // client (when a Kenari API key is configured) auto-answers any question the
+    // session asks, so delegations never stall waiting on human input.
+    let jev = mywaker::route::JevClient::from_config(&config.jev);
+    tokio::spawn(opencode_background(tx.clone(), jev.clone()));
 
     let mut tui = Tui::new()?;
     let events = EventHandler::new(config.tick_rate, rx);
     let mut app = App::with_team(config, tx, mywaker::team::Team::load_or_starter());
+    app.set_jev(jev);
 
     tui.enter()?;
     let result = app.run(&mut tui, events).await;

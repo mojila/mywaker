@@ -19,3 +19,4 @@ pub mod skills;
 pub mod team;
 pub mod tui;
 pub mod ui;
+pub mod workflow;

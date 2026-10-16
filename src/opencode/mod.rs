@@ -9,8 +9,8 @@ use reqwest::Url;
 use serde::de::DeserializeOwned;
 
 pub use models::{
-    AgentInfo, Event, Location, MessageError, Part, ProviderModel, ServerInfo, SessionInfo,
-    SessionMessage,
+    AgentInfo, Event, Location, MessageError, Part, ProviderModel, QuestionInfo, QuestionOption,
+    QuestionRequest, ServerInfo, SessionInfo, SessionMessage,
 };
 
 /// The fixed username OpenCode's local server expects in its `Basic` auth.
@@ -129,6 +129,23 @@ impl OpenCode {
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {
         let path = format!("/api/session/{session_id}/interrupt");
         let _: serde_json::Value = self.post_json(&path, &serde_json::json!({})).await?;
+        Ok(())
+    }
+
+    /// Answer a pending question request (`question.asked`).
+    ///
+    /// `answers` lists one entry per question in the request, in order; each
+    /// entry is the array of selected option labels (a single element for a
+    /// single-choice question). After this the session resumes its turn.
+    pub async fn reply_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: &[Vec<String>],
+    ) -> Result<()> {
+        let body = serde_json::json!({ "answers": answers });
+        let path = format!("/api/session/{session_id}/question/{request_id}/reply");
+        let _: serde_json::Value = self.post_json(&path, &body).await?;
         Ok(())
     }
 

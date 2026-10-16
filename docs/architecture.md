@@ -32,6 +32,7 @@ mywaker/
     ├── config.rs             load ~/.config/mywaker/config.toml (tick_rate)
     ├── logging.rs            tracing → file
     ├── team.rs               Employee/roster model (maps to OpenCode agents)
+    ├── workflow.rs           delegation protocol (parse `@id` directives, team preamble)
     ├── route/                cross-provider router (provider-agnostic)
     │   ├── mod.rs            orchestration (gather_candidates, route_roster, auto_route)
     │   ├── models.rs         serde types (ModelInfo, Pricing, Modalities)
@@ -42,7 +43,7 @@ mywaker/
     ├── persistence.rs        (planned M6) JSON store (tasks, memory)
     ├── scheduler.rs          (planned M7) cron → dispatch events
     ├── opencode/
-    │   ├── mod.rs            client + request helpers (server_info/agents/create_session/prompt/wait/interrupt/events)
+    │   ├── mod.rs            client + request helpers (server_info/agents/create_session/prompt/wait/interrupt/reply_question/events)
     │   ├── service.rs        discover `opencode service status`, read password
     │   ├── events.rs         SSE subscribe + typed event parse
     │   └── models.rs         serde types (Agent, Session, Event, ServerInfo)
@@ -324,3 +325,61 @@ classification is a local heuristic (no network, no provider dependency).
   employee's `model` shows in the dashboard; `mywaker models` prints the live routing
   and `mywaker route "<task>"` prints the auto-route for a task description, both
   without starting the TUI.
+
+---
+
+## 10. Delegation (employee ↔ employee hand-off)
+
+Employees collaborate by **delegating**, not by a single orchestrator scheduling a
+fixed role chain. Any employee can hand a sub-task to any other, and any employee
+can hand the final result back to the user.
+
+1. **Protocol** (`src/workflow.rs`) — an assistant reply ends with one or more
+   line-leading directives of the form `@<id> <instruction>` (`@writer draft the
+   intro`). Only line-leading `@` lines count, so inline mentions are ignored. The
+   special targets `@user` / `@deliver` / `@done` mean "this is the final answer";
+   `@jev` (or `@judge` / `@decide`) means "ask the decision model a yes/no
+   question". `team_context()` renders the roster + protocol as a preamble so each
+   employee learns its teammates on first contact.
+
+2. **Bootstrap** — the first prompt sent to an employee has `team_context()`
+   prepended (`Chat::bootstrapped`), so everyone knows the roster and the protocol
+   before doing any work.
+
+3. **Dispatch** (`app.rs`) — when a transcript load completes, `dispatch_delegations`
+   scans the finished assistant reply for directives (idempotent per message id via
+   `Chat::handled_message_ids`). Teammate targets are relayed via
+   `send_to_employee` → `flush_outbox` (creating the target's session on demand and
+   queueing instructions until it is ready); final targets reroute the answer back to
+   the origin chat (`App::delegation_origin`). A `MAX_DELEGATIONS` cap stops `A → B →
+   A` cycles.
+
+4. **Question auto-answer** — `question.asked` events, which pause a session until
+   the user answers, are resolved out-of-band in the event loop
+   (`spawn_question_answer`): Jev (`JevClient::answer_question`) picks the answer
+   when available/confident, with a deterministic `default_answer` fallback, then the
+   client calls `reply_question` so the session resumes. This keeps an autonomous
+   delegation chain from ever stalling on a human prompt.
+
+5. **Delegating to Jev** — an employee can hand a question straight to the decision
+   model with `@jev <question>` (`route_to_jev`): the question is framed as a binary
+   yes/no `choice` (`JevClient::answer_text`), and the verdict is posted back into
+   the asking employee's chat (`Message::JevAnswer`). With no Jev client configured
+   it answers "yes" deterministically. The **pipeline diagram** (`src/ui/pipeline.rs`)
+   shows Jev as a node reached from the planner above and the employees below:
+   the diagram is a top-down tree — planner on top, **Jev** in the middle, and the
+   remaining employees (researcher, writer, reviewer, …) fanned out along the
+   bottom — with an on/off state, so the "every employee delegates questions to
+   Jev" relationship is visible in the UI.
+
+6. **Parallel fan-out + aggregation** — `@parallel <goal>` (aliases `@all` /
+   `@fanout` / `@team`) broadcasts one goal to every teammate except the source
+   and the aggregator. Each worker starts its own session concurrently (the
+   transport issues `N` sessions and `N` prompts in parallel; verified by
+   `tests/opencode_fake.rs`). `fan_out` registers a `FanOut { workers,
+   aggregator, outputs }`; as each worker's transcript completes,
+   `note_fanout_result` records its deliverable (directives stripped), and once
+   all workers contribute, `aggregate_fanout` hands the collected outputs to the
+   aggregator — the reviewer, else the planner, else the source — which
+   synthesizes one deliverable and returns it with `@user`. The `/parallel
+   <goal>` chat command drives the same fan-out directly from the user.

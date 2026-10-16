@@ -113,11 +113,20 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 
 ## M7 — Orchestration (multi-employee fan-out)
 
-- [ ] 💻 Orchestrator: split one goal across `N` employees → parallel sessions (`tokio::spawn` + `JoinSet`)
-- [ ] 💻 Handoff: employee output fed as input to the next (role chain)
-- [ ] 💻 Aggregate results into a single deliverable view + review pass (`reviewer`)
-- [ ] 🧪 integration: fake server verifies N parallel prompts + aggregation
-- [ ] ✅ one goal → team works in parallel → aggregated result
+- [x] 💻 Orchestrator: split one goal across `N` employees → parallel sessions (`tokio::spawn` + `JoinSet`)
+  - `@parallel <goal>` (aliases `@all`/`@team`/`@fanout`) fans a goal out to every teammate but the source and the aggregator; each worker gets its own session created in parallel. The `/parallel <goal>` chat command triggers the same from the user.
+  - `src/workflow.rs` (`is_parallel`, `strip_directives`) + `src/app.rs` (`fan_out`, `FanOut` state).
+- [x] 💻 Handoff: employee output fed as input to the next (role chain)
+  - Peer-to-peer delegation protocol: an assistant reply ends with line-leading `@<id> <instruction>` directives; the app relays each to the named employee (creating their session on demand). `@user`/`@deliver`/`@done` marks the final answer, routed back to the origin chat.
+  - `src/workflow.rs` (`parse_delegations`, `is_final`, `team_context`) + app dispatch (`dispatch_delegations`/`send_to_employee`/`flush_outbox`), idempotent per message id, capped at 64 hand-offs to stop `A → B → A` cycles.
+- [x] 💻 First prompt to each employee carries a team-context preamble (roster + protocol) so anyone can delegate to anyone.
+- [x] 💻 `question.asked` auto-answer: the event loop resolves session questions via Jev (`JevClient::answer_question`) with a deterministic `default_answer` fallback, so delegated sessions never hang waiting on a human.
+- [x] 💻 Jev as a delegated answerer: `@jev <question>` routes to Jev (`JevClient::answer_text`, a binary yes/no `choice`) and posts the verdict back to the asking employee's chat. The pipeline diagram (`src/ui/pipeline.rs`) renders a top-down tree — planner top, “jev” middle, researcher/writer/reviewer on the bottom row — with an on/off state.
+- [x] 💻 Aggregate results into a single deliverable view + review pass (`reviewer`)
+  - Once every worker in a fan-out finishes (`note_fanout_result`), their stripped deliverables are collected and handed to the aggregator — the reviewer, else the planner — which synthesizes one deliverable and `@user`s it back (`aggregate_fanout`).
+- [x] 🧪 integration: fake server verifies N parallel prompts + aggregation
+  - `tests/opencode_fake.rs::fans_out_n_parallel_prompts_via_joinset` drives `N` concurrent `create_session`+`prompt` calls over a `JoinSet` against a counting fake server.
+- [ ] ✅ one goal → team works in parallel → aggregated result — **blocked**: live model inference still under the weekly budget cap (resets 2026-10-19); the end-to-end chain is exercised via unit + fake-server tests until then.
 
 ## M8 — Polish & ship
 

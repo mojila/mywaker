@@ -4,12 +4,15 @@
 //! service (and without triggering model inference).
 
 use axum::body::Body;
+use axum::extract::{Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use mywaker::opencode::OpenCode;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn app() -> Router {
     Router::new()
@@ -112,4 +115,68 @@ async fn client_streams_and_reads_messages_from_fake_server() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role(), "user");
     assert_eq!(messages[1].display_text(), "hello world");
+}
+
+// --- orchestration transport: N parallel sessions + prompts -----------------
+
+#[derive(Clone, Default)]
+struct Counters {
+    sessions: Arc<AtomicUsize>,
+    prompts: Arc<AtomicUsize>,
+}
+
+async fn count_create(State(c): State<Counters>) -> Json<Value> {
+    let n = c.sessions.fetch_add(1, Ordering::SeqCst) + 1;
+    Json(json!({
+        "data": {
+            "id": format!("ses_{n}"),
+            "projectID": "global",
+            "cost": 0,
+            "time": {"created": 1, "updated": 2},
+            "location": {"directory": "/x"}
+        }
+    }))
+}
+
+async fn count_prompt(State(c): State<Counters>, _path: Path<String>) -> Json<Value> {
+    c.prompts.fetch_add(1, Ordering::SeqCst);
+    Json(json!({}))
+}
+
+/// A fan-out's transport layer: `N` sessions are created and `N` prompts are
+/// issued in parallel over a `JoinSet`, all reaching the server.
+#[tokio::test]
+async fn fans_out_n_parallel_prompts_via_joinset() {
+    let counters = Counters::default();
+    let app = Router::new()
+        .route("/api/session", post(count_create))
+        .route("/api/session/{id}/prompt", post(count_prompt))
+        .with_state(counters.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base = reqwest::Url::parse(&format!("http://{addr}")).unwrap();
+    let client = OpenCode::with_base(base, "irrelevant");
+
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..3 {
+        let client = client.clone();
+        set.spawn(async move {
+            let session = client.create_session("/x").await.unwrap();
+            client
+                .prompt(&session.id, "work the goal from your role")
+                .await
+                .unwrap();
+        });
+    }
+    while let Some(result) = set.join_next().await {
+        result.unwrap();
+    }
+
+    assert_eq!(counters.sessions.load(Ordering::SeqCst), 3);
+    assert_eq!(counters.prompts.load(Ordering::SeqCst), 3);
 }

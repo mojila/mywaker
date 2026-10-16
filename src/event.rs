@@ -32,6 +32,7 @@ impl EventHandler {
         select! {
             Some(Ok(event)) = self.events.next() => Ok(match event {
                 Event::Key(key) => Message::Key(key),
+                Event::Paste(text) => Message::Paste(text),
                 Event::Resize(width, height) => Message::Resize(width, height),
                 _ => Message::Tick,
             }),
