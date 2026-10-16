@@ -28,6 +28,11 @@ pub enum Message {
     },
     /// A session transcript finished loading.
     TranscriptLoaded(Vec<SessionMessage>),
+    /// A chat-local `/skill add` install finished (names of installed skills, or the error).
+    SkillInstallDone {
+        employee: usize,
+        result: Result<Vec<String>, String>,
+    },
     /// Kenari routed models for `(employee index, model id)` pairs.
     ModelsAssigned(Vec<(usize, String)>),
     /// A free-form line for the status log.

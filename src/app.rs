@@ -155,6 +155,9 @@ impl App {
             Message::TranscriptLoaded(messages) => {
                 self.handle_transcript(messages);
             }
+            Message::SkillInstallDone { employee, result } => {
+                self.handle_skill_install_done(employee, result);
+            }
             Message::ModelsAssigned(assigned) => {
                 let count = assigned.len();
                 for (index, model) in assigned {
@@ -273,6 +276,12 @@ impl App {
         }
         self.input.clear();
 
+        // Chat-local slash commands are handled here and never sent to the
+        // OpenCode session (e.g. `/skill add <source>`).
+        if self.dispatch_chat_command(&text) {
+            return;
+        }
+
         let Some(session_id) = self.chat_session_id.clone() else {
             self.push_log("no active session".to_string());
             return;
@@ -297,6 +306,195 @@ impl App {
             if let Err(err) = client.prompt(&session_id, &text).await {
                 let _ = tx.send(Message::Log(format!("prompt failed: {err}"))).await;
             }
+        });
+    }
+
+    /// Recognize and run chat-local slash commands. Returns true when `text` was
+    /// consumed as a command (it must not be forwarded to the session).
+    fn dispatch_chat_command(&mut self, text: &str) -> bool {
+        let Some(rest) = text.trim().strip_prefix('/') else {
+            return false;
+        };
+        let rest = rest.trim();
+
+        // `/skills` — list installed skill names into the transcript.
+        if rest == "skills" {
+            self.transcript.push(TranscriptLine {
+                role: TranscriptRole::Info,
+                text: format!("⚡ {text}"),
+            });
+            let names = crate::skills::installed();
+            if names.is_empty() {
+                self.transcript.push(TranscriptLine {
+                    role: TranscriptRole::Info,
+                    text: "no skills installed for this project".to_string(),
+                });
+            } else {
+                for name in names {
+                    self.transcript.push(TranscriptLine {
+                        role: TranscriptRole::Info,
+                        text: format!("  • {name}"),
+                    });
+                }
+            }
+            return true;
+        }
+
+        // `/skill add <source>[@skill]` — install then attach to this employee.
+        if let Some(source) = rest.strip_prefix("skill add ").map(str::trim) {
+            if source.is_empty() {
+                self.push_transcript_error("usage: /skill add <source>[@skill]".to_string());
+                return true;
+            }
+            let Some(employee) = self.chat_employee else {
+                self.push_transcript_error("no employee selected".to_string());
+                return true;
+            };
+            self.transcript.push(TranscriptLine {
+                role: TranscriptRole::Info,
+                text: format!("⚡ /skill add {source}"),
+            });
+            self.spawn_skill_install(employee, source.to_string());
+            return true;
+        }
+
+        // `/skill <name>` — attach an already-installed skill to this employee.
+        if let Some(name) = rest.strip_prefix("skill ").map(str::trim) {
+            if name.is_empty() {
+                self.push_transcript_error("usage: /skill <name>".to_string());
+                return true;
+            }
+            self.attach_skill(name.to_string());
+            return true;
+        }
+
+        // `/help` — show the chat-local commands.
+        if rest == "help" {
+            self.transcript.push(TranscriptLine {
+                role: TranscriptRole::Info,
+                text: "chat commands:\n  /skill add <source>  install & attach a skill\n  /skill <name>        attach an installed skill\n  /skills              list installed skills"
+                    .to_string(),
+            });
+            return true;
+        }
+
+        false
+    }
+
+    /// Kick off a background install of `source`, reporting installed skill
+    /// names back through the event channel.
+    fn spawn_skill_install(&mut self, employee: usize, source: String) {
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = crate::skills::add_named(&source).map_err(|err| err.to_string());
+            let _ = tx.blocking_send(Message::SkillInstallDone { employee, result });
+        });
+    }
+
+    /// Attach the freshly installed skills to the employee and persist the roster.
+    fn handle_skill_install_done(&mut self, employee: usize, result: Result<Vec<String>, String>) {
+        let names = match result {
+            Ok(names) => names,
+            Err(err) => {
+                self.push_transcript_error(format!("skill install failed: {err}"));
+                return;
+            }
+        };
+
+        let employee_name = self
+            .team
+            .employees()
+            .get(employee)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| "employee".to_string());
+        let employee_id = self.team.employees().get(employee).map(|e| e.id.clone());
+
+        let Some(employee_id) = employee_id else {
+            self.push_transcript_error("no such employee".to_string());
+            return;
+        };
+
+        let mut attached: Vec<String> = Vec::new();
+        for name in &names {
+            match self.team.add_skill(&employee_id, name) {
+                Ok(()) => attached.push(name.clone()),
+                Err(err) => self.push_transcript_error(err),
+            }
+        }
+
+        if let Err(err) = self.persist_team() {
+            self.push_transcript_error(format!("saving team failed: {err}"));
+            return;
+        }
+
+        if attached.len() == 1 {
+            self.transcript.push(TranscriptLine {
+                role: TranscriptRole::Info,
+                text: format!(
+                    "✓ installed & attached '{}' to {employee_name}",
+                    attached[0]
+                ),
+            });
+        } else {
+            self.transcript.push(TranscriptLine {
+                role: TranscriptRole::Info,
+                text: format!(
+                    "✓ installed & attached {} skills ({}) to {employee_name}",
+                    attached.len(),
+                    attached.join(", ")
+                ),
+            });
+        }
+    }
+
+    /// Attach an already-installed skill (by name) to the current employee.
+    fn attach_skill(&mut self, name: String) {
+        self.transcript.push(TranscriptLine {
+            role: TranscriptRole::Info,
+            text: format!("⚡ /skill {name}"),
+        });
+
+        let Some(employee) = self.chat_employee else {
+            self.push_transcript_error("no employee selected".to_string());
+            return;
+        };
+        let Some(employee_name) = self.team.employees().get(employee).map(|e| e.name.clone())
+        else {
+            self.push_transcript_error("no such employee".to_string());
+            return;
+        };
+        let Some(employee_id) = self.team.employees().get(employee).map(|e| e.id.clone()) else {
+            self.push_transcript_error("no such employee".to_string());
+            return;
+        };
+
+        if let Err(err) = self.team.add_skill(&employee_id, &name) {
+            self.push_transcript_error(err);
+            return;
+        }
+        if let Err(err) = self.persist_team() {
+            self.push_transcript_error(format!("saving team failed: {err}"));
+            return;
+        }
+
+        self.transcript.push(TranscriptLine {
+            role: TranscriptRole::Info,
+            text: format!("✓ attached '{name}' to {employee_name}"),
+        });
+    }
+
+    /// Persist the roster to its default location.
+    fn persist_team(&self) -> Result<()> {
+        let path = crate::team::Team::default_path()
+            .ok_or_else(|| color_eyre::eyre::eyre!("could not determine config directory"))?;
+        self.team.save(&path)
+    }
+
+    /// Push an error line into the chat transcript.
+    fn push_transcript_error(&mut self, message: String) {
+        self.transcript.push(TranscriptLine {
+            role: TranscriptRole::Error,
+            text: message,
         });
     }
 
@@ -605,10 +803,17 @@ impl App {
 }
 
 /// Build display lines from a canonical transcript.
+///
+/// Messages are sorted by their creation timestamp so the rendered transcript
+/// reads chronologically regardless of the transport's paging/order, and
+/// contentless markers (e.g. a successful `idle` turn boundary) are dropped.
 fn build_transcript(messages: &[SessionMessage]) -> Vec<TranscriptLine> {
-    messages
-        .iter()
-        .map(|message| {
+    let mut sorted: Vec<&SessionMessage> = messages.iter().collect();
+    sorted.sort_by_key(|message| message.time.as_ref().map(|time| time.created).unwrap_or(0));
+
+    sorted
+        .into_iter()
+        .filter_map(|message| {
             let role = match message.role() {
                 "user" => TranscriptRole::User,
                 "assistant" => TranscriptRole::Assistant,
@@ -621,7 +826,9 @@ fn build_transcript(messages: &[SessionMessage]) -> Vec<TranscriptLine> {
             {
                 text = format!("error: {err}");
             }
-            TranscriptLine { role, text }
+            // Drop markers that carry no visible content (empty idle boundaries).
+            (role != TranscriptRole::Info || !text.is_empty())
+                .then_some(TranscriptLine { role, text })
         })
         .collect()
 }
@@ -792,6 +999,27 @@ mod tests {
         assert_eq!(app.transcript.len(), 2);
         assert_eq!(app.transcript[0].role, TranscriptRole::User);
         assert_eq!(app.transcript[1].text, "hello world");
+    }
+
+    #[test]
+    fn build_transcript_orders_chronologically_and_drops_empty_idle() {
+        // The message endpoint returns newest-first by default; the transcript
+        // must re-sort by creation time and drop the contentless idle marker.
+        let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+            {"id":"m3","time":{"created":300},"type":"idle","outcome":"succeeded"},
+            {"id":"m2","time":{"created":200,"completed":250},"type":"assistant",
+             "content":[{"type":"text","text":"hello"}],"finish":"stop"},
+            {"id":"m1","time":{"created":100},"text":"go","type":"user"}
+        ]))
+        .unwrap();
+
+        let transcript = build_transcript(&messages);
+
+        assert_eq!(transcript.len(), 2, "idle marker with no text is dropped");
+        assert_eq!(transcript[0].role, TranscriptRole::User);
+        assert_eq!(transcript[0].text, "go");
+        assert_eq!(transcript[1].role, TranscriptRole::Assistant);
+        assert_eq!(transcript[1].text, "hello");
     }
 
     #[test]

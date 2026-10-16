@@ -175,6 +175,8 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Chat => Line::from(vec![
             " Enter ".bold().cyan(),
             "send ".dim(),
+            " /skill add ".bold().cyan(),
+            "skill ".dim(),
             " Esc ".bold().cyan(),
             "back ".dim(),
             " Ctrl-C ".bold().cyan(),

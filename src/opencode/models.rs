@@ -301,11 +301,26 @@ impl SessionMessage {
     }
 }
 
+/// Pagination cursor for message-list responses, carried as `{ previous, next }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesCursor {
+    #[serde(default)]
+    pub previous: Option<String>,
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
 /// `GET /api/session/{id}/message` response envelope.
+///
+/// The endpoint defaults to newest-first and pages by an opaque `cursor`, so the
+/// client follows `cursor.next` until it has the full (chronological) transcript.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagesResponse {
     pub data: Vec<SessionMessage>,
+    #[serde(default)]
+    pub cursor: Option<MessagesCursor>,
 }
 
 /// A model offered through an installed provider, from `GET /api/model`.
@@ -511,6 +526,26 @@ mod tests {
         let user = &resp.data[2];
         assert_eq!(user.role(), "user");
         assert_eq!(user.display_text(), "Reply exactly");
+    }
+
+    #[test]
+    fn deserializes_message_cursor_and_asc_page() {
+        let raw = r#"{"data":[
+            {"id":"m1","time":{"created":1},"text":"go","type":"user"},
+            {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+             "content":[{"id":"p1","type":"text","text":"hi"}],"finish":"stop"}
+        ],
+        "cursor":{"previous":null,"next":"eyJzb21lIjoiY3Vyc29yIn0"}}"#;
+        let resp: MessagesResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.data.len(), 2);
+        let cursor = resp.cursor.expect("cursor present");
+        assert!(cursor.previous.is_none());
+        assert_eq!(cursor.next.as_deref(), Some("eyJzb21lIjoiY3Vyc29yIn0"));
+
+        // A response with no cursor (final page) still deserializes.
+        let last: MessagesResponse =
+            serde_json::from_str(r#"{"data":[],"cursor":{"previous":"x","next":null}}"#).unwrap();
+        assert!(last.cursor.as_ref().unwrap().next.is_none());
     }
 
     #[test]

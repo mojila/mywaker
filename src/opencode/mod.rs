@@ -79,10 +79,35 @@ impl OpenCode {
     }
 
     /// Fetch the full transcript of a session.
+    ///
+    /// The endpoint returns messages newest-first by default and pages by an
+    /// opaque cursor, so we request oldest-first on the first page and then walk
+    /// `cursor.next` until the timeline is exhausted. The result is the complete
+    /// transcript in chronological order.
     pub async fn messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
-        let path = format!("/api/session/{session_id}/message");
-        let response: models::MessagesResponse = self.get_json(&path).await?;
-        Ok(response.data)
+        let mut all: Vec<SessionMessage> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut url = self.url(&format!("/api/session/{session_id}/message"))?;
+            {
+                let mut query = url.query_pairs_mut();
+                match &cursor {
+                    Some(c) => query.append_pair("cursor", c),
+                    None => query.append_pair("order", "asc"),
+                };
+            }
+
+            let response: models::MessagesResponse = self.get_json_url(url).await?;
+            let has_next = response.cursor.as_ref().and_then(|c| c.next.clone());
+            all.extend(response.data);
+            cursor = has_next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(all)
     }
 
     /// Send a prompt to a session.
@@ -114,20 +139,24 @@ impl OpenCode {
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        self.get_json_url(self.url(path)?).await
+    }
+
+    async fn get_json_url<T: DeserializeOwned>(&self, url: Url) -> Result<T> {
         let response = self
             .http
-            .get(self.url(path)?)
+            .get(url.clone())
             .header("authorization", &self.auth)
             .send()
             .await
-            .wrap_err_with(|| format!("GET {path}"))?
+            .wrap_err_with(|| format!("GET {url}"))?
             .error_for_status()
-            .wrap_err_with(|| format!("GET {path}"))?;
+            .wrap_err_with(|| format!("GET {url}"))?;
 
         response
             .json::<T>()
             .await
-            .wrap_err_with(|| format!("decoding GET {path}"))
+            .wrap_err_with(|| format!("decoding GET {url}"))
     }
 
     async fn post_json<T: DeserializeOwned>(
