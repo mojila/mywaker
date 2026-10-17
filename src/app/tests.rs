@@ -948,3 +948,43 @@ fn input_scroll_follows_cursor_horizontally() {
     app.cursor_home();
     assert_eq!(app.input_scroll, 0);
 }
+
+#[test]
+fn input_scroll_retracts_on_delete_shrink() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.last_size = (8, 24); // 4 display columns for the input body
+
+    for c in "abcdefgh".chars() {
+        app.input_insert(c);
+    }
+    assert_eq!(app.input_cursor(), 8);
+    // Cursor (column 8) is past the 4-column window → scrolled to the end.
+    assert_eq!(app.input_scroll, 8 + 1 - 4);
+
+    // Backspace 4× back to "abcd". The view must pull back left so the text
+    // stays visible (showing "bcd" + cursor), not collapse to a bare cursor.
+    for _ in 0..4 {
+        app.input_delete_backward();
+    }
+    assert_eq!(app.input, "abcd");
+    assert_eq!(app.input_cursor(), 4);
+    assert_eq!(app.input_scroll, 4 + 1 - 4);
+}
+
+#[test]
+fn input_scroll_retracts_on_delete_word() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.last_size = (8, 24); // 4 display columns for the input body
+
+    for c in "abcdefgh".chars() {
+        app.input_insert(c);
+    }
+    assert_eq!(app.input_scroll, 8 + 1 - 4);
+
+    // Ctrl-W back to the empty prefix: the scroll must retract to zero.
+    app.input_delete_word();
+    assert_eq!(app.input, "");
+    assert_eq!(app.input_scroll, 0);
+}

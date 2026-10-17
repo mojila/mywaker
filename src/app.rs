@@ -690,6 +690,12 @@ impl App {
         } else if cursor_col < self.input_scroll {
             self.input_scroll = cursor_col;
         }
+        // On shrink (backspace / delete-word / delete-to-start), collapse the
+        // view back to the smallest scroll that still keeps the cursor in view.
+        // Without this, deleting leaves the scroll stranded past the (now
+        // shorter) text, trimming the whole input off the left of the window.
+        let minimal = cursor_col.saturating_add(1).saturating_sub(width);
+        self.input_scroll = self.input_scroll.min(minimal);
     }
 
     fn cursor_left(&mut self) {

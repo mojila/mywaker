@@ -336,6 +336,11 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     if body_width > 0 && cursor_col >= scroll + body_width {
         scroll = cursor_col + 1 - body_width;
     }
+    // Mirror `App`'s shrink retraction: pull the scroll back to the minimal
+    // in-view value so a shortened input doesn't render as a bare cursor block.
+    if body_width > 0 {
+        scroll = scroll.min(cursor_col.saturating_add(1).saturating_sub(body_width));
+    }
 
     let (before, _) = trim_leading_columns(&text[..byte], scroll);
     let after = &text[byte..];
