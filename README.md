@@ -39,6 +39,9 @@ green done) while the robot avatar mirrors the aggregate state.
   (`mywaker model list`) and assign one per employee (`mywaker model set` or the
   TUI picker via `m`). The chosen model is persisted to `team.toml` and applied
   to that employee's sessions.
+- **Autonomous scheduling** — cron schedules (`[[schedules]]`) fire tasks at
+  employees with no chat required. Each task persists across restarts and retries
+  up to three times on failure.
 
 ## Requirements
 
@@ -103,15 +106,30 @@ mywaker skills list                      # list installed skills
 mywaker skills add vercel-labs/agent-skills@react-best-practices -g  # install
 ```
 
+### Agent definitions (roles)
+
+Each employee maps 1:1 to an OpenCode agent whose id matches the employee id.
+Define role-specific system prompts in the *target project's* OpenCode config so
+every employee runs with its own role instead of the shared default. Ready-to-copy
+definitions are in [`examples/`](examples/):
+
+- [`examples/opencode.agents.jsonc`](examples/opencode.agents.jsonc) — the
+  `planner` / `researcher` / `writer` / `reviewer` agents as an `opencode.jsonc`
+  `agents` block you can drop in or merge.
+- [`examples/agents/*.md`](examples/agents) — the same roles as individual
+  markdown agent files, for the `.opencode/agents/` directory.
+
 ## Controls
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` or `j` / `k` | Select an employee |
+| `←` / `→` or `h` / `l` (also `↑`/`↓`, `j`/`k`) | Move the workflow stage / select an employee |
 | `Enter` | Chat with the selected employee |
 | `m` | Pick a model for the selected employee |
+| `p` | Choose the working project |
+| `?` | Open the keybindings help overlay |
 | `Esc` | Back / leave chat |
-| `q` | Quit |
+| `q` / `Ctrl-C` | Quit |
 
 ## Model selection
 
@@ -153,6 +171,29 @@ api_key = "kn-…"                               # or leave unset to use KENARI_
 `endpoint`, `model`, and `api_key` are all optional and default to Kenari's public
 endpoint; they can also be set via `MYWAKER_JEV_ENDPOINT`, `MYWAKER_JEV_MODEL`, and
 `MYWAKER_JEV_API_KEY`. With no API key available, Jev is simply disabled.
+
+## Autonomous scheduling
+
+Employees can start on their own — no chat required. Add cron schedules to
+`~/.config/mywaker/config.toml`:
+
+```toml
+[[schedules]]
+cron = "0 9 * * 1-5"          # 09:00 Mon–Fri
+employee = "planner"
+goal = "Summarize yesterday's commits into a morning briefing"
+
+[[schedules]]
+cron = "0/15 * * * *"
+employee = "researcher"
+goal = "Watch the build for regressions and report any failures"
+```
+
+When a schedule fires, mywaker creates a task, starts a session for that employee,
+streams the goal, and reports the deliverable in the log. A task that fails is
+retried up to three times; the retry preamble tells the employee what broke. Task
+history (and per-employee memory) persists to `store.json` under your config dir,
+so it survives restarts.
 
 ## Architecture
 

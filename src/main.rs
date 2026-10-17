@@ -153,8 +153,21 @@ async fn main() -> Result<()> {
 
     let mut tui = Tui::new()?;
     let events = EventHandler::new(config.tick_rate, rx);
+    let schedules = config.schedules.clone();
+
+    // Arm cron schedules so employees can start autonomously. The scheduler
+    // sends into its own clone of the channel, which stays alive for the app's
+    // lifetime regardless of the `tx` moved into `App` below.
+    let scheduler_tx = tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = mywaker::scheduler::run(scheduler_tx, schedules).await {
+            tracing::error!("scheduler failed: {err}");
+        }
+    });
+
     let mut app = App::with_team(config, tx, mywaker::team::Team::load_or_starter());
     app.set_jev(jev);
+    app.enable_persistence();
 
     tui.enter()?;
     let result = app.run(&mut tui, events).await;

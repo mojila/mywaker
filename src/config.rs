@@ -5,7 +5,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     #[serde(with = "humantime_serde")]
     pub tick_rate: Duration,
@@ -14,6 +14,20 @@ pub struct Config {
     pub workdir: Option<PathBuf>,
     /// Optional Jev (System One) classifier settings.
     pub jev: JevConfig,
+    /// Cron schedules for autonomous dispatch.
+    pub schedules: Vec<Schedule>,
+}
+
+/// A cron schedule: fire `goal` at `employee` on a cron cadence.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Schedule {
+    /// Cron expression (5-field, e.g. `0 9 * * 1-5`).
+    pub cron: String,
+    /// The employee id to dispatch to.
+    pub employee: String,
+    /// The natural-language goal to hand that employee.
+    pub goal: String,
 }
 
 /// Jev (System One) classifier settings. Jev is an *optional* classifier — it is
@@ -35,6 +49,7 @@ impl Default for Config {
             tick_rate: Duration::from_millis(100),
             workdir: None,
             jev: JevConfig::default(),
+            schedules: Vec::new(),
         }
     }
 }
@@ -114,5 +129,49 @@ mod tests {
         );
         assert_eq!(cfg.jev.model.as_deref(), Some("custom-decision-model"));
         assert_eq!(cfg.jev.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn deserializes_schedules() {
+        let text = r#"
+            tick_rate = "100ms"
+            [[schedules]]
+            cron = "0 9 * * 1-5"
+            employee = "planner"
+            goal = "Summarize yesterday's commits"
+        "#;
+        let cfg: Config = toml::from_str(text).expect("parse config");
+        assert_eq!(cfg.schedules.len(), 1);
+        assert_eq!(cfg.schedules[0].cron, "0 9 * * 1-5");
+        assert_eq!(cfg.schedules[0].employee, "planner");
+        assert_eq!(cfg.schedules[0].goal, "Summarize yesterday's commits");
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_field() {
+        let text = r#"
+            tick_rate = "100ms"
+            tickrate = "100ms"
+        "#;
+        assert!(toml::from_str::<Config>(text).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_schedule_field() {
+        let text = r#"
+            [[schedules]]
+            cron = "0 9 * * 1-5"
+            crone = "typo"
+            employee = "planner"
+            goal = "x"
+        "#;
+        assert!(toml::from_str::<Config>(text).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_tick_rate() {
+        // `tick_rate` must be a duration string, not a bare number.
+        let text = "tick_rate = 100\n";
+        assert!(toml::from_str::<Config>(text).is_err());
     }
 }

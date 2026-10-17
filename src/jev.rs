@@ -38,17 +38,17 @@ impl JevClient {
         api_key: impl Into<String>,
         endpoint: impl Into<String>,
         model: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
-            .expect("failed to build reqwest client");
-        Self {
+            .wrap_err("failed to build reqwest client")?;
+        Ok(Self {
             http,
             api_key: api_key.into(),
             endpoint: endpoint.into(),
             model: model.into(),
-        }
+        })
     }
 
     /// Build a client from [`JevConfig`]. The API key is taken from the config,
@@ -56,7 +56,7 @@ impl JevClient {
     /// disabled). Endpoint and model default to the public Kenari values.
     pub fn from_config(cfg: &JevConfig) -> Option<JevClient> {
         let (api_key, endpoint, model) = Self::settings(cfg)?;
-        Some(Self::new(api_key, endpoint, model))
+        Self::new(api_key, endpoint, model).ok()
     }
 
     /// Resolve the (api key, endpoint, model) from config, with a

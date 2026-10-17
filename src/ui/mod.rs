@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::app::{App, Mode};
@@ -33,6 +33,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_main(frame, app, main_area);
     render_log(frame, app, log_area);
     render_help(frame, app, help_area);
+
+    if app.show_help() {
+        render_help_overlay(frame, frame.area());
+    }
 }
 
 fn render_title(frame: &mut Frame, app: &App, area: Rect) {
@@ -202,6 +206,8 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             "projects ".dim(),
             " m ".bold().cyan(),
             "model ".dim(),
+            " ? ".bold().cyan(),
+            "help ".dim(),
             " q ".bold().cyan(),
             "quit ".dim(),
         ]),
@@ -245,4 +251,79 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         ]),
     };
     frame.render_widget(Paragraph::new(help), area);
+}
+
+/// Centre a fixed-size popup within `area`, clamped to the terminal size.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2));
+    let height = height.min(area.height.saturating_sub(2));
+    let [_, vertical_center, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let [_, popup, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(width),
+        Constraint::Fill(1),
+    ])
+    .areas(vertical_center);
+    popup
+}
+
+/// The help overlay's body lines.
+fn help_lines() -> Vec<Line<'static>> {
+    let key = |k: &'static str, d: &'static str| {
+        Line::from(vec![
+            Span::styled(
+                k,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {d}")),
+        ])
+    };
+    let head = |t: &'static str| {
+        Line::from(Span::styled(
+            t,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    vec![
+        head(" global"),
+        key("q · Esc", "quit (any screen)"),
+        key("?", "this help overlay"),
+        Line::from(""),
+        head(" roster"),
+        key("←/→ j/k", "move workflow stage"),
+        key("Enter", "chat with the selected employee"),
+        key("m", "pick a model"),
+        key("p", "choose the working project"),
+        Line::from(""),
+        head(" chat"),
+        key("Enter", "send · Shift+Enter newline"),
+        key("↑/↓", "command history · PgUp/PgDn scroll"),
+        key("Esc", "back · Ctrl-C stop · /help commands"),
+        Line::from(""),
+        head(" model picker"),
+        key("type", "filter by id / name / provider"),
+        key("Enter", "assign · Ctrl-U clear · Esc back"),
+    ]
+}
+
+/// A full-screen help overlay, centred over the current view.
+fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    frame.render_widget(Clear, area);
+    let popup = centered(area, 68, 20);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Color::Cyan)
+        .bg(Color::Black)
+        .title(" help ".bold().cyan());
+    frame.render_widget(Paragraph::new(help_lines()).block(block), popup);
 }

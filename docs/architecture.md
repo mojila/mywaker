@@ -35,9 +35,9 @@ mywaker/
     ├── workflow.rs           delegation protocol (parse `@id` directives, team preamble)
     ├── jev.rs                Jev (System One) client — answers `@jev` + `form.created`
     ├── role.rs               Role enum — workflow stage order/labels for the pipeline
-    ├── task.rs               (planned M6) Task model, queue, retry, state machine
-    ├── persistence.rs        (planned M6) JSON store (tasks, memory)
-    ├── scheduler.rs          (planned M7) cron → dispatch events
+    ├── task.rs               Task model + state machine + retry (cap 3)
+    ├── persistence.rs        JSON store (tasks + per-employee memory), atomic write
+    ├── scheduler.rs          tokio-cron-scheduler — `[[schedules]]` → dispatch
     ├── opencode/
     │   ├── mod.rs            client + request helpers (server_info/agents/create_session/prompt/wait/interrupt/reply_form/events)
     │   ├── service.rs        discover `opencode service status`, read password

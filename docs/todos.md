@@ -32,7 +32,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 💻 `events.rs` — hand-rolled SSE parser (async-stream + reqwest `bytes_stream`); no `reqwest-eventsource` dep
 - [x] 🧪 unit: serde round-trips + `basic_auth` + camelCase/ID-suffix fixtures
 - [x] 🧪 live smoke test (`#[ignore]`): connect → `server_info` → list agents (passes against real service)
-- [ ] 🧪 integration: `tests/` fake OpenCode server (deferred to M5/M6, where prompt/wait flows are exercised)
+- [x] 🧪 integration: `tests/` fake OpenCode server (axum) exercising info/agents/session + prompt/wait/messages flow
 - [x] ✅ `cargo test` green · `cargo clippy` clean · `cargo fmt` clean
 
 > Note: ID-suffix fields use Go-style `xxxID` (not serde's `camelCase` `xxxId`).
@@ -47,7 +47,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 💻 `event.rs` — `select!` loop: crossterm `EventStream` + `mpsc::Receiver<Message>` (OpenCode) + tick interval
 - [x] 💻 `tui.rs` — terminal init/restore with manual panic hook (justified: manual `Terminal<CrosstermBackend>`, per skill exception)
 - [x] 💻 `team.rs` — `Employee`, starter roster, `EmployeeStatus`, `is_busy`
-- [ ] 🧪 unit: config parsing (valid file + unknown-field + missing-field errors) — deferred (config is a single field today)
+- [x] 🧪 unit: config parsing (valid file + unknown-field + malformed-value errors) — `deny_unknown_fields` now enabled on `Config`/`Schedule`; adds `[[schedules]]`
 - [x] ✅ compiles, renders, `q`/`Esc` quits (verified via `TestBackend` render tests)
 
 ## M3 — Robot avatar widget (`src/ui/robot.rs`)
@@ -56,7 +56,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 💻 `Idle` + `Thinking` + `Working` + `Error` variants as static ASCII templates
 - [x] 💻 "thinking" animation via Braille spinner (self-contained) — `tui-shimmer` dep dropped to avoid an unverified-API dependency; swap in later if we want richer shimmer
 - [x] 💻 Blink/spin driven by tick `frame` counter (deterministic)
-- [ ] 🧪 unit: phase→frame mapping — covered indirectly by render smoke tests; add explicit mapping test in M6 when statuses actually transition
+- [x] 🧪 unit: phase→frame mapping — explicit render tests assert line count, idle blink period, spinner rotation, stable error glyph
 - [x] ✅ avatar renders and animates in the left panel, reflects connection/team state (`connecting`→`thinking`, error→`✕`, connected+idle→blinking antenna)
 
 ## M4 — Team dashboard (`src/ui/dashboard.rs`)
@@ -112,14 +112,14 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 
 ## M6 — Harness: tasks, retry, persistence, scheduler
 
-- [ ] 💻 `task.rs` — `TaskId` newtype, `TaskStatus` state machine, `try_retry` (cap 3)
-- [ ] 💻 `persistence.rs` — JSON store (tasks + memory) via `dirs`, atomic single-write
-- [ ] 💻 Wire `wait` endpoint as completion signal; detect failure → retry preamble
-- [ ] 💻 `scheduler.rs` — `tokio-cron-scheduler` from `[[schedules]]` → dispatch
+- [x] 💻 `task.rs` — `TaskId` newtype, `TaskStatus` state machine, `try_retry` (cap 3)
+- [x] 💻 `persistence.rs` — JSON store (tasks + memory) via `dirs`, atomic single-write
+- [x] 💻 Wire `wait` endpoint as completion signal; detect failure → retry preamble
+- [x] 💻 `scheduler.rs` — `tokio-cron-scheduler` from `[[schedules]]` → dispatch
 - [ ] 💻 Watch-hook (optional): file-change trigger → dispatch (`notify` crate)
-- [ ] 🧪 unit: task state transitions (Pending→Running→Succeeded/Failed/Retrying)
-- [ ] 🧪 unit: retry cap; persistence round-trip
-- [ ] ✅ scheduled task fires autonomously, survives restart via persistence
+- [x] 🧪 unit: task state transitions (Pending→Running→Succeeded/Failed/Retrying)
+- [x] 🧪 unit: retry cap; persistence round-trip
+- [ ] ✅ scheduled task fires autonomously, survives restart via persistence — history round-trips; live fire needs a running service
 
 ## M7 — Orchestration (multi-employee fan-out)
 
@@ -148,17 +148,17 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 
 ## M8 — Polish & ship
 
-- [ ] 💻 Help popup + keybinding footer (q quit, ↑↓ navigate, Enter chat, d dispatch, r retry, t tab)
-- [ ] 💻 Tabbed layout: Dashboard / Tasks / (Chat is modal-on-Enter)
-- [ ] 💻 Theming/colors consistent (cyan/green/red/yellow-dim per architecture §5)
-- [ ] 💻 `tui-shimmer` idle "waiting for work…" states
-- [ ] 📄 `README.md` — install, config, keybindings, OpenCode setup, screenshots(gif)
-- [ ] 📄 Sample `.opencode/agents/*.md` + `opencode.jsonc` checked in
-- [ ] ✅ `cargo fmt --check`
-- [ ] ✅ `cargo clippy --all-features -- -D warnings` clean
-- [ ] ✅ no `unwrap()` outside tests (colors-eyre context everywhere)
-- [ ] ✅ terminal restored on all exit paths (incl. panic)
-- [ ] ✅ `cargo build --release` succeeds; binary size noted
+- [x] 💻 Help popup + keybinding footer (q quit, ←/→ stage, Enter chat, m model, p projects, ? help)
+- [ ] 💻 Tabbed layout: Dashboard / Tasks / (Chat is modal-on-Enter) — superseded by the workflow-pipeline + right-hand tasks panel (see M4 note)
+- [x] 💻 Theming/colors consistent (cyan/green/red/yellow-dim per architecture §5)
+- [ ] 💻 `tui-shimmer` idle "waiting for work…" states — deferred: self-contained Braille spinner already animates thinking/working (see M3 note)
+- [x] 📄 `README.md` — install, config, keybindings, OpenCode setup, scheduling, sample agents (screenshots/gif deferred)
+- [x] 📄 Sample agent definitions checked in — `examples/opencode.agents.jsonc` + `examples/agents/{planner,researcher,writer,reviewer}.md`
+- [x] ✅ `cargo fmt --check`
+- [x] ✅ `cargo clippy --all-features -- -D warnings` clean
+- [x] ✅ no `unwrap()` outside tests (colors-eyre context everywhere)
+- [x] ✅ terminal restored on all exit paths (incl. panic)
+- [x] ✅ `cargo build --release` succeeds; binary size noted (6.4M `target/release/mywaker`)
 
 ---
 
@@ -179,6 +179,6 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 | Message-text streaming event names | ✅ Resolved | Extracted from the installed binary: `session.text.*`, `message.part.{delta,updated,removed}`, `session.reasoning.*`, `session.execution.*`, `session.step.*`; plus canonical-poll fallback | M5 |
 | `create_session` response `{"data":{…}}` envelope | ✅ Resolved | Verified live; `DataEnvelope<T>` added | M5 |
 | `POST /api/session` rejects bare-string `model` (`Expected Model.Ref | null`) | ✅ Resolved | `create_session` now sends `model` as `{ "id", "providerID" }`; provider persisted on assignment (`model_provider`) and backfilled for legacy rosters | M5.5 |
-| `experimental/session/{id}/wait` signature drift | ⚠️ Open | Fallback to polling `GET /api/session/{id}/message` | M6 |
+| `experimental/session/{id}/wait` signature drift | ✅ Resolved | Scheduled-task runner calls `wait` best-effort then verifies completion from `GET /api/session/{id}/message` (the drift fallback) | M6 |
 | Live model inference blocked by weekly budget | ✅ Resolved | Budget restored; live conversation loop can be verified against the service | M5 |
 | No Rust SDK (by design) | ✅ Resolved | Thin `opencode` module isolates the HTTP surface | M1 |

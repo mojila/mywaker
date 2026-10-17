@@ -782,3 +782,39 @@ fn models_loaded_clamps_selection_to_filtered_range() {
 
     assert_eq!(app.model_selected, 0);
 }
+
+// --- help overlay ---
+
+#[test]
+fn question_mark_opens_help_and_any_key_dismisses() {
+    let (mut app, _rx) = make_app();
+
+    // `?` opens the help overlay from the roster.
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    assert!(app.show_help);
+
+    // Any subsequent key dismisses it.
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert!(!app.show_help);
+}
+
+#[test]
+fn help_does_not_open_in_chat() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+
+    // `?` is a normal character in chat, not a help toggle.
+    app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    assert!(!app.show_help);
+    assert_eq!(app.input, "?");
+}
+
+#[test]
+fn renders_help_overlay_without_panicking() {
+    let (mut app, _rx) = make_app();
+    app.show_help = true;
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+}

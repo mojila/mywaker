@@ -46,6 +46,14 @@ pub enum Message {
     ModelsLoaded(Vec<crate::opencode::ProviderModel>),
     /// Jev answered a delegated `@jev` question (for `employee`, who asked).
     JevAnswer { employee: usize, answer: String },
+    /// A cron schedule fired, handing `goal` to `employee` (autonomous dispatch).
+    ScheduledTask { employee: String, goal: String },
+    /// One delivery attempt for a scheduled task finished (success or failure).
+    TaskAttemptFinished {
+        task_id: crate::task::TaskId,
+        succeeded: bool,
+        result: String,
+    },
     /// A free-form line for the status log.
     Log(String),
     /// Quit the application.

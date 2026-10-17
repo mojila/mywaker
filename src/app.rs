@@ -12,10 +12,12 @@ use crate::harness::{self, PendingDelivery};
 use crate::jev::JevClient;
 use crate::message::Message;
 use crate::opencode::{
-    AgentInfo, Event, OpenCode, ProviderModel, ServerInfo, SessionMessage, pick_provider,
+    AgentInfo, Event, ModelRef, OpenCode, ProviderModel, ServerInfo, SessionMessage, pick_provider,
 };
+use crate::persistence::Store;
 use crate::projects::{self, Project};
 use crate::role::Role;
+use crate::task::{Task, TaskId, TaskStatus};
 use crate::team::{EmployeeStatus, Team, move_selection};
 use crate::tui::Tui;
 use crate::ui;
@@ -225,6 +227,12 @@ pub struct App {
     usage: Usage,
     /// Process resource metrics (RSS + CPU) for the telemetry readout.
     metrics: ProcessMetrics,
+    /// Persisted scheduled-task history + per-employee memory.
+    store: Store,
+    /// Where the store persists (`None` disables persistence, e.g. in tests).
+    store_path: Option<PathBuf>,
+    /// Whether the full-screen help overlay is showing.
+    show_help: bool,
 }
 
 impl App {
@@ -269,6 +277,9 @@ impl App {
             next_fanout_id: 0,
             usage: Usage::default(),
             metrics: ProcessMetrics::new(),
+            store: Store::default(),
+            store_path: None,
+            show_help: false,
         }
     }
 
@@ -276,6 +287,15 @@ impl App {
     /// questions and OpenCode `form.created` prompts.
     pub fn set_jev(&mut self, jev: Option<JevClient>) {
         self.jev = jev;
+    }
+
+    /// Enable task/memory persistence at the default store path, loading any
+    /// previously saved tasks. Call once after [`Self::with_team`].
+    pub fn enable_persistence(&mut self) {
+        self.store_path = Store::default_path();
+        if let Some(path) = &self.store_path {
+            self.store = Store::load(path).unwrap_or_default();
+        }
     }
 
     pub async fn run(&mut self, tui: &mut Tui, mut events: EventHandler) -> Result<()> {
@@ -345,12 +365,28 @@ impl App {
             Message::JevAnswer { employee, answer } => {
                 self.push_to_chat(employee, TranscriptRole::Assistant, answer);
             }
+            Message::ScheduledTask { employee, goal } => {
+                self.handle_scheduled_task(employee, goal);
+            }
+            Message::TaskAttemptFinished {
+                task_id,
+                succeeded,
+                result,
+            } => {
+                self.handle_task_attempt(task_id, succeeded, result);
+            }
             Message::Log(line) => self.push_log(line),
             Message::Quit => self.should_quit = true,
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // The help overlay swallows the next key (dismiss) before anything else.
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+
         // Ctrl-C quits from anywhere except chat, where it interrupts the
         // running generation instead.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -359,6 +395,12 @@ impl App {
                 return;
             }
             self.should_quit = true;
+            return;
+        }
+
+        // `?` opens the help overlay from any non-chat screen.
+        if key.code == KeyCode::Char('?') && self.mode != Mode::Chat {
+            self.show_help = true;
             return;
         }
 
@@ -1891,6 +1933,127 @@ impl App {
         }
     }
 
+    // --- scheduled tasks (autonomous dispatch) ---
+
+    /// A cron schedule fired: record a task and dispatch its first attempt.
+    fn handle_scheduled_task(&mut self, employee_id: String, goal: String) {
+        let Some(index) = self.team_index_by_id(&employee_id) else {
+            self.push_log(format!(
+                "scheduled task for unknown employee '{employee_id}' — skipped"
+            ));
+            return;
+        };
+
+        let mut task = Task::new(goal.clone(), Some(employee_id.clone()));
+        task.transition(TaskStatus::Running);
+        self.store.upsert_task(task.clone());
+        self.persist_store();
+
+        self.team.set_status(index, EmployeeStatus::Thinking);
+        self.team.set_last_task(index, Some(task_summary(&goal)));
+        self.push_log(format!(
+            "⌛ scheduled task for {employee_id}: {}",
+            task_summary(&goal)
+        ));
+
+        self.dispatch_task(&task);
+    }
+
+    /// Spawn one delivery attempt for `task` in the background.
+    fn dispatch_task(&mut self, task: &Task) {
+        let Some(client) = self.client.clone() else {
+            self.push_log("scheduled task: not connected to OpenCode".to_string());
+            return;
+        };
+        let Some(employee_id) = task.assigned_to.clone() else {
+            return;
+        };
+        let Some(index) = self.team_index_by_id(&employee_id) else {
+            return;
+        };
+
+        let directory = self.workdir();
+        let employee = &self.team.employees()[index];
+        let agent = employee.agent_id().to_owned();
+        let model = employee.model_ref();
+        let goal = task.goal.clone();
+        let attempts = task.attempts;
+        let task_id = task.id;
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            let outcome = run_task_attempt(
+                &client,
+                &directory,
+                Some(agent.as_str()),
+                model.as_ref(),
+                &goal,
+                attempts,
+            )
+            .await;
+            let (succeeded, result) = match outcome {
+                Ok(result) => (true, result),
+                Err(reason) => (false, reason),
+            };
+            let _ = tx
+                .send(Message::TaskAttemptFinished {
+                    task_id,
+                    succeeded,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    /// Handle the outcome of one scheduled-task attempt: succeed, retry (bounded),
+    /// or fail — persisting the task and updating the roster status each time.
+    fn handle_task_attempt(&mut self, task_id: TaskId, succeeded: bool, result: String) {
+        let Some(position) = self.store.tasks.iter().position(|t| t.id == task_id) else {
+            return;
+        };
+
+        let assigned = self.store.tasks[position].assigned_to.clone();
+        let summary = task_summary(&self.store.tasks[position].goal);
+
+        let mut retry = false;
+        let mut status = EmployeeStatus::Error;
+        if succeeded {
+            self.store.tasks[position].succeed(result);
+            status = EmployeeStatus::Done;
+            self.push_log(format!("✓ scheduled task done: {summary}"));
+        } else if self.store.tasks[position].try_retry() {
+            status = EmployeeStatus::Thinking;
+            retry = true;
+            self.push_log(format!("🔁 scheduled task retrying: {summary} ({result})"));
+        } else {
+            self.store.tasks[position].fail(result);
+            self.push_log(format!("✕ scheduled task failed: {summary}"));
+        }
+
+        if let Some(employee_id) = &assigned
+            && let Some(employee) = self.team.employee_mut(employee_id)
+        {
+            employee.status = status;
+        }
+        self.persist_store();
+
+        if retry {
+            let task = self.store.tasks[position].clone();
+            self.dispatch_task(&task);
+        }
+    }
+
+    /// Persist the store to its configured path (a no-op when persistence is
+    /// disabled, e.g. in unit tests).
+    fn persist_store(&mut self) {
+        let Some(path) = &self.store_path else {
+            return;
+        };
+        if let Err(err) = self.store.save(path) {
+            self.push_log(format!("store save failed: {err}"));
+        }
+    }
+
     /// Open the model picker and fetch the models available through OpenCode's
     /// providers so the user can choose one for the selected employee.
     fn open_models(&mut self) {
@@ -2130,6 +2293,11 @@ impl App {
         self.mode
     }
 
+    /// Whether the full-screen help overlay is showing.
+    pub fn show_help(&self) -> bool {
+        self.show_help
+    }
+
     pub fn input(&self) -> &str {
         &self.input
     }
@@ -2272,6 +2440,74 @@ fn last_assistant_output(messages: &[SessionMessage]) -> Option<String> {
         .find(|message| message.role() == "assistant" && !message.is_incomplete())
         .map(|message| strip_directives(&message.display_text()))
         .filter(|text| !text.is_empty())
+}
+
+/// Run one scheduled-task attempt: create a session, prompt (with a retry
+/// preamble on later attempts), wait for completion, and read the outcome back
+/// from the transcript. `Ok` carries the deliverable; `Err` the failure reason.
+async fn run_task_attempt(
+    client: &OpenCode,
+    directory: &str,
+    agent: Option<&str>,
+    model: Option<&ModelRef>,
+    goal: &str,
+    attempts: u8,
+) -> Result<String, String> {
+    let session = client
+        .create_session(directory, agent, model)
+        .await
+        .map_err(|err| format!("session failed: {err:#}"))?;
+    let session_id = session.id;
+
+    let prompt = if attempts > 0 {
+        format!("{}\n\n{}", harness::retry_preamble(attempts), goal)
+    } else {
+        goal.to_string()
+    };
+
+    client
+        .prompt(&session_id, &prompt)
+        .await
+        .map_err(|err| format!("prompt failed: {err}"))?;
+
+    // Block until the session is idle — best-effort: the experimental endpoint
+    // may drift, so completion is verified against the transcript below.
+    let _ = client.wait(&session_id).await;
+
+    let messages = client
+        .messages(&session_id)
+        .await
+        .map_err(|err| format!("transcript failed: {err}"))?;
+
+    task_outcome(&messages)
+}
+
+/// Interpret a completed transcript as ‹success → deliverable› or ‹failure → reason›.
+fn task_outcome(messages: &[SessionMessage]) -> Result<String, String> {
+    let Some(message) = messages
+        .iter()
+        .rev()
+        .find(|m| m.role() == "assistant" && !m.is_incomplete())
+    else {
+        return Err("no assistant reply".to_string());
+    };
+
+    // A typed error (or `finish: "error"`) means the attempt failed.
+    if message.error.is_some() || message.finish.as_deref() == Some("error") {
+        let reason = message
+            .error
+            .as_ref()
+            .and_then(|e| e.message.clone())
+            .unwrap_or_else(|| "execution failed".to_string());
+        return Err(reason);
+    }
+
+    let text = strip_directives(&message.display_text());
+    if text.is_empty() {
+        Err("no deliverable (empty reply)".to_string())
+    } else {
+        Ok(text)
+    }
 }
 
 /// Build display lines from a canonical transcript.

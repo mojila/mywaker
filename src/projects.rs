@@ -168,14 +168,15 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_root() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mywaker-projects-{nanos}"));
+        // A process-wide monotonic counter, unlike wall-clock nanos, guarantees a
+        // unique directory even when two tests start in the same instant.
+        let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mywaker-projects-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
