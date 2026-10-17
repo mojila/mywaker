@@ -240,8 +240,9 @@ so it survives restarts.
 TEA (The Elm Architecture): `Model → Message → Update → View`, driven by a
 `tokio::select!` event loop that combines crossterm input, OpenCode SSE, and a
 tick. See [`docs/architecture.md`](docs/architecture.md) for the full breakdown,
-[`PLAN.md`](PLAN.md) for the vision and roadmap, and
-[`docs/todos.md`](docs/todos.md) for the milestone checklist.
+[`PLAN.md`](PLAN.md) for the vision and roadmap,
+[`docs/todos.md`](docs/todos.md) for the milestone checklist, and
+[`RELEASING.md`](RELEASING.md) for how a version is cut.
 
 ## License
 

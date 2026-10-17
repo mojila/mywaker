@@ -158,6 +158,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [ ] 💻 `tui-shimmer` idle "waiting for work…" states — deferred: self-contained Braille spinner already animates thinking/working (see M3 note)
 - [x] 📄 `README.md` — install, config, keybindings, OpenCode setup, scheduling, sample agents (screenshots/gif deferred)
 - [x] 📄 Sample agent definitions checked in — `examples/opencode.agents.jsonc` + `examples/agents/{planner,researcher,writer,reviewer}.md`
+- [x] 📄 `RELEASING.md` — the release is one `chore: bump version to X.Y.Z` commit plus an annotated tag on it (feat → minor, fix → patch); the version lives only in `Cargo.toml`, which the `Makefile` and `packaging/*` templates derive, so nothing else needs editing. The checklist spells out the pre-tag verification (`fmt` / `clippy -D warnings` / `test` / `doc` / release build) and the differential cell dump that a UI-touching release needs as evidence
 - [x] ✅ `cargo fmt --check`
 - [x] ✅ `cargo clippy --all-features -- -D warnings` clean
 - [x] ✅ no `unwrap()` outside tests (colors-eyre context everywhere)
