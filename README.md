@@ -39,6 +39,9 @@ green done) while the robot avatar mirrors the aggregate state.
   (`mywaker model list`) and assign one per employee (`mywaker model set` or the
   TUI picker via `m`). The chosen model is persisted to `team.toml` and applied
   to that employee's sessions.
+- **Mouse or keyboard** — click a pipeline node or picker row to select it and
+  wheel to step or scroll; every control also has a key, so the TUI is fully
+  usable either way.
 - **Autonomous triggers** — cron schedules (`[[schedules]]`) and file-change
   watch hooks (`[[watches]]`) fire tasks at employees with no chat required. Each
   task persists across restarts and retries up to three times on failure.
@@ -137,6 +140,13 @@ rather than failing with `Agent not found`.
 | `?` | Open the keybindings help overlay |
 | `Esc` | Back / leave chat |
 | `q` / `Ctrl-C` | Quit |
+| Click | Select the employee, project, or model you clicked |
+| Wheel | Move the selection, or page the chat transcript |
+
+Mouse capture is on, so the terminal's own selection is bypassed — hold `Shift`
+while dragging to copy text as usual. Clicking only moves the selection: opening
+a chat, adopting a project, and assigning a model still take `Enter`, so a stray
+click can't change anything.
 
 ## Model selection
 

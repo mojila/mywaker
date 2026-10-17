@@ -1,5 +1,5 @@
 use color_eyre::eyre::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc::Sender;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -386,7 +386,7 @@ impl App {
                 // Graceful shutdown: animate the overlay for a few frames so
                 // the terminal stays put while state is flushed, then return.
                 self.shutdown_frame = self.shutdown_frame.wrapping_add(1);
-                tui.draw(|frame| ui::render(frame, self))?;
+                self.draw(tui)?;
                 if self.shutdown_frame >= SHUTDOWN_FRAMES {
                     break;
                 }
@@ -394,12 +394,24 @@ impl App {
                 continue;
             }
 
-            tui.draw(|frame| ui::render(frame, self))?;
+            self.draw(tui)?;
 
             let message = events.next().await?;
             self.update(message);
         }
 
+        Ok(())
+    }
+
+    /// Draw one frame, recording the size it was drawn at — mouse hit-testing
+    /// then resolves clicks against the frame that is actually on screen.
+    fn draw(&mut self, tui: &mut Tui) -> Result<()> {
+        let mut size = self.last_size;
+        tui.draw(|frame| {
+            size = (frame.area().width, frame.area().height);
+            ui::render(frame, self);
+        })?;
+        self.last_size = size;
         Ok(())
     }
 
@@ -428,6 +440,7 @@ impl App {
                 self.follow_input_cursor();
             }
             Message::Key(key) => self.handle_key(key),
+            Message::Mouse(mouse) => self.handle_mouse(mouse),
             Message::Paste(text) => self.handle_paste(&text),
             Message::Connected { client, info } => {
                 let version = info.version.clone();
@@ -563,6 +576,64 @@ impl App {
                 _ => {}
             },
             Mode::Chat => self.handle_chat_key(key),
+        }
+    }
+
+    /// Handle a mouse event: a click moves the selection to whatever it landed on
+    /// (a roster node, a picker row), and a wheel notch steps the active screen the
+    /// way its arrow keys do. Activation stays on Enter — a stray click never
+    /// adopts a project or reassigns a model.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let kind = mouse.kind;
+        // Only clicks and wheel notches are input; motion is ignored (and must
+        // not dismiss an overlay the user is reading).
+        if !matches!(
+            kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+        ) {
+            return;
+        }
+        // The shutdown overlay swallows everything; the help overlay is modal, so
+        // any input dismisses it — as any key does — without touching what it
+        // covers.
+        if self.shutting_down {
+            return;
+        }
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                match ui::hit::target_at(self, self.last_size, mouse.column, mouse.row) {
+                    Some(ui::hit::Target::Employee(index)) => self.selected = index,
+                    Some(ui::hit::Target::Project(index)) => self.project_selected = index,
+                    Some(ui::hit::Target::Model(index)) => self.model_selected = index,
+                    None => {}
+                }
+            }
+            MouseEventKind::ScrollUp => self.step_screen(-1),
+            MouseEventKind::ScrollDown => self.step_screen(1),
+            _ => {}
+        }
+    }
+
+    /// Step the active screen by one row: a wheel notch, mirroring the arrow keys.
+    fn step_screen(&mut self, delta: isize) {
+        match self.mode {
+            Mode::Roster => self.move_selection_stage(delta),
+            Mode::Chat => self.scroll_transcript(delta),
+            Mode::Projects => {
+                self.project_selected =
+                    move_selection(self.project_selected, delta, self.projects.len());
+            }
+            Mode::Models => {
+                self.model_selected =
+                    move_selection(self.model_selected, delta, self.filtered_models().len());
+            }
         }
     }
 

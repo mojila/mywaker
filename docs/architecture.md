@@ -46,6 +46,8 @@ mywaker/
     │   └── models.rs         serde types (Agent, Session, Event, ServerInfo)
     └── ui/
         ├── mod.rs            layout orchestration + shared text helpers (view)
+        ├── layout.rs         screen geometry — regions and list windows, shared with hit-testing
+        ├── hit.rs            mouse hit-testing — a point → the employee/row under it
         ├── robot.rs          animated robot avatar (state-driven ASCII)
         ├── pipeline.rs       team tree diagram — planner → jev → leaves
         ├── tasks.rs          per-employee board + persisted task queue
@@ -64,8 +66,9 @@ folded into `opencode/mod.rs` (the client is small enough to live in one file); 
 session `messages()` endpoint lands in M5.
 
 Rationale for split: `opencode/` is a self-contained integration layer (could later
-be its own crate); `ui/` is pure render; `app.rs` is the state machine. Modules are
-organized **by feature** (rust-skills `proj-mod-by-feature`).
+be its own crate); `ui/` owns everything that turns state into pixels — and the
+geometry that turns a click back into state; `app.rs` is the state machine. Modules
+are organized **by feature** (rust-skills `proj-mod-by-feature`).
 
 ---
 
@@ -230,6 +233,11 @@ consts; no per-frame allocation.
   completion menu and the `/help` listing read; `CommandOption` carries the
   command, its argument hint, its one-line description, and whether the menu offers
   it, so the menu and the listing cannot drift apart.
+- Mouse hit-testing reads the same geometry the renderer draws into: the frame
+  regions and list windows in `ui/layout.rs`, and the node rectangles
+  `ui/pipeline.rs::tree` hands to both the renderer and `ui/hit.rs`. A click can
+  therefore only land on something on screen, on the row it points at. Clicks move
+  the selection; activation stays on `Enter`.
 
 ---
 
@@ -271,6 +279,12 @@ load (serde `deny_unknown_fields`).
 - `color_eyre::install()` **before** terminal init so the terminal is restored before
   the report prints (per skill).
 - Use `ratatui::run()` / `init` + `restore`; no hand-written panic hook.
+- Mouse capture is enabled on `enter` and disabled in the restore path **before**
+  leaving the alternate screen, so the terminal's own scrolling and selection come
+  back on every exit path (including the panic hook).
+- The app learns the size of the frame it just drew (`App::draw`), and mouse
+  hit-testing resolves against that size — clicks can't be mapped onto a stale
+  layout.
 
 ---
 

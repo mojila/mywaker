@@ -3,7 +3,7 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -11,9 +11,10 @@ use ratatui::{
 
 use crate::app::App;
 
+use super::layout;
+
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let [header_area, list_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
+    let [header_area, list_area] = layout::project_areas(area);
 
     let active_name = app.active_project().map(|p| p.name.as_str());
     let roots = app
@@ -72,6 +73,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut state = ListState::default();
     state.select(Some(app.project_selected()));
+    // Scroll to the window hit-testing expects (see `layout::list_window`), so a
+    // click lands on the row it points at.
+    *state.offset_mut() = layout::list_window(list_area, items.len(), app.project_selected());
 
     let list = List::new(items)
         .block(

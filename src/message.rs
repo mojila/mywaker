@@ -1,6 +1,6 @@
 //! App-level messages (the `Message` of the TEA event loop).
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::opencode::{AgentInfo, Event, OpenCode, ServerInfo, SessionInfo, SessionMessage};
 
@@ -11,6 +11,8 @@ pub enum Message {
     Tick,
     /// A terminal key press.
     Key(KeyEvent),
+    /// A mouse event: a click or a wheel notch at a screen coordinate.
+    Mouse(MouseEvent),
     /// A bracketed paste from the terminal.
     Paste(String),
     /// Terminal resize (width, height).

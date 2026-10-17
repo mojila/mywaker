@@ -2,7 +2,7 @@ use std::io::{self, Stdout};
 
 use color_eyre::eyre::Result;
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -23,7 +23,12 @@ impl Tui {
 
     pub fn enter(&mut self) -> Result<()> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
 
         // Restore the terminal before the panic hook prints its report.
         let original_hook = std::panic::take_hook();
@@ -46,7 +51,12 @@ impl Tui {
 
     fn reset() -> Result<()> {
         disable_raw_mode()?;
-        execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
+        execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        )?;
         Ok(())
     }
 

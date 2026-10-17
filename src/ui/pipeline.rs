@@ -51,16 +51,27 @@ const STAGE_HEIGHT: u16 = CONTENT_LINES + 2;
 /// this, while leaf nodes share the full row).
 const MAX_NODE_WIDTH: u16 = 42;
 
-fn render_tree(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-    top: usize,
-    bottom: &[usize],
-    employees: &[Employee],
-) {
-    let has_bottom = !bottom.is_empty();
-    let node_width = (area.width / (bottom.len().max(1) as u16)).clamp(14, MAX_NODE_WIDTH);
+/// One drawn node: the employee it stands for (the shared Jev node stands for
+/// none) and the rectangle it occupies.
+pub(crate) struct Node {
+    pub(crate) employee: Option<usize>,
+    pub(crate) area: Rect,
+}
+
+/// The pipeline's geometry: the nodes in draw order (root, Jev, then the leaves)
+/// and the connector rows between them.
+pub(crate) struct Tree {
+    pub(crate) nodes: Vec<Node>,
+    pub(crate) arrows: Vec<Rect>,
+}
+
+/// Lay the tree out in `area`: the root on top, the shared Jev node below it, and
+/// the leaves fanned out along the bottom.
+///
+/// The renderer draws from this and mouse hit-testing reads it, so a click lands
+/// on the node it points at.
+pub(crate) fn tree(area: Rect, root: usize, leaves: &[usize]) -> Tree {
+    let node_width = (area.width / (leaves.len().max(1) as u16)).clamp(14, MAX_NODE_WIDTH);
 
     // Rows (top → bottom): [fill, planner, arrow, jev, arrow, leaves, fill].
     let mut constraints = vec![
@@ -69,35 +80,62 @@ fn render_tree(
         Constraint::Length(1),            // arrow
         Constraint::Length(STAGE_HEIGHT), // jev
     ];
-    if has_bottom {
+    if !leaves.is_empty() {
         constraints.push(Constraint::Length(1)); // arrow
         constraints.push(Constraint::Length(STAGE_HEIGHT)); // leaves
     }
     constraints.push(Constraint::Fill(1));
 
     let rows = Layout::vertical(constraints).split(area);
+    let mut nodes = vec![
+        Node {
+            employee: Some(root),
+            area: centered(rows[1], node_width),
+        },
+        Node {
+            employee: None,
+            area: centered(rows[3], node_width),
+        },
+    ];
+    let mut arrows = vec![rows[2]];
 
-    render_stage(
-        frame,
-        app,
-        &employees[top],
-        centered(rows[1], node_width),
-        top == app.selected(),
-    );
-    render_arrow_down(frame, rows[2]);
-    render_jev_stage(frame, app, centered(rows[3], node_width));
+    if !leaves.is_empty() {
+        arrows.push(rows[4]);
+        let leaf_areas = Layout::horizontal(vec![Constraint::Fill(1); leaves.len()]).split(rows[5]);
+        for (index, &employee) in leaves.iter().enumerate() {
+            nodes.push(Node {
+                employee: Some(employee),
+                area: leaf_areas[index],
+            });
+        }
+    }
 
-    if has_bottom {
-        render_arrow_down(frame, rows[4]);
-        let leaves = Layout::horizontal(vec![Constraint::Fill(1); bottom.len()]).split(rows[5]);
-        for (i, &employee_index) in bottom.iter().enumerate() {
-            render_stage(
+    Tree { nodes, arrows }
+}
+
+fn render_tree(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    top: usize,
+    bottom: &[usize],
+    employees: &[Employee],
+) {
+    let tree = tree(area, top, bottom);
+
+    for arrow in &tree.arrows {
+        render_arrow_down(frame, *arrow);
+    }
+    for node in &tree.nodes {
+        match node.employee {
+            Some(index) => render_stage(
                 frame,
                 app,
-                &employees[employee_index],
-                leaves[i],
-                employee_index == app.selected(),
-            );
+                &employees[index],
+                node.area,
+                index == app.selected(),
+            ),
+            None => render_jev_stage(frame, app, node.area),
         }
     }
 }
@@ -231,4 +269,87 @@ fn render_arrow_down(frame: &mut Frame, area: Rect) {
     .alignment(Alignment::Center);
 
     frame.render_widget(arrow, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area() -> Rect {
+        Rect::new(4, 1, 80, 30)
+    }
+
+    /// The nodes the renderer draws are the nodes hit-testing searches: one per
+    /// employee plus the shared Jev node, all inside the area and none overlapping.
+    #[test]
+    fn tree_nodes_are_disjoint_and_inside_the_area() {
+        let tree = tree(area(), 3, &[0, 1, 2]);
+
+        let employees: Vec<Option<usize>> = tree.nodes.iter().map(|n| n.employee).collect();
+        assert_eq!(
+            employees,
+            vec![Some(3), None, Some(0), Some(1), Some(2)],
+            "root, the shared Jev node, then the leaves in order"
+        );
+        assert_eq!(
+            tree.arrows.len(),
+            2,
+            "one connector per step below the root"
+        );
+
+        for node in &tree.nodes {
+            assert!(node.area.width > 0 && node.area.height > 0);
+            assert!(node.area.right() <= area().right(), "{:?}", node.area);
+            assert!(node.area.bottom() <= area().bottom(), "{:?}", node.area);
+        }
+        for (index, node) in tree.nodes.iter().enumerate() {
+            for other in &tree.nodes[index + 1..] {
+                assert!(
+                    !node.area.intersects(other.area),
+                    "{:?} ∩ {:?}",
+                    node.area,
+                    other.area
+                );
+            }
+        }
+        for arrow in &tree.arrows {
+            for node in &tree.nodes {
+                assert!(
+                    !arrow.intersects(node.area),
+                    "an arrow must not cover a node"
+                );
+            }
+        }
+    }
+
+    /// Root and Jev are centred on the panel and capped in width; the leaves share
+    /// the bottom row edge to edge.
+    #[test]
+    fn tree_centres_the_root_and_tiles_the_leaves() {
+        let tree = tree(area(), 3, &[0, 1, 2]);
+        let (root, jev) = (&tree.nodes[0], &tree.nodes[1]);
+        let leaves = &tree.nodes[2..];
+
+        assert!(root.area.width <= MAX_NODE_WIDTH && jev.area.width <= MAX_NODE_WIDTH);
+        assert_eq!(root.area.x, area().x + (area().width - root.area.width) / 2);
+        assert_eq!(jev.area.width, root.area.width);
+        assert_eq!(leaves[0].area.x, area().x);
+        assert_eq!(leaves[2].area.right(), area().right());
+        for pair in leaves.windows(2) {
+            assert_eq!(pair[0].area.right(), pair[1].area.x, "leaves are adjacent");
+        }
+        assert_eq!(leaves[0].area.y, leaves[2].area.y, "leaves share a row");
+    }
+
+    /// A team of one has no leaf row: just the root and the connected Jev node.
+    #[test]
+    fn tree_without_leaves_is_root_and_jev_only() {
+        let tree = tree(area(), 0, &[]);
+
+        assert_eq!(tree.nodes.len(), 2);
+        assert_eq!(tree.arrows.len(), 1);
+        assert_eq!(tree.nodes[0].employee, Some(0));
+        assert_eq!(tree.nodes[1].employee, None);
+        assert!(!tree.nodes[0].area.intersects(tree.nodes[1].area));
+    }
 }

@@ -1394,3 +1394,260 @@ fn a_worker_owes_a_fanout_once() {
     assert!(app.fanouts_awaiting(0).is_empty());
     assert!(app.fanouts_awaiting(1).is_empty());
 }
+
+// --- mouse ---
+
+/// A model catalog of `count` entries, as OpenCode lists them.
+fn model_list(count: usize) -> Vec<ProviderModel> {
+    (0..count)
+        .map(|i| {
+            serde_json::from_value(serde_json::json!({
+                "id": format!("m{i:02}"),
+                "name": format!("Model {i:02}"),
+                "providerID": "kenari",
+            }))
+            .unwrap()
+        })
+        .collect()
+}
+
+/// A project list of `count` entries, as the directory scan would find them.
+fn project_list(count: usize) -> Vec<Project> {
+    (0..count)
+        .map(|i| Project {
+            name: format!("proj{i:02}"),
+            path: PathBuf::from(format!("/tmp/Projects/proj{i:02}")),
+        })
+        .collect()
+}
+
+/// A left-button press at a screen cell.
+fn mouse_click(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// A wheel notch at a screen cell.
+fn mouse_wheel(column: u16, row: u16, up: bool) -> MouseEvent {
+    MouseEvent {
+        kind: if up {
+            MouseEventKind::ScrollUp
+        } else {
+            MouseEventKind::ScrollDown
+        },
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// A pointer move, which is not input (motion is reported while capture is on).
+fn mouse_move(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Moved,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// Where `needle` was drawn in a `width`×`height` frame, so a test can click what
+/// it read on screen. Each cell contributes one character.
+fn find_on_screen(app: &App, width: u16, height: u16, needle: &str) -> (u16, u16) {
+    let text: Vec<char> = screen(app, width, height).chars().collect();
+    let needle: Vec<char> = needle.chars().collect();
+    let index = text
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())
+        .unwrap_or_else(|| panic!("{needle:?} is not on screen"));
+    (
+        (index % width as usize) as u16,
+        (index / width as usize) as u16,
+    )
+}
+
+#[test]
+fn clicking_a_pipeline_node_selects_that_employee() {
+    let (mut app, _rx) = make_app();
+    app.last_size = (120, 40);
+
+    // The node the renderer drew is the node the click resolves to. The anchor is
+    // the node's own title (its stage label, uppercased), because a name alone
+    // would also match the tasks panel, which prints every name.
+    for (stage, index) in [
+        ("RESEARCHER", 0),
+        ("WRITER", 1),
+        ("REVIEWER", 2),
+        ("PLANNER", 3),
+    ] {
+        let (column, row) = find_on_screen(&app, 120, 40, &format!(" {stage} "));
+        app.handle_mouse(mouse_click(column, row));
+        assert_eq!(app.selected(), index, "clicking the {stage} node");
+    }
+
+    // The shared Jev node stands for no employee: it is not a target.
+    app.selected = 0;
+    let (column, row) = find_on_screen(&app, 120, 40, "answers questions");
+    app.handle_mouse(mouse_click(column, row));
+    assert_eq!(app.selected(), 0, "the Jev node has no employee to select");
+}
+
+#[test]
+fn clicking_outside_a_target_keeps_the_selection() {
+    let (mut app, _rx) = make_app();
+    app.last_size = (120, 40);
+    app.selected = 2;
+
+    // Title bar, hint bar, robot avatar, tasks panel, empty space above the tree.
+    for (column, row) in [(0, 0), (119, 39), (2, 20), (119, 8), (40, 2)] {
+        app.handle_mouse(mouse_click(column, row));
+    }
+    assert_eq!(app.selected(), 2);
+}
+
+#[test]
+fn wheel_steps_the_roster_selection() {
+    let (mut app, _rx) = make_app();
+
+    // The starter stage order is planner, researcher, writer, reviewer, starting
+    // on the researcher — the same walk ←/→ makes, clamping at both ends.
+    app.handle_mouse(mouse_wheel(60, 20, false));
+    assert_eq!(app.selected(), 1);
+    app.handle_mouse(mouse_wheel(60, 20, true));
+    assert_eq!(app.selected(), 0);
+
+    for _ in 0..5 {
+        app.handle_mouse(mouse_wheel(60, 20, true));
+    }
+    assert_eq!(app.selected(), 3, "the wheel stops at the first stage");
+    for _ in 0..5 {
+        app.handle_mouse(mouse_wheel(60, 20, false));
+    }
+    assert_eq!(app.selected(), 2, "and at the last");
+}
+
+#[test]
+fn wheel_scrolls_the_chat_transcript() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    assert_eq!(app.chat_scroll(), 0);
+
+    app.handle_mouse(mouse_wheel(40, 10, true));
+    assert!(app.chat_scroll() > 0, "wheel up pages back through history");
+
+    app.handle_mouse(mouse_wheel(40, 10, false));
+    assert_eq!(app.chat_scroll(), 0, "wheel down returns to the live tail");
+}
+
+#[test]
+fn wheel_steps_the_pickers() {
+    let (mut app, _rx) = make_app();
+    app.projects = project_list(4);
+    app.models = model_list(4);
+
+    app.mode = Mode::Projects;
+    app.handle_mouse(mouse_wheel(40, 10, false));
+    assert_eq!(app.project_selected(), 1);
+    app.handle_mouse(mouse_wheel(40, 10, true));
+    assert_eq!(app.project_selected(), 0);
+    assert!(
+        app.active_project().is_none(),
+        "scrolling never adopts a project"
+    );
+
+    app.mode = Mode::Models;
+    app.handle_mouse(mouse_wheel(40, 10, false));
+    assert_eq!(app.model_selected(), 1);
+    app.handle_mouse(mouse_wheel(40, 10, true));
+    assert_eq!(app.model_selected(), 0);
+}
+
+#[test]
+fn clicking_a_project_row_selects_it_without_adopting_it() {
+    let (mut app, _rx) = make_app();
+    app.mode = Mode::Projects;
+    app.projects = project_list(12);
+    app.last_size = (100, 30);
+
+    let (column, row) = find_on_screen(&app, 100, 30, "proj07");
+    app.handle_mouse(mouse_click(column, row));
+
+    assert_eq!(app.project_selected(), 7);
+    assert!(
+        app.active_project().is_none(),
+        "Enter still adopts the project"
+    );
+}
+
+/// The picker scrolls to the window hit-testing assumes: with the selection deep
+/// in a list too long for the panel, the row under the highlight is the selected
+/// item (and the row above it is the item before).
+#[test]
+fn clicking_a_scrolled_row_selects_the_item_drawn_there() {
+    let (mut app, _rx) = make_app();
+    app.mode = Mode::Projects;
+    app.projects = project_list(12);
+    app.project_selected = 11;
+    app.last_size = (60, 16); // the panel shows four of the twelve rows
+
+    let (column, row) = find_on_screen(&app, 60, 16, "▶");
+    app.handle_mouse(mouse_click(column, row));
+    assert_eq!(app.project_selected(), 11, "the highlight selects itself");
+
+    let (column, row) = find_on_screen(&app, 60, 16, "proj09");
+    app.handle_mouse(mouse_click(column, row));
+    assert_eq!(app.project_selected(), 9);
+}
+
+#[test]
+fn clicking_a_model_row_selects_it_without_assigning_it() {
+    let (mut app, _rx) = make_app();
+    app.mode = Mode::Models;
+    app.models = model_list(12);
+    app.last_size = (100, 30);
+    let assigned = app.team.employees()[0].model.clone();
+
+    let (column, row) = find_on_screen(&app, 100, 30, "m07");
+    app.handle_mouse(mouse_click(column, row));
+
+    assert_eq!(app.model_selected(), 7);
+    assert_eq!(
+        app.team.employees()[0].model,
+        assigned,
+        "Enter still assigns the model"
+    );
+}
+
+#[test]
+fn a_click_dismisses_the_help_overlay_without_reaching_the_panel() {
+    let (mut app, _rx) = make_app();
+    app.last_size = (120, 40);
+    app.selected = 0;
+
+    // Find a point inside an employee's node, then cover it with the overlay.
+    let (column, row) = find_on_screen(&app, 120, 40, " WRITER ");
+    app.show_help = true;
+
+    app.handle_mouse(mouse_click(column, row));
+    assert!(!app.show_help());
+    assert_eq!(app.selected(), 0, "the overlay swallowed the click");
+}
+
+#[test]
+fn mouse_motion_is_not_input() {
+    let (mut app, _rx) = make_app();
+    app.last_size = (120, 40);
+
+    let (column, row) = find_on_screen(&app, 120, 40, " WRITER ");
+    app.show_help = true;
+    app.handle_mouse(mouse_move(column, row));
+    assert!(app.show_help(), "motion must not dismiss the overlay");
+
+    app.show_help = false;
+    app.handle_mouse(mouse_move(column, row));
+    assert_eq!(app.selected(), 0, "motion must not move the selection");
+}

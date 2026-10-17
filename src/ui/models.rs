@@ -4,7 +4,7 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -12,13 +12,10 @@ use ratatui::{
 
 use crate::app::App;
 
+use super::layout;
+
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let [header_area, search_area, list_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
+    let [header_area, search_area, list_area] = layout::model_areas(area);
 
     let employee = app.team().employees().get(app.selected());
     let employee_name = employee.map(|e| e.name.as_str()).unwrap_or("employee");
@@ -106,6 +103,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut state = ListState::default();
     state.select(Some(app.model_selected()));
+    // Scroll to the window hit-testing expects (see `layout::list_window`), so a
+    // click lands on the row it points at.
+    *state.offset_mut() = layout::list_window(list_area, items.len(), app.model_selected());
 
     let list = List::new(items)
         .block(

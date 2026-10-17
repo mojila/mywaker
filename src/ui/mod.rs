@@ -1,6 +1,8 @@
 //! The ratatui renderer: title bar, robot avatar, team pipeline, chat, log, help.
 
 mod chat;
+pub(crate) mod hit;
+mod layout;
 mod models;
 mod pipeline;
 mod projects;
@@ -42,18 +44,12 @@ pub(crate) fn truncate(text: &str, width: usize) -> String {
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
-    let [title_area, main_area, log_area, help_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(6),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    let regions = layout::Regions::of(frame.area());
 
-    render_title(frame, app, title_area);
-    render_main(frame, app, main_area);
-    render_log(frame, app, log_area);
-    render_help(frame, app, help_area);
+    render_title(frame, app, regions.title);
+    render_main(frame, app, regions.main);
+    render_log(frame, app, regions.log);
+    render_help(frame, app, regions.help);
 
     if app.is_shutting_down() {
         render_shutdown(frame, app, frame.area());
@@ -122,12 +118,7 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Projects => projects::render(frame, app, area),
         Mode::Models => models::render(frame, app, area),
         Mode::Roster => {
-            let [robot_area, team_area, tasks_area] = Layout::horizontal([
-                Constraint::Length(24),
-                Constraint::Fill(1),
-                Constraint::Length(32),
-            ])
-            .areas(area);
+            let [robot_area, team_area, tasks_area] = layout::roster_areas(area);
             render_robot_widget(frame, app, robot_area);
             pipeline::render(frame, app, team_area);
             tasks::render(frame, app, tasks_area);
@@ -320,6 +311,7 @@ fn help_lines() -> Vec<Line<'static>> {
         head(" global"),
         key("q · Esc", "quit (any screen)"),
         key("?", "this help overlay"),
+        key("click · wheel", "select · step / scroll"),
         Line::from(""),
         head(" roster"),
         key("←/→ j/k", "move workflow stage"),

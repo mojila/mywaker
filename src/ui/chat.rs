@@ -3,7 +3,7 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
@@ -14,8 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, TranscriptLine, TranscriptRole};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let [transcript_area, input_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(4)]).areas(area);
+    let [transcript_area, input_area] = super::layout::chat_areas(area);
 
     render_transcript(frame, app, transcript_area);
     render_input(frame, app, input_area);
