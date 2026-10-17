@@ -10,6 +10,7 @@
 pub mod app;
 pub mod config;
 pub mod event;
+pub mod harness;
 pub mod jev;
 pub mod logging;
 pub mod message;
@@ -20,4 +21,5 @@ pub mod skills;
 pub mod team;
 pub mod tui;
 pub mod ui;
+pub mod usage;
 pub mod workflow;

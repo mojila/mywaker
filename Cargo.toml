@@ -1,6 +1,6 @@
 [package]
 name = "mywaker"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Run a team of AI employees backed by OpenCode from your terminal"
@@ -24,6 +24,7 @@ serde_json = "1.0.154"
 base64 = "0.23.1"
 async-stream = "0.3.6"
 reqwest = { version = "0.13.5", features = ["json", "stream", "rustls"], default-features = false }
+sysinfo = "0.38.4"
 
 [profile.release]
 opt-level = 3

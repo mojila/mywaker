@@ -310,8 +310,9 @@ can hand the final result back to the user.
    `Chat::handled_message_ids`). Teammate targets are relayed via
    `send_to_employee` → `flush_outbox` (creating the target's session on demand and
    queueing instructions until it is ready); final targets reroute the answer back to
-   the origin chat (`App::delegation_origin`). A `MAX_DELEGATIONS` cap stops `A → B →
-   A` cycles.
+   the origin chat (`App::origin_of`, a per-chain map larger than the old single
+   `delegation_origin` global). Two caps stop `A → B → A` cycles: a per-chain
+   `depth_of` bound (`MAX_CHAIN_DEPTH`) and a run-wide `DELEGATION_TOTAL_LIMIT`.
 
 4. **Form auto-answer** — `form.created` events, which pause a session until the
    user supplies typed input for one or more fields, are resolved out-of-band in
@@ -356,3 +357,44 @@ can hand the final result back to the user.
    `opencode.json(c)`; see `examples/opencode.agents.jsonc`). `team_context()`
    additionally inlines the role boundaries so the planner is explicitly told to
    delegate implementation (code/prose) to the software engineer / writer.
+
+## 11. Reliability (timeouts, retry, fan-out completion)
+
+Hand-offs are fire-and-forget by nature: a worker that goes silent used to hang the
+chain or the fan-out forever. `src/harness.rs` adds the small primitives that close
+those gaps, driven from the tick loop so the app stays in its TEA shape.
+
+- **Pending delivery** (`Chat::pending: Option<PendingDelivery>`) tracks the in-flight
+  delegated instruction on a target, its retry attempt count, and a liveness
+  timestamp. `flush_outbox` attaches it on send; `handle_stream_event` heartbeats it on
+  every SSE event for that session, so a healthy but slow worker is never abandoned.
+- **Deadline + retry + abandon** — each tick, `tick_reliability` finds pending
+  deliveries that have been silent past `HANDOFF_TIMEOUT`. `retry_or_abandon` re-sends
+  the original instruction with a `retry_preamble` up to `MAX_ATTEMPTS`, then
+  `abandon` posts a deterministic `⚠ no deliverable from <name> (<reason>)` note.
+- **Delivery failure surfacing** — `prompt` errors now emit `Message::DeliveryFailed`
+  (instead of a silent log line). Delegated hand-offs retry; a direct user prompt just
+  surfaces the error in the chat for a manual retry.
+- **Per-chain isolation** — the single `delegation_origin` global is replaced by
+  `origin_of`/`depth_of` maps so concurrent chains don't clobber one another; a
+  `@user` deliverable routes to its own chain's origin.
+- **Fan-out guarantee** — `force_worker_contribution` injects the `⚠` note into any
+  fan-out still waiting on an abandoned/failed worker, and `aggregate_ready_fanouts`
+  (shared by `note_fanout_result`) aggregates every fan-out the moment all workers
+  have reported, real or synthetic — so a fan-out can no longer deadlock.
+
+## 12. Telemetry (token usage, cache hit, RAM, CPU)
+
+The log panel's second status line shows the aggregate token usage, prompt-cache hit
+rate, process RSS, and exponentially-averaged process CPU%.
+
+- **Token usage** (`src/usage.rs::Usage`) — accumulated from `SessionMessage::tokens`
+  (`openocode/models.rs::TokenUsage` / `CacheUsage`), deduped by message id so
+  transcript re-loads don't double-count. Cache-hit rate is `cache.read ÷ input`,
+  clamped to `1.0`.
+- **Process metrics** (`src/usage.rs::ProcessMetrics`) — `sysinfo` reads the current
+  process's RSS and CPU%, refreshed at most once a second from the tick loop; CPU is
+  smoothed with an EMA (`usage::Ema`).
+- **Note** — the exact `tokens` payload shape from OpenCode is experimental; a
+  `#[serde(default)]`-tolerant `TokenUsage` keeps a mismatch from breaking
+  deserialization, and the readout degrades to `0`/`—` when the field is absent.

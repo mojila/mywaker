@@ -33,6 +33,10 @@ pub enum Message {
         employee: usize,
         messages: Vec<SessionMessage>,
     },
+    /// A prompt delivery failed (user or delegated), carrying the target employee
+    /// and the reason so the app can retry an autonomous hand-off or surface the
+    /// error in the chat.
+    DeliveryFailed { target: usize, reason: String },
     /// A chat-local `/skill add` install finished (names of installed skills, or the error).
     SkillInstallDone {
         employee: usize,

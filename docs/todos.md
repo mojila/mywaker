@@ -139,6 +139,16 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
   - `tests/opencode_fake.rs::fans_out_n_parallel_prompts_via_joinset` drives `N` concurrent `create_session`+`prompt` calls over a `JoinSet` against a counting fake server.
 - [ ] ✅ one goal → team works in parallel → aggregated result — **blocked**: live model inference still under the weekly budget cap (resets 2026-10-19); the end-to-end chain is exercised via unit + fake-server tests until then.
 
+## M7.5 — Reliability & telemetry
+
+- [x] 💻 Reliability primitives (`src/harness.rs`): `PendingDelivery`, `MAX_ATTEMPTS=3`, `MAX_CHAIN_DEPTH=8`, `DELEGATION_TOTAL_LIMIT=64`, `HANDOFF_TIMEOUT=5m`, `retry_preamble`/`abandon_note`.
+- [x] 💻 Per-chain isolation: `origin_of`/`depth_of` maps replace the single `delegation_origin` global; final answers route to their own chain's origin.
+- [x] 💻 Deadline/retry/abandon driven from `Tick`: silent hand-offs retried (bounded) then abandoned with a `⚠` note; SSE events heartbeat the deadline.
+- [x] 💻 Delivery failure surfacing: `Message::DeliveryFailed` replaces silent `Log` on prompt errors; delegated hand-offs auto-retry, user prompts surface the error.
+- [x] 💻 Fan-out completion guarantee: `force_worker_contribution` + `aggregate_ready_fanouts` let a fan-out finish even when a worker fails/abandons.
+- [x] 💻 Telemetry readout (`src/usage.rs` + UI log line): token in/out, cache-hit %, process RAM (K/M), EMA CPU % via `sysinfo`.
+- [x] 🧪 unit: token-usage dedup + cache-hit clamp; deadline retry→abandon; abandoned worker still aggregates; `fmt_bytes`/`fmt_count`/`Ema`.
+
 ## M8 — Polish & ship
 
 - [ ] 💻 Help popup + keybinding footer (q quit, ↑↓ navigate, Enter chat, d dispatch, r retry, t tab)

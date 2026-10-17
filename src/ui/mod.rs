@@ -16,6 +16,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Mode};
+use crate::usage::{fmt_bytes, fmt_count};
 
 use robot::{RobotState, render as render_robot};
 
@@ -130,7 +131,7 @@ fn robot_state(app: &App) -> RobotState {
 }
 
 fn render_log(frame: &mut Frame, app: &App, area: Rect) {
-    let mut text: Vec<Line> = vec![stream_stats(app)];
+    let mut text: Vec<Line> = vec![stream_stats(app), telemetry_stats(app)];
 
     for line in app.log().iter().rev().take(3) {
         text.push(Line::from(Span::styled(line.clone(), Color::DarkGray)));
@@ -142,6 +143,38 @@ fn render_log(frame: &mut Frame, app: &App, area: Rect) {
         .title(" log ".bold().cyan());
 
     frame.render_widget(Paragraph::new(text).block(block), area);
+}
+
+fn telemetry_stats(app: &App) -> Line<'static> {
+    let usage = app.usage();
+    let metrics = app.metrics();
+
+    let ram = metrics
+        .memory_bytes()
+        .map(fmt_bytes)
+        .unwrap_or_else(|| "—".to_string());
+    let hit = usage.cache_hit_rate() * 100.0;
+
+    Line::from(vec![
+        Span::styled(" usage ", Color::Cyan),
+        Span::styled(
+            format!(
+                "{}/{} in/out",
+                fmt_count(usage.input_tokens),
+                fmt_count(usage.output_tokens)
+            ),
+            Color::Gray,
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!("cache {hit:.0}% ({})", fmt_count(usage.cache_read_tokens)),
+            Color::Gray,
+        ),
+        Span::raw(" · "),
+        Span::styled(format!("ram {ram}"), Color::Gray),
+        Span::raw(" · "),
+        Span::styled(format!("cpu {:.1}%", metrics.cpu_percent()), Color::Gray),
+    ])
 }
 
 fn stream_stats(app: &App) -> Line<'static> {

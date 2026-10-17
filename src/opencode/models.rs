@@ -298,6 +298,10 @@ pub struct SessionMessage {
     pub outcome: Option<String>,
     #[serde(default)]
     pub error: Option<MessageError>,
+    /// Token usage for this message (input/output/reasoning + cache), when the
+    /// provider reports it on the assistant reply.
+    #[serde(default)]
+    pub tokens: Option<TokenUsage>,
 }
 
 impl SessionMessage {
@@ -342,6 +346,32 @@ impl SessionMessage {
                 .as_deref()
                 .is_none_or(|f| f == "error" || f == "unknown")
     }
+}
+
+/// Token usage for a message, as reported by the provider on the assistant
+/// reply. `cache` reflects prompt-caching reads/writes; a "cache hit" is
+/// `cache.read` serving part of the `input` tokens.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub reasoning: u64,
+    #[serde(default)]
+    pub cache: CacheUsage,
+}
+
+/// Prompt-cache token counts (`read` = served from cache, `write` = newly cached).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheUsage {
+    #[serde(default)]
+    pub read: u64,
+    #[serde(default)]
+    pub write: u64,
 }
 
 /// Best-effort label for a tool part, e.g. `[tool: read]`.
