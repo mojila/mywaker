@@ -4,6 +4,7 @@ use tokio::sync::mpsc::Sender;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -106,6 +107,10 @@ struct Chat {
     /// The delegated hand-off currently in flight for this employee, tracked so
     /// a silent worker can be retried or abandoned on a deadline.
     pending: Option<PendingDelivery>,
+    /// User prompts submitted while the employee was mid-turn (or before their
+    /// session was ready), drained one per completed turn by
+    /// [`App::pump_employee_queue`].
+    queue_running: Vec<String>,
 }
 
 /// A parallel fan-out: one goal broadcast to several workers, whose outputs are
@@ -946,7 +951,8 @@ impl App {
             chat.streaming_text.clear();
             chat.reasoning_text.clear();
             chat.scroll = 0;
-            chat.scroll = 0;
+            // Prompts queued against the old conversation don't carry over.
+            chat.queue_running.clear();
         }
         self.begin_session(employee);
     }
@@ -1056,6 +1062,8 @@ impl App {
                 }
                 // Relay any instructions queued while the session was being made.
                 self.flush_outbox(employee);
+                // Then anything the user typed while the session was pending.
+                self.pump_employee_queue(employee);
             }
             Err(err) => {
                 self.team.set_status(employee, EmployeeStatus::Error);
@@ -1094,21 +1102,14 @@ impl App {
         let Some(employee) = self.chat_employee else {
             return;
         };
-        let Some(session_id) = self
-            .chats
-            .get(&employee)
-            .and_then(|chat| chat.session_id.clone())
-        else {
-            self.push_log("no active session".to_string());
-            return;
-        };
 
+        // Record the prompt immediately — in the transcript and the recall
+        // history — whether it goes out now or waits behind an in-flight turn.
         if let Some(chat) = self.chats.get_mut(&employee) {
             chat.transcript
                 .push(TranscriptLine::new(TranscriptRole::User, text.clone()));
             chat.streaming_text.clear();
             chat.reasoning_text.clear();
-            chat.scroll = 0;
             chat.scroll = 0;
             // Record history (dedup consecutive repeats), reset navigation.
             if chat.history.last() != Some(&text) {
@@ -1116,20 +1117,111 @@ impl App {
             }
             chat.hist_index = None;
         }
-        self.team.set_status(employee, EmployeeStatus::Thinking);
         self.team.set_last_task(employee, Some(task_summary(&text)));
         // A fresh user prompt to this employee starts a new delegation chain whose
         // origin is this very chat, so a later `@user` delivers back here.
         self.origin_of.insert(employee, employee);
         self.depth_of.insert(employee, 0);
 
+        // If the employee is mid-turn (or their session isn't ready yet), the
+        // prompt is queued and sent once they're idle — see `pump_employee_queue`.
+        if self.employee_is_busy(employee) || !self.has_session(employee) {
+            self.enqueue_prompt(employee, text);
+            return;
+        }
+
+        self.dispatch_prompt(employee, text);
+    }
+
+    /// True when `employee` has a live OpenCode session.
+    fn has_session(&self, employee: usize) -> bool {
+        self.chats
+            .get(&employee)
+            .is_some_and(|chat| chat.session_id.is_some())
+    }
+
+    /// True when `employee` is mid-turn (thinking or working) and so cannot take
+    /// a new prompt right now.
+    fn employee_is_busy(&self, employee: usize) -> bool {
+        self.team
+            .employees()
+            .get(employee)
+            .is_some_and(|e| matches!(e.status, EmployeeStatus::Thinking | EmployeeStatus::Working))
+    }
+
+    /// Queue `text` for `employee`, starting their session if none is already
+    /// being created so the queue can drain once it is ready.
+    fn enqueue_prompt(&mut self, employee: usize, text: String) {
+        let name = self
+            .team
+            .employees()
+            .get(employee)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| employee.to_string());
+        self.push_log(format!("queued for {name}"));
+        self.chats
+            .entry(employee)
+            .or_default()
+            .queue_running
+            .push(text);
+        if !self.has_session(employee) {
+            self.begin_session(employee);
+        }
+    }
+
+    /// Drain the next queued prompt for `employee`, if they are idle with a
+    /// ready session. At most one prompt is sent per call: dispatching marks the
+    /// employee `Thinking`, so the next call (on the following completed turn)
+    /// picks up the rest.
+    fn pump_employee_queue(&mut self, employee: usize) {
+        if self.client.is_none() {
+            return;
+        }
+        let Some(text) = self.next_queued(employee) else {
+            return;
+        };
+        self.dispatch_prompt(employee, text);
+    }
+
+    /// Pop `employee`'s oldest queued prompt, but only when they are idle with a
+    /// live session — otherwise `None`, leaving the queue intact. Split out from
+    /// [`Self::pump_employee_queue`] so the gating can be exercised without a
+    /// live client.
+    fn next_queued(&mut self, employee: usize) -> Option<String> {
+        if !self.has_session(employee) || self.employee_is_busy(employee) {
+            return None;
+        }
+        let chat = self.chats.get_mut(&employee)?;
+        if chat.queue_running.is_empty() {
+            None
+        } else {
+            Some(chat.queue_running.remove(0))
+        }
+    }
+
+    /// Send `text` to `employee`'s live session right now, marking them busy. The
+    /// caller has already recorded it in the transcript and history.
+    fn dispatch_prompt(&mut self, employee: usize, text: String) {
+        let Some(session_id) = self
+            .chats
+            .get(&employee)
+            .and_then(|chat| chat.session_id.clone())
+        else {
+            return;
+        };
+        if let Some(chat) = self.chats.get_mut(&employee) {
+            chat.streaming_text.clear();
+            chat.reasoning_text.clear();
+            chat.scroll = 0;
+        }
+        self.team.set_status(employee, EmployeeStatus::Thinking);
+
         // The first prompt to an employee carries the team roster + delegation
         // protocol; later prompts go through verbatim.
-        let prompt = self.bootstrap_prompt(employee, text.clone());
+        let prompt = self.bootstrap_prompt(employee, text);
 
-        let client = match self.client.clone() {
-            Some(client) => client,
-            None => return,
+        let Some(client) = self.client.clone() else {
+            return;
         };
         let tx = self.tx.clone();
         let target = employee;
@@ -1410,7 +1502,6 @@ impl App {
         chat.streaming_text.clear();
         chat.reasoning_text.clear();
         chat.scroll = 0;
-        chat.scroll = 0;
         // The hand-off "returned" (in some form), so stop tracking its deadline.
         chat.pending = None;
 
@@ -1434,6 +1525,10 @@ impl App {
 
         // Record the employee's deliverable into any active parallel fan-out.
         self.note_fanout_result(employee, &messages);
+
+        // The turn is over — send the next prompt the user queued while we were
+        // busy, if any.
+        self.pump_employee_queue(employee);
     }
 
     /// Route a streamed OpenCode event into the owning employee's chat
@@ -2052,6 +2147,9 @@ impl App {
         } else {
             self.team.set_status(target, EmployeeStatus::Error);
         }
+
+        // A failed delivery ends the turn; let the next queued prompt through.
+        self.pump_employee_queue(target);
     }
 
     // --- autonomous tasks (cron schedules + file watches) ---
@@ -2551,11 +2649,17 @@ impl App {
     pub fn metrics(&self) -> &ProcessMetrics {
         &self.metrics
     }
+
+    /// The persisted scheduled tasks, in insertion order (newest last). The
+    /// tasks panel re-sorts them for display via [`order_tasks`].
+    pub fn tasks(&self) -> &[Task] {
+        &self.store.tasks
+    }
 }
 
 /// A short, single-line summary of a task — the goal an employee is handed —
 /// for the tasks panel: first non-empty line, whitespace collapsed, truncated.
-fn task_summary(text: &str) -> String {
+pub(crate) fn task_summary(text: &str) -> String {
     let line = text
         .lines()
         .map(str::trim)
@@ -2568,6 +2672,20 @@ fn task_summary(text: &str) -> String {
     let mut out: String = joined.chars().take(47).collect();
     out.push('…');
     out
+}
+
+/// A display ordering for the tasks panel: active work first (Pending, Running,
+/// Retrying), then terminal tasks (Succeeded, Failed), each group sorted
+/// newest-first by `created_at`. Returns indices into `tasks` so callers keep
+/// borrowing the original slice.
+pub(crate) fn order_tasks(tasks: &[Task]) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..tasks.len()).collect();
+    indices.sort_by_key(|&index| {
+        let task = &tasks[index];
+        let terminal = matches!(task.status, TaskStatus::Succeeded | TaskStatus::Failed);
+        (terminal, Reverse(task.created_at))
+    });
+    indices
 }
 
 /// The deliverable text of the last completed assistant reply — delegation

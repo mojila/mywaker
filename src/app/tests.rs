@@ -1014,3 +1014,156 @@ fn input_scroll_retracts_on_delete_word() {
     assert_eq!(app.input, "");
     assert_eq!(app.input_scroll, 0);
 }
+
+/// The tasks panel orders active work (pending, running, retrying) ahead of
+/// terminal tasks, each group newest-first by creation time.
+#[test]
+fn order_tasks_puts_active_first_then_recent() {
+    let mut pending = Task::new("pending goal", None);
+    let mut running = Task::new("running goal", None);
+    let mut retrying = Task::new("retrying goal", None);
+    let mut done_old = Task::new("old success", None);
+    let mut done_new = Task::new("new success", None);
+    let mut failed = Task::new("failed goal", None);
+
+    // Fixed timestamps keep the expectation independent of wall-clock order.
+    pending.created_at = 10;
+    running.created_at = 30;
+    retrying.created_at = 20;
+    done_old.created_at = 5;
+    done_new.created_at = 40;
+    failed.created_at = 6;
+    running.status = TaskStatus::Running;
+    retrying.status = TaskStatus::Retrying;
+    done_old.status = TaskStatus::Succeeded;
+    done_new.status = TaskStatus::Succeeded;
+    failed.status = TaskStatus::Failed;
+
+    let tasks = vec![pending, running, retrying, done_old, done_new, failed];
+    let ordered: Vec<&str> = order_tasks(&tasks)
+        .into_iter()
+        .map(|index| tasks[index].goal.as_str())
+        .collect();
+
+    assert_eq!(
+        ordered,
+        vec![
+            "running goal",
+            "retrying goal",
+            "pending goal", // active work, newest first
+            "new success",
+            "failed goal",
+            "old success", // terminal, newest first
+        ]
+    );
+}
+
+#[test]
+fn tasks_accessor_exposes_persisted_tasks() {
+    let (mut app, _rx) = make_app();
+    assert!(app.tasks().is_empty());
+
+    app.store
+        .upsert_task(Task::new("write the changelog", None));
+    app.store
+        .upsert_task(Task::new("sweep the inbox", Some("researcher".into())));
+
+    let goals: Vec<&str> = app.tasks().iter().map(|task| task.goal.as_str()).collect();
+    assert_eq!(goals, vec!["write the changelog", "sweep the inbox"]);
+}
+
+/// The persisted queue section renders above the per-employee board without
+/// panicking, showing each task's status and a goal summary.
+#[test]
+fn renders_task_queue_without_panicking() {
+    let (mut app, _rx) = make_app();
+    let mut running = Task::new("sweep the inbox", Some("researcher".into()));
+    running.status = TaskStatus::Running;
+    app.store.upsert_task(running);
+    app.store
+        .upsert_task(Task::new("write the changelog", None));
+
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &app))
+        .unwrap();
+
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("queue"), "task queue heading missing");
+    assert!(text.contains("running"), "queued task status missing");
+    assert!(text.contains("sweep the inbox"), "queued goal missing");
+    assert!(text.contains("pending"), "pending task status missing");
+}
+
+/// A prompt typed while the employee is mid-turn is queued (not dropped) and
+/// still lands in the transcript and recall history right away.
+#[test]
+fn send_prompt_queues_when_employee_is_busy() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0); // a live session…
+    app.team.set_status(0, EmployeeStatus::Thinking); // …but a turn in flight
+
+    app.input = "second thought".into();
+    app.send_prompt();
+
+    assert_eq!(app.chats[&0].queue_running, vec!["second thought"]);
+    assert_eq!(app.chats[&0].history, vec!["second thought"]);
+    assert!(
+        app.chats[&0]
+            .transcript
+            .iter()
+            .any(|line| line.text == "second thought"),
+        "queued prompt should appear in the transcript immediately"
+    );
+}
+
+/// `next_queued` only hands out a prompt when the employee is idle *and* has a
+/// live session, one prompt at a time.
+#[test]
+fn next_queued_requires_idle_and_ready_session() {
+    let (mut app, _rx) = make_app();
+    app.chats
+        .entry(0)
+        .or_default()
+        .queue_running
+        .push("queued".into());
+
+    // No session yet → nothing drains.
+    assert_eq!(app.next_queued(0), None);
+    assert_eq!(app.chats[&0].queue_running, vec!["queued"]);
+
+    // Live session, but a busy employee → still nothing.
+    app.chats.get_mut(&0).unwrap().session_id = Some("ses_1".into());
+    app.team.set_status(0, EmployeeStatus::Working);
+    assert_eq!(app.next_queued(0), None);
+    assert_eq!(app.chats[&0].queue_running, vec!["queued"]);
+
+    // Idle with a session → the oldest prompt drains, then the queue is empty.
+    app.team.set_status(0, EmployeeStatus::Idle);
+    assert_eq!(app.next_queued(0), Some("queued".to_string()));
+    assert!(app.chats[&0].queue_running.is_empty());
+    assert_eq!(app.next_queued(0), None);
+}
+
+/// Without a client, pumping is a silent no-op and the queue is left intact.
+#[test]
+fn pump_is_a_noop_without_a_client() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.chats
+        .get_mut(&0)
+        .unwrap()
+        .queue_running
+        .push("held".into());
+
+    app.pump_employee_queue(0);
+
+    assert_eq!(app.chats[&0].queue_running, vec!["held"]);
+}

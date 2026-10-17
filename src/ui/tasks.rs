@@ -1,6 +1,10 @@
 //! The "tasks" panel: a right-hand list of every employee and its latest
 //! task, complementing the workflow pipeline. Read-only — the pipeline stays
 //! the selection surface; this panel just surfaces what each teammate is up to.
+//!
+//! Above the per-employee board sits the persisted scheduled-task queue: the
+//! autonomous (cron/file-watch) goals the harness has on record, active work
+//! first. It is shown only when there is at least one task.
 
 use ratatui::{
     Frame,
@@ -10,7 +14,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::app::App;
+use crate::app::{self, App};
+use crate::task::{Task, TaskStatus};
 use crate::team::{Employee, EmployeeStatus};
 
 /// Braille spinner frames, indexed by the app tick (in sync with the avatar).
@@ -19,6 +24,7 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let employees = app.team().employees();
     let order = app.workflow_order();
+    let tasks = app.tasks();
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -31,6 +37,22 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let mut lines: Vec<Line> = Vec::new();
+
+    // The persisted scheduled-task queue, active work first. The heading only
+    // appears when there is something queued, so an idle store stays quiet.
+    if !tasks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " queue",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for &index in &app::order_tasks(tasks) {
+            lines.push(queued_task_line(&tasks[index]));
+        }
+        lines.push(Line::from(""));
+    }
+
     for &index in &order {
         let employee = &employees[index];
         let selected = index == app.selected();
@@ -40,6 +62,29 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// One line of the persisted-task queue: the status label (colored) plus a
+/// truncated goal summary.
+fn queued_task_line(task: &Task) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{:<9}", task.status.label()),
+            Style::default().fg(queued_status_color(task.status)),
+        ),
+        Span::styled(truncate(&app::task_summary(&task.goal), 18), Color::Gray),
+    ])
+}
+
+fn queued_status_color(status: TaskStatus) -> Color {
+    match status {
+        TaskStatus::Pending => Color::DarkGray,
+        TaskStatus::Running => Color::Cyan,
+        TaskStatus::Retrying => Color::Yellow,
+        TaskStatus::Succeeded => Color::Green,
+        TaskStatus::Failed => Color::Red,
+    }
 }
 
 /// Line 1: status icon + name (+ role, dim).
