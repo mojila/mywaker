@@ -35,6 +35,21 @@ fn open_chat(app: &mut App, employee: usize) {
     app.chats.entry(employee).or_default().session_id = Some("ses_1".into());
 }
 
+/// Draw the whole app at `width`×`height` on a throwaway terminal and return the
+/// buffer's symbols — one place builds the screen the render tests read.
+fn screen(app: &App, width: u16, height: u16) -> String {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, app)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
 /// The first prompt to an employee carries the team roster + delegation
 /// protocol; subsequent prompts are verbatim.
 #[test]
@@ -559,9 +574,7 @@ fn renders_pipeline_with_mixed_statuses() {
     app.team.set_status(0, EmployeeStatus::Working); // researcher
     app.selected = 3;
 
-    let backend = ratatui::backend::TestBackend::new(120, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    screen(&app, 120, 30);
 }
 
 #[test]
@@ -574,9 +587,7 @@ fn renders_in_chat_mode() {
     chat.streaming_text = "wor".into();
     app.input = "reply".into();
 
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    screen(&app, 100, 30);
 }
 
 #[test]
@@ -586,9 +597,7 @@ fn renders_slash_command_menu_without_panicking() {
     app.input = "/s".into();
     app.command_menu = Some(1);
 
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    screen(&app, 100, 30);
 }
 
 #[test]
@@ -606,9 +615,7 @@ fn renders_projects_mode() {
     app.active_project = app.projects.first().cloned();
     app.project_selected = 0;
 
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    screen(&app, 100, 30);
 }
 
 #[test]
@@ -631,17 +638,7 @@ fn renders_shutdown_overlay_without_panicking() {
     let (mut app, _rx) = make_app();
     app.update(Message::Quit);
 
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
-
-    let text: String = terminal
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect();
+    let text = screen(&app, 100, 30);
     assert!(
         text.contains("shutting down"),
         "shutdown overlay text missing"
@@ -846,7 +843,7 @@ fn models_loaded_clamps_selection_to_filtered_range() {
     assert_eq!(app.model_selected, 0);
 }
 
-// --- help overlay ---
+// --- help: overlay, command table, footer hints ---
 
 #[test]
 fn question_mark_opens_help_and_any_key_dismisses() {
@@ -877,9 +874,53 @@ fn renders_help_overlay_without_panicking() {
     let (mut app, _rx) = make_app();
     app.show_help = true;
 
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    screen(&app, 100, 30);
+}
+
+/// `/help` is generated from the command table, so every command the table knows
+/// is listed with the argument it takes and the description the completion menu
+/// shows — the two surfaces that explain the commands cannot drift apart.
+#[test]
+fn help_lists_every_command_from_the_table() {
+    let text = chat_help_text();
+    for command in CHAT_COMMANDS {
+        assert!(
+            text.contains(&command.usage()),
+            "{} missing from /help",
+            command.command
+        );
+        assert!(
+            text.contains(command.description),
+            "{} has no description in /help",
+            command.command
+        );
+    }
+}
+
+/// A command whose whole point is a free-text argument is listed by `/help` but
+/// kept out of the completion menu, which would otherwise trigger while the user
+/// is still typing the goal.
+#[test]
+fn help_lists_argument_commands_the_menu_leaves_out() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.input = "/parallel".into();
+
+    assert!(chat_help_text().contains("/parallel <goal>"));
+    assert!(app.matching_commands().is_empty(), "menu offered it");
+}
+
+/// The `/help` chat command prints that same listing into the transcript.
+#[test]
+fn slash_help_prints_the_command_table() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.input = "/help".into();
+
+    app.send_prompt();
+
+    let last = app.chats[&0].transcript.last().expect("a help line");
+    assert_eq!(last.text, chat_help_text());
 }
 
 // --- grapheme-safe editing ---
@@ -1083,19 +1124,7 @@ fn renders_task_queue_without_panicking() {
     app.store
         .upsert_task(Task::new("write the changelog", None));
 
-    let backend = ratatui::backend::TestBackend::new(120, 40);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| crate::ui::render(frame, &app))
-        .unwrap();
-
-    let text: String = terminal
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect();
+    let text = screen(&app, 120, 40);
     assert!(text.contains("queue"), "task queue heading missing");
     assert!(text.contains("running"), "queued task status missing");
     assert!(text.contains("sweep the inbox"), "queued goal missing");

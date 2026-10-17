@@ -223,6 +223,13 @@ consts; no per-frame allocation.
   (`ui/status.rs`), so the pipeline, the tasks panel, and the avatar cannot drift
   apart; `EmployeeStatus::label()` (`team.rs`) supplies the text without pulling a
   UI dependency into the model layer.
+- The bottom hint bar is data: `ui::hint_bar` holds one `(key, description)` list
+  per screen and `ui::hint_line` styles it, so a screen's hints are an edit to one
+  list. The full-screen overlay's body is `ui::help_lines`.
+- The chat's slash commands live in one table (`app::CHAT_COMMANDS`) that both the
+  completion menu and the `/help` listing read; `CommandOption` carries the
+  command, its argument hint, its one-line description, and whether the menu offers
+  it, so the menu and the listing cannot drift apart.
 
 ---
 
@@ -274,6 +281,9 @@ load (serde `deny_unknown_fields`).
 - Integration tests in `tests/` against a fake OpenCode HTTP server (`wiremock`-style
   or `axum` test server) for client/SSE behavior, so CI needs no real OpenCode.
 - `tokio::test` for async paths.
+- Render tests build their screen through one helper per test crate
+  (`src/app/tests.rs::screen`, `tests/render.rs::screen`) — draw at a size, return the
+  buffer's symbols — so a rendering assertion only says what it looks for.
 
 ---
 

@@ -221,62 +221,58 @@ fn stream_stats(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_help(frame: &mut Frame, app: &App, area: Rect) {
-    let help = match app.mode() {
-        Mode::Roster => Line::from(vec![
-            " ←/→ ".bold().cyan(),
-            "stage ".dim(),
-            " Enter ".bold().cyan(),
-            "chat ".dim(),
-            " p ".bold().cyan(),
-            "projects ".dim(),
-            " m ".bold().cyan(),
-            "model ".dim(),
-            " ? ".bold().cyan(),
-            "help ".dim(),
-            " q ".bold().cyan(),
-            "quit ".dim(),
-        ]),
-        Mode::Models => Line::from(vec![
-            " type ".bold().cyan(),
-            "search ".dim(),
-            " Ctrl-U ".bold().cyan(),
-            "clear ".dim(),
-            " ↑ ".bold().cyan(),
-            "/ ".dim(),
-            " ↓ ".bold().cyan(),
-            "move ".dim(),
-            " Enter ".bold().cyan(),
-            "assign ".dim(),
-            " Esc ".bold().cyan(),
-            "back ".dim(),
-        ]),
-        Mode::Projects => Line::from(vec![
-            " ↑/k ".bold().cyan(),
-            "move ".dim(),
-            " ↓/j ".bold().cyan(),
-            "move ".dim(),
-            " Enter ".bold().cyan(),
-            "select ".dim(),
-            " Esc ".bold().cyan(),
-            "back ".dim(),
-        ]),
-        Mode::Chat => Line::from(vec![
-            " Enter ".bold().cyan(),
-            "send ".dim(),
-            " ↑/↓ ".bold().cyan(),
-            "history ".dim(),
-            " PgUp/PgDn ".bold().cyan(),
-            "scroll ".dim(),
-            " /help ".bold().cyan(),
-            "cmds ".dim(),
-            " Esc ".bold().cyan(),
-            "back ".dim(),
-            " Ctrl-C ".bold().cyan(),
-            "stop ".dim(),
-        ]),
+/// The bottom hint bar: the active screen's keys, as `(key, description)` pairs
+/// in display order. The bar is data so a screen's hints are one list, not a run
+/// of hand-built spans.
+fn hint_bar(app: &App) -> Line<'static> {
+    let hints: &[(&str, &str)] = match app.mode() {
+        Mode::Roster => &[
+            ("←/→", "stage"),
+            ("Enter", "chat"),
+            ("p", "projects"),
+            ("m", "model"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Mode::Models => &[
+            ("type", "search"),
+            ("Ctrl-U", "clear"),
+            ("↑", "/"),
+            ("↓", "move"),
+            ("Enter", "assign"),
+            ("Esc", "back"),
+        ],
+        Mode::Projects => &[
+            ("↑/k", "move"),
+            ("↓/j", "move"),
+            ("Enter", "select"),
+            ("Esc", "back"),
+        ],
+        Mode::Chat => &[
+            ("Enter", "send"),
+            ("↑/↓", "history"),
+            ("PgUp/PgDn", "scroll"),
+            ("/help", "cmds"),
+            ("Esc", "back"),
+            ("Ctrl-C", "stop"),
+        ],
     };
-    frame.render_widget(Paragraph::new(help), area);
+    hint_line(hints)
+}
+
+/// One hint bar line: every key in bold cyan with its padding, every description
+/// dim and trailing a space, so the pairs run together without gaps.
+fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(hints.len() * 2);
+    for (key, description) in hints {
+        spans.push(format!(" {key} ").bold().cyan());
+        spans.push(format!("{description} ").dim());
+    }
+    Line::from(spans)
+}
+
+fn render_help(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(Paragraph::new(hint_bar(app)), area);
 }
 
 /// Centre a fixed-size popup within `area`, clamped to the terminal size.

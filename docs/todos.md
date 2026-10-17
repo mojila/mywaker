@@ -150,7 +150,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 
 ## M8 — Polish & ship
 
-- [x] 💻 Help popup + keybinding footer (q quit, ←/→ stage, Enter chat, m model, p projects, ? help)
+- [x] 💻 Help popup + keybinding footer (q quit, ←/→ stage, Enter chat, m model, p projects, ? help) — the footer is data (`ui::hint_bar`: one `(key, description)` list per screen, styled by `ui::hint_line`), the overlay body is `ui::help_lines`, and the chat's slash commands live in one table (`app::CHAT_COMMANDS`) that both the completion menu and the `/help` listing read, so the menu and the listing can't drift
 - [ ] 💻 Tabbed layout: Dashboard / Tasks / (Chat is modal-on-Enter) — superseded by the workflow-pipeline + right-hand tasks panel (see M4 note)
 - [x] 💻 Theming/colors consistent (cyan/green/red/yellow-dim per architecture §5) — the status → glyph/colour/spinner mapping is shared from `src/ui/status.rs` by the pipeline, the tasks panel, and the avatar, so the panels can't drift apart
 - [ ] 💻 `tui-shimmer` idle "waiting for work…" states — deferred: self-contained Braille spinner already animates thinking/working (see M3 note)

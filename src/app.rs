@@ -142,54 +142,101 @@ struct FanOut {
     aggregated: bool,
 }
 
-/// One entry in the chat slash-command autocomplete menu.
+/// One chat slash command. Both surfaces that explain the commands read this
+/// table — the completion menu and `/help` — so the two cannot drift apart.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandOption {
+    /// The command as typed, e.g. `/skill add`.
     pub command: &'static str,
+    /// The argument it takes, e.g. `<source>` (empty when it takes none). The
+    /// completion menu leaves a trailing space for it; `/help` writes it out.
+    pub args: &'static str,
     pub description: &'static str,
-    /// Whether selecting this option auto-appends a trailing space (it takes an
-    /// argument the user then types).
-    pub takes_arg: bool,
+    /// Whether the completion menu offers this command as you type. A command
+    /// whose whole point is a free-text argument is listed by `/help` but left
+    /// out of the menu, which would only get in the way of typing the goal.
+    pub menu: bool,
 }
 
-/// The slash commands offered by the chat completion menu, in display order.
+impl CommandOption {
+    /// The command with its argument hint, as `/help` writes it: `/skill add
+    /// <source>`.
+    fn usage(&self) -> String {
+        if self.args.is_empty() {
+            self.command.to_string()
+        } else {
+            format!("{} {}", self.command, self.args)
+        }
+    }
+}
+
+/// The chat's slash commands, in display order.
 const CHAT_COMMANDS: &[CommandOption] = &[
     CommandOption {
         command: "/help",
+        args: "",
         description: "show chat commands",
-        takes_arg: false,
+        menu: true,
     },
     CommandOption {
         command: "/stop",
+        args: "",
         description: "interrupt the current run",
-        takes_arg: false,
+        menu: true,
     },
     CommandOption {
         command: "/new",
+        args: "",
         description: "start a fresh session",
-        takes_arg: false,
+        menu: true,
     },
     CommandOption {
         command: "/clear",
+        args: "",
         description: "clear this conversation",
-        takes_arg: false,
+        menu: true,
     },
     CommandOption {
         command: "/skills",
+        args: "",
         description: "list installed skills",
-        takes_arg: false,
+        menu: true,
     },
     CommandOption {
         command: "/skill add",
+        args: "<source>",
         description: "install & attach a skill",
-        takes_arg: true,
+        menu: true,
     },
     CommandOption {
         command: "/skill",
+        args: "<name>",
         description: "attach an installed skill",
-        takes_arg: true,
+        menu: true,
+    },
+    CommandOption {
+        command: "/parallel",
+        args: "<goal>",
+        description: "fan the goal out to the whole team",
+        menu: false,
     },
 ];
+
+/// The `/help` body: every command in the table, each with the argument it takes
+/// and the description the completion menu shows, padded into two columns.
+fn chat_help_text() -> String {
+    let width = CHAT_COMMANDS
+        .iter()
+        .map(|command| command.usage().len())
+        .max()
+        .unwrap_or(0);
+    let mut text = String::from("chat commands:");
+    for command in CHAT_COMMANDS {
+        let usage = command.usage();
+        text.push_str(&format!("\n  {usage:width$}  {}", command.description));
+    }
+    text
+}
 
 pub struct App {
     config: Config,
@@ -597,7 +644,7 @@ impl App {
         let input = self.input.trim();
         CHAT_COMMANDS
             .iter()
-            .filter(|opt| opt.command.starts_with(input))
+            .filter(|opt| opt.menu && opt.command.starts_with(input))
             .copied()
             .collect()
     }
@@ -650,7 +697,7 @@ impl App {
             return;
         };
         self.input = option.command.to_string();
-        if option.takes_arg {
+        if !option.args.is_empty() {
             self.input.push(' ');
         }
         self.input_cursor = self.grapheme_len();
@@ -1336,12 +1383,10 @@ impl App {
             return true;
         }
 
-        // `/help` — show the chat-local commands.
+        // `/help` — show the chat-local commands, straight from the table the
+        // completion menu reads.
         if rest == "help" {
-            self.push_transcript_line(
-                TranscriptRole::Info,
-                "chat commands:\n  /skill add <source>  install & attach a skill\n  /skill <name>        attach an installed skill\n  /skills              list installed skills\n  /parallel <goal>     fan the goal out to the whole team\n  /stop                interrupt the current run\n  /new · /clear        start a fresh session".to_string(),
-            );
+            self.push_transcript_line(TranscriptRole::Info, chat_help_text());
             return true;
         }
 
