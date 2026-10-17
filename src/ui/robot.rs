@@ -2,6 +2,8 @@
 
 use ratatui::text::Line;
 
+use crate::ui::status;
+
 /// Aggregate team mood the robot reflects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RobotState {
@@ -11,12 +13,9 @@ pub enum RobotState {
     Error,
 }
 
-/// Braille spinner frames, indexed by tick.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
 /// Render the robot as pre-padded lines for the given state + animation frame.
 pub fn render(state: RobotState, frame: u64) -> Vec<Line<'static>> {
-    let spinner = SPINNER[(frame as usize) % SPINNER.len()];
+    let spinner = status::spinner(frame);
 
     let antenna = match state {
         RobotState::Error => "✕",

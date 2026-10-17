@@ -152,7 +152,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 
 - [x] 💻 Help popup + keybinding footer (q quit, ←/→ stage, Enter chat, m model, p projects, ? help)
 - [ ] 💻 Tabbed layout: Dashboard / Tasks / (Chat is modal-on-Enter) — superseded by the workflow-pipeline + right-hand tasks panel (see M4 note)
-- [x] 💻 Theming/colors consistent (cyan/green/red/yellow-dim per architecture §5)
+- [x] 💻 Theming/colors consistent (cyan/green/red/yellow-dim per architecture §5) — the status → glyph/colour/spinner mapping is shared from `src/ui/status.rs` by the pipeline, the tasks panel, and the avatar, so the panels can't drift apart
 - [ ] 💻 `tui-shimmer` idle "waiting for work…" states — deferred: self-contained Braille spinner already animates thinking/working (see M3 note)
 - [x] 📄 `README.md` — install, config, keybindings, OpenCode setup, scheduling, sample agents (screenshots/gif deferred)
 - [x] 📄 Sample agent definitions checked in — `examples/opencode.agents.jsonc` + `examples/agents/{planner,researcher,writer,reviewer}.md`

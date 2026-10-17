@@ -45,13 +45,19 @@ mywaker/
     │   ├── events.rs         SSE subscribe + typed event parse
     │   └── models.rs         serde types (Agent, Session, Event, ServerInfo)
     └── ui/
-        ├── mod.rs            layout orchestration (view)
+        ├── mod.rs            layout orchestration + shared text helpers (view)
         ├── robot.rs          animated robot avatar (state-driven ASCII)
-        ├── dashboard.rs      (planned M4) roster + status
-        ├── chat.rs           (planned M5) conversation + streaming
-        ├── tasks.rs          (planned M6) task list + retry
-        └── components.rs     (planned) popups, help, status bar
+        ├── pipeline.rs       team tree diagram — planner → jev → leaves
+        ├── tasks.rs          per-employee board + persisted task queue
+        ├── chat.rs           conversation transcript + streaming (modal)
+        ├── models.rs         model picker popup
+        ├── projects.rs       project picker popup
+        └── status.rs         status glyph/colour/spinner shared by the panels
 ```
+
+Note: the `dashboard.rs`/`components.rs` sketches were dropped — the roster lives
+in `pipeline.rs`, the popups in their own modules, and the original M8 "tabbed
+layout" is superseded by the pipeline + right-hand tasks panel.
 
 Note: `opencode/client.rs` and `opencode/session.rs` from the original sketch were
 folded into `opencode/mod.rs` (the client is small enough to live in one file); the
@@ -213,6 +219,10 @@ consts; no per-frame allocation.
 - Use `Stylize` helpers (`.cyan()`, `.green()`, `.red()`, `.dim()`, `.bold()`).
 - Palette: cyan primary, green success, red error, yellow warnings (sparing), dim/mute.
 - True-color with automatic fallback.
+- The lifecycle status → glyph/colour/spinner mapping lives in one place
+  (`ui/status.rs`), so the pipeline, the tasks panel, and the avatar cannot drift
+  apart; `EmployeeStatus::label()` (`team.rs`) supplies the text without pulling a
+  UI dependency into the model layer.
 
 ---
 

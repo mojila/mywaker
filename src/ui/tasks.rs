@@ -15,11 +15,9 @@ use ratatui::{
 };
 
 use crate::app::{self, App};
-use crate::task::{Task, TaskStatus};
-use crate::team::{Employee, EmployeeStatus};
-
-/// Braille spinner frames, indexed by the app tick (in sync with the avatar).
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+use crate::task::Task;
+use crate::team::Employee;
+use crate::ui::{status, truncate};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let employees = app.team().employees();
@@ -71,20 +69,10 @@ fn queued_task_line(task: &Task) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             format!("{:<9}", task.status.label()),
-            Style::default().fg(queued_status_color(task.status)),
+            Style::default().fg(status::task_color(task.status)),
         ),
         Span::styled(truncate(&app::task_summary(&task.goal), 18), Color::Gray),
     ])
-}
-
-fn queued_status_color(status: TaskStatus) -> Color {
-    match status {
-        TaskStatus::Pending => Color::DarkGray,
-        TaskStatus::Running => Color::Cyan,
-        TaskStatus::Retrying => Color::Yellow,
-        TaskStatus::Succeeded => Color::Green,
-        TaskStatus::Failed => Color::Red,
-    }
 }
 
 /// Line 1: status icon + name (+ role, dim).
@@ -97,7 +85,7 @@ fn employee_header(employee: &Employee, tick: u64, selected: bool) -> Line<'stat
         Style::default().add_modifier(Modifier::BOLD)
     };
     Line::from(vec![
-        status_icon(employee.status, tick),
+        status::icon_span(employee.status, tick),
         Span::raw(" "),
         Span::styled(truncate(&employee.name, 18), name_style),
         Span::styled(" · ", Color::DarkGray),
@@ -112,53 +100,9 @@ fn task_line(employee: &Employee) -> Line<'static> {
             Span::raw("  "),
             Span::styled(
                 truncate(task, 24),
-                Style::default().fg(task_color(employee.status)),
+                Style::default().fg(status::text_color(employee.status)),
             ),
         ]),
         None => Line::from(Span::styled("  —", Color::DarkGray)),
     }
-}
-
-fn status_icon(status: EmployeeStatus, tick: u64) -> Span<'static> {
-    let symbol = match status {
-        EmployeeStatus::Idle => "●",
-        EmployeeStatus::Thinking => SPINNER[(tick as usize) % SPINNER.len()],
-        EmployeeStatus::Working => "▶",
-        EmployeeStatus::Done => "✓",
-        EmployeeStatus::Error => "✕",
-    };
-    Span::styled(symbol, status_color(status))
-}
-
-fn status_color(status: EmployeeStatus) -> Color {
-    match status {
-        EmployeeStatus::Idle => Color::DarkGray,
-        EmployeeStatus::Thinking => Color::Yellow,
-        EmployeeStatus::Working => Color::Cyan,
-        EmployeeStatus::Done => Color::Green,
-        EmployeeStatus::Error => Color::Red,
-    }
-}
-
-fn task_color(status: EmployeeStatus) -> Color {
-    match status {
-        EmployeeStatus::Idle => Color::Gray,
-        EmployeeStatus::Thinking => Color::Yellow,
-        EmployeeStatus::Working => Color::Cyan,
-        EmployeeStatus::Done => Color::Green,
-        EmployeeStatus::Error => Color::Red,
-    }
-}
-
-/// Truncate to `width` display columns, appending an ellipsis when clipped.
-fn truncate(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }

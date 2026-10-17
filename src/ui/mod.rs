@@ -5,6 +5,7 @@ mod models;
 mod pipeline;
 mod projects;
 mod robot;
+mod status;
 mod tasks;
 
 use ratatui::{
@@ -20,11 +21,24 @@ use crate::usage::{fmt_bytes, fmt_count};
 
 use robot::{RobotState, render as render_robot};
 
-/// Braille spinner frames shared by the connecting and shutdown indicators.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
+/// The connecting/shutdown indicator spins at half the roster cadence, so it
+/// indexes the shared frames directly rather than via [`status::spinner`].
 fn spinner_at(frame: u64) -> &'static str {
-    SPINNER[(frame as usize / 2) % SPINNER.len()]
+    status::SPINNER[(frame as usize / 2) % status::SPINNER.len()]
+}
+
+/// Truncate `text` to `width` display columns, appending an ellipsis when
+/// clipped. Shared by the panels that render fixed-width rows.
+pub(crate) fn truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 pub fn render(frame: &mut Frame, app: &App) {

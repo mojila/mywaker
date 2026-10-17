@@ -17,10 +17,8 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::team::{Employee, EmployeeStatus};
-
-/// Braille spinner frames, indexed by the app tick (in sync with the avatar).
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+use crate::team::Employee;
+use crate::ui::{status, truncate};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let order = app.workflow_order();
@@ -120,51 +118,39 @@ fn centered(area: Rect, width: u16) -> Rect {
 
 fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, selected: bool) {
     let tick = app.frame();
-    let color = status_color(employee.status);
+    let accent = status::color(employee.status);
+    let width = area.width.saturating_sub(2) as usize;
 
     let title = Span::styled(
         format!(" {} ", employee.stage_label()),
-        Style::default().fg(color).add_modifier(if selected {
+        Style::default().fg(accent).add_modifier(if selected {
             Modifier::BOLD
         } else {
             Modifier::DIM
         }),
     );
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(if selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(color)
-        })
-        .title(title);
-
-    let width = area.width.saturating_sub(2) as usize;
+    let border = if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(accent)
+    };
 
     let lines = vec![
-        Line::from(vec![
-            status_icon(employee.status, tick),
-            Span::raw(" "),
-            Span::styled(
-                truncate(&employee.name, width.saturating_sub(2)),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        node_head(
+            status::icon_span(employee.status, tick),
+            &employee.name,
+            width,
+        ),
         Line::from(Span::styled(
             truncate(&employee.role, width),
             Color::DarkGray,
         )),
-        status_label(employee.status),
+        Line::from(Span::styled(employee.status.label(), accent)),
     ];
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .alignment(Alignment::Left);
-
-    frame.render_widget(paragraph, area);
+    render_node(frame, area, title, border, lines);
 }
 
 /// The Jev (System One) answerer node — a shared, non-employee stage every
@@ -176,39 +162,64 @@ fn render_jev_stage(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Color::DarkGray
     };
+    let width = area.width.saturating_sub(2) as usize;
 
     let title = Span::styled(
         " jev ",
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent))
-        .title(title);
 
     let lines = vec![
-        Line::from(vec![
-            Span::styled("◆", accent),
-            Span::raw(" "),
-            Span::styled("jev", Style::default().add_modifier(Modifier::BOLD)),
-        ]),
+        node_head(Span::styled("◆", accent), "jev", width),
         Line::from(Span::styled("answers questions", Color::DarkGray)),
-        Span::styled(
+        Line::from(Span::styled(
             if enabled { "on — @jev" } else { "off" },
             if enabled {
                 Color::Green
             } else {
                 Color::DarkGray
             },
-        )
-        .into(),
+        )),
     ];
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .alignment(Alignment::Left);
+    render_node(frame, area, title, Style::default().fg(accent), lines);
+}
 
-    frame.render_widget(paragraph, area);
+/// Render one pipeline node: a bordered box with a coloured title tab and
+/// left-aligned content. An employee stage and the shared Jev node are the same
+/// widget — they differ only in title, accent, and content — so the node's
+/// geometry and styling live here.
+fn render_node(
+    frame: &mut Frame,
+    area: Rect,
+    title: Span<'static>,
+    border: Style,
+    lines: Vec<Line<'static>>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(title);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
+/// A node's head row: the status glyph, a gap, then the node's name in bold,
+/// truncated to the box's inner width.
+fn node_head(glyph: Span<'static>, name: &str, inner_width: usize) -> Line<'static> {
+    Line::from(vec![
+        glyph,
+        Span::raw(" "),
+        Span::styled(
+            truncate(name, inner_width.saturating_sub(2)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 /// A downward connector (planner → jev → leaves).
@@ -220,49 +231,4 @@ fn render_arrow_down(frame: &mut Frame, area: Rect) {
     .alignment(Alignment::Center);
 
     frame.render_widget(arrow, area);
-}
-
-fn status_color(status: EmployeeStatus) -> Color {
-    match status {
-        EmployeeStatus::Idle => Color::DarkGray,
-        EmployeeStatus::Thinking => Color::Yellow,
-        EmployeeStatus::Working => Color::Cyan,
-        EmployeeStatus::Done => Color::Green,
-        EmployeeStatus::Error => Color::Red,
-    }
-}
-
-fn status_icon(status: EmployeeStatus, tick: u64) -> Span<'static> {
-    let symbol = match status {
-        EmployeeStatus::Idle => "●",
-        EmployeeStatus::Thinking => SPINNER[(tick as usize) % SPINNER.len()],
-        EmployeeStatus::Working => "▶",
-        EmployeeStatus::Done => "✓",
-        EmployeeStatus::Error => "✕",
-    };
-    Span::styled(symbol, status_color(status))
-}
-
-fn status_label(status: EmployeeStatus) -> Line<'static> {
-    let (text, color) = match status {
-        EmployeeStatus::Idle => ("idle", Color::DarkGray),
-        EmployeeStatus::Thinking => ("thinking", Color::Yellow),
-        EmployeeStatus::Working => ("working", Color::Cyan),
-        EmployeeStatus::Done => ("done", Color::Green),
-        EmployeeStatus::Error => ("error", Color::Red),
-    };
-    Line::from(Span::styled(text, color))
-}
-
-/// Truncate to `width` display columns, appending an ellipsis when clipped.
-fn truncate(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
