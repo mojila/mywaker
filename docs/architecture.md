@@ -153,7 +153,7 @@ Verified against a running `opencode serve --service` on macOS:
 |---|---|
 | Health / version | `GET /api/info` |
 | List agents (employees) | `GET /api/agent` |
-| Create session | `POST /api/session` body `{ "location": { "directory": "..." } }` |
+| Create session | `POST /api/session` body `{ "location": { "directory": "..." }, "model": { "id": "...", "providerID": "..." } }` |
 | Send prompt | `POST /api/session/{id}/prompt` |
 | Read messages | `GET /api/session/{id}/message` |
 | Block until idle | `POST /api/experimental/session/{id}/wait` |
@@ -270,12 +270,16 @@ chosen *explicitly* by the user via a **model selector**:
   service can run. `mywaker model list` prints them (id, provider, name, cost,
   context, tool/reasoning flags).
 - **Assign** — a model is persisted to `team.toml` as the employee's `model`
-  field, via `mywaker model set <employee> <model>`, or interactively in the TUI
-  (Roster → `m`) which lists models and assigns on Enter.
+  field plus its `model_provider`, via `mywaker model set <employee> <model>`, or
+  interactively in the TUI (Roster → `m`) which lists models and assigns on
+  Enter. The provider is resolved from `GET /api/model` and stored alongside the
+  id because the id alone is ambiguous (e.g. `deepseek-v4-pro` exists on both
+  `kenari` and `clario`).
 - **Apply** — when a session is created for an employee
-  (`OpenCode::create_session`), the employee's chosen `model` is passed through as
-  the session's model override (alongside the bound agent). No model → the
-  agent's own default.
+  (`OpenCode::create_session`), the employee's chosen model is passed through as
+  a `Model.Ref` object `{ "id", "providerID" }` (alongside the bound agent).
+  OpenCode v2 rejects a bare model id with `Expected Model.Ref | null`, hence the
+  object. No model → the agent's own default.
 
 The previous cross-provider *router* (Kenari catalog + weighted capability/cost
 scoring + task-complexity inference) was removed: automatic routing was assigning
@@ -339,8 +343,8 @@ can hand the final result back to the user.
 6. **Parallel fan-out + aggregation** — `@parallel <goal>` (aliases `@all` /
    `@fanout` / `@team`) broadcasts one goal to every teammate except the source
    and the aggregator. Each worker starts its own session concurrently (the
-   transport issues `N` sessions and `N` prompts in parallel; verified by
-   `tests/opencode_fake.rs`). `fan_out` registers a `FanOut { workers,
+   transport issues `N` sessions and `N` prompts in parallel). `fan_out`
+   registers a `FanOut { workers,
    aggregator, outputs }`; as each worker's transcript completes,
    `note_fanout_result` records its deliverable (directives stripped), and once
    all workers contribute, `aggregate_fanout` hands the collected outputs to the

@@ -4,7 +4,7 @@
 //! unknown keys and `Option` fields default to `None` when absent, so we only
 //! model what the app actually consumes.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// `GET /api/info` response.
 #[derive(Debug, Clone, Deserialize)]
@@ -189,8 +189,12 @@ pub struct MessageTime {
     pub completed: Option<u64>,
 }
 
-/// The model an assistant message ran on.
-#[derive(Debug, Clone, Deserialize)]
+/// A model reference — OpenCode's `Model.Ref` (`{ "id", "providerID" }`). Used
+/// both to describe the model an assistant message ran on ([`SessionMessage`])
+/// and, when serialized, as the `model` field of `POST /api/session`, where the
+/// provider disambiguates ids that exist under several providers (e.g.
+/// `deepseek-v4-pro` on both `kenari` and `clario`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRef {
     pub id: String,
@@ -541,6 +545,23 @@ impl ProviderModel {
     }
 }
 
+/// The provider assumed when a model id can't be resolved to its provider via
+/// the catalog — Kenari is the app's gateway, so its mirrored entries are the
+/// natural default.
+pub const DEFAULT_PROVIDER: &str = "kenari";
+
+/// Pick the catalog entry whose `id` equals `model`, preferring
+/// [`DEFAULT_PROVIDER`] when several entries share the id (e.g. `deepseek-v4-pro`
+/// is mirrored by both `kenari` and `clario`).
+pub fn pick_provider<'a>(models: &'a [ProviderModel], model: &str) -> Option<&'a ProviderModel> {
+    let viable: Vec<&'a ProviderModel> = models.iter().filter(|m| m.id == model).collect();
+    viable
+        .iter()
+        .copied()
+        .find(|m| m.provider_id.as_deref() == Some(DEFAULT_PROVIDER))
+        .or_else(|| viable.first().copied())
+}
+
 /// `cost` is either a list of `{input,output}` entries (OpenRouter-style) or a
 /// single object (some provider configs). `untagged` tolerates both.
 #[derive(Debug, Clone, Deserialize)]
@@ -602,6 +623,45 @@ pub struct ModelVariant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pick_provider` prefers the kenari mirror when an id is shared across
+    /// providers; otherwise it returns the first match in catalog order.
+    #[test]
+    fn pick_provider_prefers_kenari_mirror() {
+        fn model(id: &str, provider: &str) -> ProviderModel {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "providerID": provider,
+            }))
+            .unwrap()
+        }
+
+        let models = vec![
+            model("deepseek-v4-pro", "clario"),
+            model("deepseek-v4-pro", "kenari"),
+            model("anthropic/claude-haiku-5.5", "openrouter"),
+        ];
+
+        // Shared id → kenari wins regardless of catalog order.
+        assert_eq!(
+            pick_provider(&models, "deepseek-v4-pro")
+                .unwrap()
+                .provider_id
+                .as_deref(),
+            Some("kenari")
+        );
+
+        // Unique id → returned directly.
+        assert_eq!(
+            pick_provider(&models, "anthropic/claude-haiku-5.5")
+                .unwrap()
+                .provider_id
+                .as_deref(),
+            Some("openrouter")
+        );
+
+        assert!(pick_provider(&models, "unknown/model").is_none());
+    }
 
     #[test]
     fn deserializes_server_connected_event() {

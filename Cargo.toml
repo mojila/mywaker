@@ -1,6 +1,6 @@
 [package]
 name = "mywaker"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Run a team of AI employees backed by OpenCode from your terminal"

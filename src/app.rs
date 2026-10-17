@@ -11,7 +11,9 @@ use crate::event::EventHandler;
 use crate::harness::{self, PendingDelivery};
 use crate::jev::JevClient;
 use crate::message::Message;
-use crate::opencode::{AgentInfo, Event, OpenCode, ProviderModel, ServerInfo, SessionMessage};
+use crate::opencode::{
+    AgentInfo, Event, OpenCode, ProviderModel, ServerInfo, SessionMessage, pick_provider,
+};
 use crate::projects::{self, Project};
 use crate::role::Role;
 use crate::team::{EmployeeStatus, Team, move_selection};
@@ -335,6 +337,7 @@ impl App {
             Message::ModelsLoaded(models) => {
                 self.push_log(format!("{} models available", models.len()));
                 self.models = models;
+                self.backfill_model_providers();
                 self.model_selected = self
                     .model_selected
                     .min(self.filtered_models().len().saturating_sub(1));
@@ -860,13 +863,13 @@ impl App {
         let directory = self.workdir();
         let employee_conf = self.team.employees().get(employee);
         let agent = employee_conf.map(|e| e.agent_id().to_owned());
-        let model = employee_conf.and_then(|e| e.model.clone());
+        let model = employee_conf.and_then(|e| e.model_ref());
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = client
-                .create_session(&directory, agent.as_deref(), model.as_deref())
+                .create_session(&directory, agent.as_deref(), model.as_ref())
                 .await
-                .map_err(|err| err.to_string());
+                .map_err(|err| format!("{err:#}"));
             let _ = tx.send(Message::SessionCreated { employee, result }).await;
         });
     }
@@ -1959,21 +1962,29 @@ impl App {
             .collect()
     }
 
-    /// The model id currently highlighted, resolving the filtered picker index
-    /// back to the underlying catalog entry.
-    fn selected_model_id(&self) -> Option<String> {
+    /// The model catalog entry currently highlighted, resolving the filtered
+    /// picker index back to the underlying catalog entry.
+    fn current_model(&self) -> Option<&ProviderModel> {
         let index = *self.filtered_models().get(self.model_selected)?;
-        self.models.get(index).map(|model| model.id.clone())
+        self.models.get(index)
+    }
+
+    /// The model id currently highlighted in the picker.
+    #[cfg(test)]
+    fn selected_model_id(&self) -> Option<String> {
+        self.current_model().map(|m| m.id.clone())
     }
 
     /// Assign the highlighted model to the currently selected employee,
-    /// persisting the roster and returning to the dashboard.
+    /// persisting the roster (id + provider) and returning to the dashboard.
     fn assign_selected_model(&mut self) {
-        let Some(model) = self.selected_model_id() else {
+        let Some(model) = self.current_model() else {
             return;
         };
+        let id = model.id.clone();
+        let provider = model.provider_id.clone().unwrap_or_else(|| model.vendor());
         let employee = self.selected;
-        self.team.set_model(employee, model.clone());
+        self.team.set_model(employee, id.clone(), Some(provider));
         self.push_log(format!(
             "{} → model {}",
             self.team
@@ -1981,7 +1992,7 @@ impl App {
                 .get(employee)
                 .map(|e| e.name.as_str())
                 .unwrap_or("employee"),
-            model,
+            id,
         ));
         if let Some(path) = Team::default_path()
             && let Err(err) = self.team.save(&path)
@@ -1989,6 +2000,31 @@ impl App {
             self.push_log(format!("could not save team: {err}"));
         }
         self.mode = Mode::Roster;
+    }
+
+    /// Backfill each employee's `model_provider` from the loaded catalog when a
+    /// legacy assignment (a bare model id) predates the provider field, so
+    /// `Employee::model_ref` resolves the real provider instead of guessing. The
+    /// kenari mirror is preferred when an id is ambiguous. Persists only when
+    /// something changed.
+    fn backfill_model_providers(&mut self) {
+        let mut changed = false;
+        for employee in self.team.employees_mut() {
+            if employee.model_provider.is_none()
+                && let Some(model_id) = employee.model.as_deref()
+                && let Some(found) = pick_provider(&self.models, model_id)
+            {
+                employee.model_provider =
+                    Some(found.provider_id.clone().unwrap_or_else(|| found.vendor()));
+                changed = true;
+            }
+        }
+        if changed
+            && let Some(path) = Team::default_path()
+            && let Err(err) = self.team.save(&path)
+        {
+            self.push_log(format!("could not save team: {err}"));
+        }
     }
 
     fn workdir(&self) -> String {
@@ -2309,6 +2345,12 @@ pub async fn opencode_background(tx: Sender<Message>, jev: Option<JevClient>) {
 
     if let Ok(agents) = client.agents().await {
         let _ = tx.send(Message::AgentsLoaded(agents)).await;
+    }
+
+    // Pre-load the model catalog so session creation can resolve a model's
+    // provider without the user opening the picker first.
+    if let Ok(models) = client.models().await {
+        let _ = tx.send(Message::ModelsLoaded(models)).await;
     }
 
     let Some(events) = client.events().ok() else {

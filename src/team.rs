@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
-use crate::opencode::AgentInfo;
+use crate::opencode::{AgentInfo, DEFAULT_PROVIDER, ModelRef};
 
 /// Lifecycle status of an employee; drives the robot avatar and roster UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,6 +43,11 @@ pub struct Employee {
     /// Model the backing agent runs on (`None` until agents are loaded).
     #[serde(default)]
     pub model: Option<String>,
+    /// Provider hosting [`Self::model`], needed to build OpenCode's `Model.Ref`
+    /// (`{ id, providerID }`). Persisted with the model assignment; `None` for
+    /// legacy entries (falls back to the id's vendor segment at ref time).
+    #[serde(default)]
+    pub model_provider: Option<String>,
     /// Skills from the agent-skills ecosystem attached to this employee.
     #[serde(default)]
     pub skills: Vec<String>,
@@ -74,6 +79,7 @@ impl Employee {
             name: name.into(),
             role: role.into(),
             model: None,
+            model_provider: None,
             skills: Vec::new(),
             agent: None,
             onboarded: today_iso(),
@@ -91,6 +97,22 @@ impl Employee {
     /// else the employee's own id (which doubles as the agent id).
     pub fn agent_id(&self) -> &str {
         self.agent.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The model reference for OpenCode `POST /api/session`: the assigned model
+    /// id paired with its provider. `None` while no model is assigned. The
+    /// provider defaults to [`DEFAULT_PROVIDER`] (kenari) when a legacy
+    /// assignment predates `model_provider`.
+    pub fn model_ref(&self) -> Option<ModelRef> {
+        let id = self.model.clone()?;
+        let provider = self
+            .model_provider
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+        Some(ModelRef {
+            id,
+            provider_id: Some(provider),
+        })
     }
 }
 
@@ -127,6 +149,10 @@ impl Team {
         &self.employees
     }
 
+    pub fn employees_mut(&mut self) -> &mut [Employee] {
+        &mut self.employees
+    }
+
     pub fn len(&self) -> usize {
         self.employees.len()
     }
@@ -153,10 +179,11 @@ impl Team {
         }
     }
 
-    /// Set one employee's model by index (no-op if out of range).
-    pub fn set_model(&mut self, index: usize, model: String) {
+    /// Set one employee's model and its provider by index (no-op if out of range).
+    pub fn set_model(&mut self, index: usize, model: String, provider: Option<String>) {
         if let Some(employee) = self.employees.get_mut(index) {
             employee.model = Some(model);
+            employee.model_provider = provider;
         }
     }
 
@@ -378,6 +405,7 @@ mod tests {
         let mut team = Team::starter();
         team.add_skill("writer", "copywriting").unwrap();
         team.employee_mut("writer").unwrap().model = Some("openai/gpt-6-luna-pro".into());
+        team.employee_mut("writer").unwrap().model_provider = Some("openrouter".into());
         team.employee_mut("writer").unwrap().agent = Some("code-gen".into());
 
         let text = toml::to_string_pretty(&team).unwrap();
@@ -390,10 +418,40 @@ mod tests {
         let writer = loaded.employee("writer").unwrap();
         assert_eq!(writer.skills, vec!["copywriting".to_string()]);
         assert_eq!(writer.model.as_deref(), Some("openai/gpt-6-luna-pro"));
+        assert_eq!(writer.model_provider.as_deref(), Some("openrouter"));
         assert_eq!(writer.agent.as_deref(), Some("code-gen"));
         assert_eq!(writer.status, EmployeeStatus::Idle);
 
         // An employee without an explicit agent defaults to its own id.
         assert_eq!(loaded.employee("planner").unwrap().agent_id(), "planner");
+    }
+
+    #[test]
+    fn model_ref_pairs_id_with_provider_and_defaults_to_kenari() {
+        let mut team = Team::starter();
+        let writer = team.employee_mut("writer").unwrap();
+        writer.model = Some("deepseek-v4-pro".into());
+        writer.model_provider = Some("kenari".into());
+        assert_eq!(
+            writer.model_ref(),
+            Some(crate::opencode::ModelRef {
+                id: "deepseek-v4-pro".into(),
+                provider_id: Some("kenari".into()),
+            })
+        );
+
+        // Legacy assignment without an explicit provider defaults to kenari.
+        writer.model = Some("openai/gpt-6-luna-pro".into());
+        writer.model_provider = None;
+        assert_eq!(
+            writer.model_ref(),
+            Some(crate::opencode::ModelRef {
+                id: "openai/gpt-6-luna-pro".into(),
+                provider_id: Some("kenari".into()),
+            })
+        );
+
+        writer.model = None;
+        assert_eq!(writer.model_ref(), None);
     }
 }

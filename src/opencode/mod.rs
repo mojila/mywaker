@@ -9,8 +9,8 @@ use reqwest::Url;
 use serde::de::DeserializeOwned;
 
 pub use models::{
-    AgentInfo, Event, FormField, FormOption, FormRequest, Location, MessageError, Part,
-    ProviderModel, ServerInfo, SessionInfo, SessionMessage,
+    AgentInfo, DEFAULT_PROVIDER, Event, FormField, FormOption, FormRequest, Location, MessageError,
+    ModelRef, Part, ProviderModel, ServerInfo, SessionInfo, SessionMessage, pick_provider,
 };
 
 /// The fixed username OpenCode's local server expects in its `Basic` auth.
@@ -75,19 +75,16 @@ impl OpenCode {
     /// (`None` → the agent's own model). Binding each employee to its own agent
     /// is what gives it a role-specific system prompt; the model is what the
     /// user picked for that employee in the model selector.
+    ///
+    /// The model must be a full [`ModelRef`] (`{ id, providerID }`): OpenCode v2
+    /// rejects a bare model id with a 400 (`Expected Model.Ref | null`).
     pub async fn create_session(
         &self,
         directory: &str,
         agent: Option<&str>,
-        model: Option<&str>,
+        model: Option<&ModelRef>,
     ) -> Result<SessionInfo> {
-        let mut body = serde_json::json!({ "location": { "directory": directory } });
-        if let Some(agent) = agent {
-            body["agent"] = serde_json::Value::String(agent.to_owned());
-        }
-        if let Some(model) = model {
-            body["model"] = serde_json::Value::String(model.to_owned());
-        }
+        let body = session_body(directory, agent, model);
         let envelope: models::DataEnvelope<SessionInfo> =
             self.post_json("/api/session", &body).await?;
         Ok(envelope.data)
@@ -181,9 +178,13 @@ impl OpenCode {
             .header("authorization", &self.auth)
             .send()
             .await
-            .wrap_err_with(|| format!("GET {url}"))?
-            .error_for_status()
             .wrap_err_with(|| format!("GET {url}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(http_status_error("GET", url.as_str(), status, &body));
+        }
 
         response
             .json::<T>()
@@ -203,9 +204,13 @@ impl OpenCode {
             .json(body)
             .send()
             .await
-            .wrap_err_with(|| format!("POST {path}"))?
-            .error_for_status()
             .wrap_err_with(|| format!("POST {path}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(http_status_error("POST", path, status, &body));
+        }
 
         response
             .json::<T>()
@@ -216,6 +221,55 @@ impl OpenCode {
     fn url(&self, path: &str) -> Result<Url> {
         self.base.join(path).wrap_err("invalid request path")
     }
+}
+
+/// Build the `POST /api/session` request body. The `model` field must be a
+/// [`ModelRef`] object (`{ id, providerID }`): OpenCode v2 rejects a bare model
+/// id with a 400 (`Expected Model.Ref | null`).
+fn session_body(
+    directory: &str,
+    agent: Option<&str>,
+    model: Option<&ModelRef>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({ "location": { "directory": directory } });
+    if let Some(agent) = agent {
+        body["agent"] = serde_json::Value::String(agent.to_owned());
+    }
+    if let Some(model) = model {
+        body["model"] = serde_json::json!({
+            "id": model.id,
+            "providerID": model.provider_id,
+        });
+    }
+    body
+}
+
+/// Build a descriptive error from a non-2xx response, surfacing OpenCode's
+/// `message` field when the body is its standard `{ "_tag", "message", … }`
+/// error envelope. This turns the bare `POST /api/session` wrap context into
+/// `POST /api/session: 400 Bad Request: Expected Model.Ref | null …`.
+fn http_status_error(
+    method: &str,
+    path: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> color_eyre::eyre::Report {
+    let detail = body_detail(body).unwrap_or_else(|| body.trim().to_owned());
+    let detail = if detail.is_empty() {
+        "(empty body)".to_owned()
+    } else {
+        detail
+    };
+    color_eyre::eyre::eyre!("{method} {path}: {status}: {detail}")
+}
+
+/// Extract `message` from an OpenCode error body (`{ "message": "…" }`).
+fn body_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -230,6 +284,28 @@ mod tests {
             .decode(encoded)
             .unwrap();
         assert_eq!(String::from_utf8(decoded).unwrap(), "opencode:sekrit");
+    }
+
+    /// Regression: `create_session` must serialize `model` as OpenCode's
+    /// `Model.Ref` object (`{ id, providerID }`), not a bare string.
+    #[test]
+    fn session_body_serializes_model_as_ref() {
+        let model = ModelRef {
+            id: "deepseek-v4-pro".into(),
+            provider_id: Some("kenari".into()),
+        };
+
+        let body = session_body("/x", Some("researcher"), Some(&model));
+        assert_eq!(body["location"]["directory"], "/x");
+        assert_eq!(body["agent"], "researcher");
+        assert_eq!(body["model"]["id"], "deepseek-v4-pro");
+        assert_eq!(body["model"]["providerID"], "kenari");
+        assert!(!body["model"].is_string(), "model must be an object");
+
+        // No model → no `model` key (the agent's own default applies).
+        let minimal = session_body("/x", None, None);
+        assert!(minimal.get("model").is_none());
+        assert!(minimal.get("agent").is_none());
     }
 
     /// End-to-end check of discovery + auth + read-only endpoints. Does not

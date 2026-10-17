@@ -79,8 +79,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 💻 Status transitions fuel the avatar (reasoning→thinking, execution.started→working, succeeded→done, failed→error)
 - [x] 💻 `messages()` client + `SessionMessage`/`Part`/`MessageError` models (confirmed against a real payload)
 - [x] 🧪 unit: delta assembly in order, session scoping, status transitions, transcript mapping
-- [x] 🧪 integration: `tests/opencode_fake.rs` (axum) drives the client over a scripted SSE server + `/message`
-- [ ] ✅ full live conversation loop (type → send → watch stream → result) — **blocked**: model inference hit the weekly budget cap (reset 2026-10-19); the loop is exercised via the fake server + unit tests until then
+- [ ] ✅ full live conversation loop (type → send → watch stream → result) — budget restored; verify against the live service
 
 ## M5.5 — model selector (superseded the Kenari models router)
 
@@ -135,9 +134,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 💻 Jev as a delegated answerer: `@jev <question>` routes to Jev (`JevClient::answer_text`, a binary yes/no `choice`) and posts the verdict back to the asking employee's chat. The pipeline diagram (`src/ui/pipeline.rs`) renders a top-down tree — planner top, “jev” middle, researcher/writer/reviewer on the bottom row — with an on/off state.
 - [x] 💻 Aggregate results into a single deliverable view + review pass (`reviewer`)
   - Once every worker in a fan-out finishes (`note_fanout_result`), their stripped deliverables are collected and handed to the aggregator — the reviewer, else the planner — which synthesizes one deliverable and `@user`s it back (`aggregate_fanout`).
-- [x] 🧪 integration: fake server verifies N parallel prompts + aggregation
-  - `tests/opencode_fake.rs::fans_out_n_parallel_prompts_via_joinset` drives `N` concurrent `create_session`+`prompt` calls over a `JoinSet` against a counting fake server.
-- [ ] ✅ one goal → team works in parallel → aggregated result — **blocked**: live model inference still under the weekly budget cap (resets 2026-10-19); the end-to-end chain is exercised via unit + fake-server tests until then.
+- [ ] ✅ one goal → team works in parallel → aggregated result — budget restored; verify against the live service.
 
 ## M7.5 — Reliability & telemetry
 
@@ -181,6 +178,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 | SSE event schema is undocumented/experimental | ✅ Resolved (shape) | `data: {json}\n\n` + `: heartbeat` confirmed; generic `Event` tolerates unknown fields | M1 |
 | Message-text streaming event names | ✅ Resolved | Extracted from the installed binary: `session.text.*`, `message.part.{delta,updated,removed}`, `session.reasoning.*`, `session.execution.*`, `session.step.*`; plus canonical-poll fallback | M5 |
 | `create_session` response `{"data":{…}}` envelope | ✅ Resolved | Verified live; `DataEnvelope<T>` added | M5 |
+| `POST /api/session` rejects bare-string `model` (`Expected Model.Ref | null`) | ✅ Resolved | `create_session` now sends `model` as `{ "id", "providerID" }`; provider persisted on assignment (`model_provider`) and backfilled for legacy rosters | M5.5 |
 | `experimental/session/{id}/wait` signature drift | ⚠️ Open | Fallback to polling `GET /api/session/{id}/message` | M6 |
-| Live model inference blocked by weekly budget | ⚠️ Open | `$10.03/$10.00` used (resets 2026-10-19). M5 verified via fake-server integration + unit tests; re-run live conversation once budget resets | M5 |
+| Live model inference blocked by weekly budget | ✅ Resolved | Budget restored; live conversation loop can be verified against the service | M5 |
 | No Rust SDK (by design) | ✅ Resolved | Thin `opencode` module isolates the HTTP surface | M1 |

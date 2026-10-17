@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Model { cmd }) => return run_model(cmd).await,
         Some(Command::Projects { cmd }) => return run_projects(cmd),
-        Some(Command::Employee { cmd }) => return run_employee(cmd),
+        Some(Command::Employee { cmd }) => return run_employee(cmd).await,
         Some(Command::Skills { cmd }) => return run_skills(cmd),
         None => {}
     }
@@ -250,7 +250,7 @@ fn rm_scan_dirs(dirs: Vec<std::path::PathBuf>) -> Result<()> {
 async fn run_model(cmd: ModelCmd) -> Result<()> {
     match cmd {
         ModelCmd::List => run_model_list().await,
-        ModelCmd::Set { employee, model } => run_model_set(&employee, &model),
+        ModelCmd::Set { employee, model } => run_model_set(&employee, &model).await,
     }
 }
 
@@ -319,20 +319,41 @@ async fn run_model_list() -> Result<()> {
 
 /// `mywaker model set <employee> <model>`: assign a model (persisted to
 /// team.toml). The next session for that employee runs on it.
-fn run_model_set(employee: &str, model: &str) -> Result<()> {
+async fn run_model_set(employee: &str, model: &str) -> Result<()> {
     use mywaker::team::Team;
 
+    let provider = resolve_model_provider(model).await;
+
     let mut team = Team::load_or_starter();
-    team.employee_mut(employee)
-        .ok_or_else(|| eyre!("no employee '{employee}'"))?
-        .model = Some(model.to_string());
+    let entry = team
+        .employee_mut(employee)
+        .ok_or_else(|| eyre!("no employee '{employee}'"))?;
+    entry.model = Some(model.to_string());
+    entry.model_provider = provider;
     team.save(&team_path()?)?;
     println!("assigned model '{model}' to '{employee}'");
     Ok(())
 }
 
+/// Resolve a model id to its provider, consulting OpenCode's live model catalog
+/// and defaulting to [`mywaker::opencode::DEFAULT_PROVIDER`] (kenari) when the
+/// service is unavailable or the id isn't listed. When several entries share the
+/// id, the kenari mirror is preferred.
+async fn resolve_model_provider(model: &str) -> Option<String> {
+    use mywaker::opencode::{DEFAULT_PROVIDER, pick_provider};
+
+    if let Ok(client) = mywaker::opencode::OpenCode::connect().await
+        && let Ok(models) = client.models().await
+        && let Some(found) = pick_provider(&models, model)
+    {
+        let provider = found.provider_id.clone().unwrap_or_else(|| found.vendor());
+        return Some(provider);
+    }
+    Some(DEFAULT_PROVIDER.to_string())
+}
+
 /// Manage the employee roster: list / add / rm / set / skill / unskill.
-fn run_employee(cmd: EmployeeCmd) -> Result<()> {
+async fn run_employee(cmd: EmployeeCmd) -> Result<()> {
     use mywaker::team::{Employee, Team};
 
     match cmd {
@@ -352,7 +373,11 @@ fn run_employee(cmd: EmployeeCmd) -> Result<()> {
                 name.unwrap_or_else(|| id.clone()),
                 role.unwrap_or_else(|| "general".to_string()),
             );
-            employee.model = model;
+            if let Some(model) = model.as_deref() {
+                let provider = resolve_model_provider(model).await;
+                employee.model = Some(model.to_string());
+                employee.model_provider = provider;
+            }
             team.add_employee(employee).map_err(|e| eyre!("{e}"))?;
             team.save(&team_path()?)?;
             println!("added employee '{id}'");
@@ -382,8 +407,10 @@ fn run_employee(cmd: EmployeeCmd) -> Result<()> {
             if let Some(role) = role {
                 employee.role = role;
             }
-            if model.is_some() {
-                employee.model = model;
+            if let Some(model) = model.as_deref() {
+                let provider = resolve_model_provider(model).await;
+                employee.model = Some(model.to_string());
+                employee.model_provider = provider;
             }
             team.save(&team_path()?)?;
             println!("updated employee '{id}'");
