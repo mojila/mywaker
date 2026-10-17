@@ -66,15 +66,16 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 💻 Per-employee detail line (name · role · model · onboarded · task · status); `model`/`last_task` fields added to `Employee`
 - [x] 🧪 unit: selection clamp (`move_selection`), status text mapping (`EmployeeStatus::label`)
 - [x] ✅ dashboard shows the team and live status
-- [x] 💻 Right-side "tasks" panel (`src/ui/tasks.rs`) — every employee with its latest task + live status; `last_task` is set on prompt send/delegation (`send_prompt`/`flush_outbox`) and retained (tinted done/error) until `/new`·`/clear` or the next task. Layout is now robot (24) · pipeline (fill) · tasks (32).
-- [x] 🧪 unit: `task_summary` (first line, whitespace collapse, 48-char truncate), `Team::set_last_task`; render smoke tests assert the panel shows a task and degrades at narrow width
+- [x] 💻 Right-side "tasks" panel (`src/ui/tasks.rs`) — every employee with its latest task + live status; `last_task` is set on prompt send/delegation (`send_prompt`/`flush_outbox`) and retained (tinted done/error) until `/new`·`/clear` or the next task. Layout is now robot (24) · pipeline (fill) · tasks (32). The panel also renders the persisted scheduled-task queue above the board (`App::tasks()` ordered by `order_tasks()` — active work first, then terminal, newest-first; the heading appears only when tasks exist).
+- [x] 🧪 unit: `task_summary` (first line, whitespace collapse, 48-char truncate), `Team::set_last_task`; render smoke tests assert the panel shows a task and degrades at narrow width — plus `order_tasks` ordering, the `App::tasks()` accessor, and a queue-section render test
 
 ## M5 — Chat & streaming (`src/ui/chat.rs`)
 
 - [x] 🧩 SPIKE: streaming event names — resolved from the installed binary: `session.text.{started,delta,ended}`, `message.part.{delta,updated,removed}`, `session.reasoning.{started,delta,ended}`, `session.execution.{started,succeeded,failed}`, `session.step.*`, `session.tool.*`
 - [x] 🧩 SPIKE: `create_session` response is wrapped in `{"data":{…}}` (was a `{id}` assumption) — fixed with `DataEnvelope`
 - [x] 💻 Create OpenCode session on `Enter` (workdir from `config.workdir`, else cwd)
-- [x] 💻 Input box (single-line) → send prompt → `POST /api/session/{id}/prompt`
+- [x] 💻 Input box (single-line) → send prompt → `POST /api/session/{id}/prompt`; a prompt typed while the employee is mid-turn (or before its session is ready) is queued (`Chat::queue_running`) and sent one per completed turn by `pump_employee_queue` (hooked into `handle_transcript`/`handle_session_created`/`handle_delivery_failed`), with `/new` dropping the old queue
+- [x] 🧪 unit: a prompt to a busy employee is queued (still transcribed + recalled), `next_queued` gating (idle **and** live session), and a no-op pump without a client
 - [x] 💻 Stream SSE deltas into a live transcript (`session.text.delta` / `message.part.delta`), then replace with the canonical `GET …/message` transcript on completion (tolerant double-write)
 - [x] 💻 Status transitions fuel the avatar (reasoning→thinking, execution.started→working, succeeded→done, failed→error)
 - [x] 💻 `messages()` client + `SessionMessage`/`Part`/`MessageError` models (confirmed against a real payload)
