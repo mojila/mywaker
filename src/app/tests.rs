@@ -233,6 +233,32 @@ fn fan_out_aggregates_once_all_workers_finish() {
     assert!(outbox[0].contains("Draft copy for the launch"));
 }
 
+/// A file watch fires the same autonomous path a cron schedule does: a task is
+/// recorded for the named employee, the roster reflects it, and the log names
+/// the watch hook as the trigger.
+#[test]
+fn watched_task_records_a_task_for_the_employee() {
+    let (mut app, _rx) = make_app();
+
+    app.update(Message::WatchedTask {
+        employee: "researcher".into(),
+        goal: "Review the change to src/app.rs".into(),
+    });
+
+    let task = app.store.tasks.last().expect("a task was recorded");
+    assert_eq!(task.assigned_to.as_deref(), Some("researcher"));
+    assert_eq!(task.goal, "Review the change to src/app.rs");
+    assert_eq!(task.status, TaskStatus::Running);
+
+    let index = app.team_index_by_id("researcher").expect("known employee");
+    assert_eq!(app.team.employees()[index].status, EmployeeStatus::Thinking);
+    assert_eq!(
+        app.team.employees()[index].last_task.as_deref(),
+        Some("Review the change to src/app.rs")
+    );
+    assert!(app.log.iter().any(|line| line.contains("👁 watched task")));
+}
+
 #[test]
 fn streams_deltas_in_order_and_ignores_other_sessions() {
     let (mut app, _rx) = make_app();

@@ -38,6 +38,7 @@ mywaker/
     ├── task.rs               Task model + state machine + retry (cap 3)
     ├── persistence.rs        JSON store (tasks + per-employee memory), atomic write
     ├── scheduler.rs          tokio-cron-scheduler — `[[schedules]]` → dispatch
+    ├── watcher.rs            notify file watchers — `[[watches]]` → dispatch (debounced)
     ├── opencode/
     │   ├── mod.rs            client + request helpers (server_info/agents/create_session/prompt/wait/interrupt/reply_form/events)
     │   ├── service.rs        discover `opencode service status`, read password
@@ -235,6 +236,12 @@ model = "anthropic/claude-sonnet-4-5"
 cron = "0 9 * * 1-5"
 employee = "planner"
 goal = "Summarize yesterday's commits into a morning briefing"
+
+[[watches]]                    # file-change triggers for autonomous start
+path = "~/Projects/mywaker/src"
+employee = "reviewer"
+goal = "Review the change to {path}"   # `{path}` = the changed path
+recursive = true
 ```
 
 Employees without a `schedule` are manual/chat-only. Configuration is validated at

@@ -37,6 +37,7 @@ Turn OpenCode from a developer tool into a *team of on-screen employees*:
 | Errors | `color-eyre` (app), `thiserror` (lib-ish) | Idiomatic + terminal-safe |
 | Logging | `tracing` + `tracing-subscriber` | Structured, quiet in TUI |
 | Scheduling | `tokio-cron-scheduler` | cron triggers |
+| Watch hooks | `notify` | file-change triggers (debounced) |
 | Animation | Braille spinner + state-driven ASCII (self-contained) | `tui-shimmer` deferred; swap in if we want richer shimmer |
 
 ## 3. Architecture (overview)
@@ -44,7 +45,8 @@ Turn OpenCode from a developer tool into a *team of on-screen employees*:
 ```
 crossterm event stream ──┐
 OpenCode SSE stream ─────┤──► tokio::select! ──► Message ──► App::update ──► View
-cron scheduler ──────────┘
+cron scheduler ──────────┤
+file watchers ───────────┘
 ```
 
 TEA (The Elm Architecture): `Model → Message → Update → View`, the standard
@@ -77,7 +79,8 @@ TEA (The Elm Architecture): `Model → Message → Update → View`, the standar
 - **M3 — Robot avatar**: animated, state-driven ASCII robot.
 - **M4 — Team dashboard**: roster + status.
 - **M5 — Chat & streaming**: talk to an employee, stream response.
-- **M6 — Harness**: task queue, retry, persistence, scheduler (autonomous).
+- **M6 — Harness**: task queue, retry, persistence, autonomous triggers
+  (cron scheduler + file-change watch hooks).
 - **M7 — Orchestration**: fan-out to multiple employees + aggregate.
 - **M8 — Polish & ship**: help, theming, release build, lint/fmt.
 

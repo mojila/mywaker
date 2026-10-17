@@ -29,6 +29,7 @@ reqwest = { version = "0.13.5", features = ["json", "stream", "rustls"], default
 sysinfo = "0.38.4"
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 tokio-cron-scheduler = "0.15.1"
+notify = "8.2.0"
 
 [profile.release]
 opt-level = 3

@@ -48,6 +48,8 @@ pub enum Message {
     JevAnswer { employee: usize, answer: String },
     /// A cron schedule fired, handing `goal` to `employee` (autonomous dispatch).
     ScheduledTask { employee: String, goal: String },
+    /// A watched path changed, handing `goal` to `employee` (autonomous dispatch).
+    WatchedTask { employee: String, goal: String },
     /// One delivery attempt for a scheduled task finished (success or failure).
     TaskAttemptFinished {
         task_id: crate::task::TaskId,

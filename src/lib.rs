@@ -25,4 +25,5 @@ pub mod team;
 pub mod tui;
 pub mod ui;
 pub mod usage;
+pub mod watcher;
 pub mod workflow;

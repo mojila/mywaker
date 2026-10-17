@@ -39,9 +39,9 @@ green done) while the robot avatar mirrors the aggregate state.
   (`mywaker model list`) and assign one per employee (`mywaker model set` or the
   TUI picker via `m`). The chosen model is persisted to `team.toml` and applied
   to that employee's sessions.
-- **Autonomous scheduling** — cron schedules (`[[schedules]]`) fire tasks at
-  employees with no chat required. Each task persists across restarts and retries
-  up to three times on failure.
+- **Autonomous triggers** — cron schedules (`[[schedules]]`) and file-change
+  watch hooks (`[[watches]]`) fire tasks at employees with no chat required. Each
+  task persists across restarts and retries up to three times on failure.
 
 ## Requirements
 
@@ -179,10 +179,13 @@ api_key = "kn-…"                               # or leave unset to use KENARI_
 endpoint; they can also be set via `MYWAKER_JEV_ENDPOINT`, `MYWAKER_JEV_MODEL`, and
 `MYWAKER_JEV_API_KEY`. With no API key available, Jev is simply disabled.
 
-## Autonomous scheduling
+## Autonomous triggers
 
-Employees can start on their own — no chat required. Add cron schedules to
-`~/.config/mywaker/config.toml`:
+Employees can start on their own — no chat required. There are two triggers:
+**cron schedules** and **file-change watch hooks**. Add either to
+`~/.config/mywaker/config.toml`.
+
+### Cron schedules
 
 ```toml
 [[schedules]]
@@ -196,7 +199,27 @@ employee = "researcher"
 goal = "Watch the build for regressions and report any failures"
 ```
 
-When a schedule fires, mywaker creates a task, starts a session for that employee,
+### File-change watch hooks
+
+A watch fires when a file or directory changes — e.g. have the reviewer look at
+every save. `path` may start with `~`; `recursive` defaults to `true`. The `goal`
+is a template: `{path}` is replaced with the path that changed. Editor saves emit
+a burst of events, so changes are debounced (coalesced into a single dispatch).
+
+```toml
+[[watches]]
+path = "~/Projects/mywaker/src"
+employee = "reviewer"
+goal = "Review the change to {path} for regressions and style issues"
+recursive = true
+
+[[watches]]
+path = "~/.config/mywaker/config.toml"
+employee = "planner"
+goal = "Validate the config change in {path}"
+```
+
+When a trigger fires, mywaker creates a task, starts a session for that employee,
 streams the goal, and reports the deliverable in the log. A task that fails is
 retried up to three times; the retry preamble tells the employee what broke. Task
 history (and per-employee memory) persists to `store.json` under your config dir,

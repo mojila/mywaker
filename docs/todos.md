@@ -116,7 +116,8 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 💻 `persistence.rs` — JSON store (tasks + memory) via `dirs`, atomic single-write
 - [x] 💻 Wire `wait` endpoint as completion signal; detect failure → retry preamble
 - [x] 💻 `scheduler.rs` — `tokio-cron-scheduler` from `[[schedules]]` → dispatch
-- [ ] 💻 Watch-hook (optional): file-change trigger → dispatch (`notify` crate)
+- [x] 💻 Watch-hook: file-change trigger → dispatch (`notify` crate) — `[[watches]]` config (`path`/`employee`/`goal`/`recursive`); `src/watcher.rs` arms a `notify` watcher per entry, ignores pure reads, debounces a save burst (`Coalescer`, 500 ms), and emits `Message::WatchedTask` (goal templated with `{path}`, `~` expanded) into the same autonomous dispatch path as cron (`App::handle_autonomous_task`). Wired in `main.rs` alongside the scheduler.
+- [x] 🧪 unit: watch debounce coalescing, `{path}` templating, `~` expansion, access-event filtering, and a synthetic burst → `Message::WatchedTask` (`watch_one`) — plus `tests/watch_hook.rs`: a real filesystem change reaches `watcher::run` as a `Message::WatchedTask` (no service/budget needed)
 - [x] 🧪 unit: task state transitions (Pending→Running→Succeeded/Failed/Retrying)
 - [x] 🧪 unit: retry cap; persistence round-trip
 - [ ] ✅ scheduled task fires autonomously, survives restart via persistence — history round-trips; live fire needs a running service
@@ -164,11 +165,11 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 
 ## Definition of done (each milestone)
 
-- [ ] Compiles with `cargo build`
-- [ ] `cargo clippy` clean, `cargo fmt` applied
-- [ ] Focused unit/integration tests pass
-- [ ] Behavior verified manually in the TUI
-- [ ] Checklist row(s) flipped to `[x]`
+- [x] Compiles with `cargo build`
+- [x] `cargo clippy` clean, `cargo fmt` applied
+- [x] Focused unit/integration tests pass
+- [ ] Behavior verified manually in the TUI — pending a live run (deferred by choice, not covered here)
+- [x] Checklist row(s) flipped to `[x]`
 
 ## Open risk register
 

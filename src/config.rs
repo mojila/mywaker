@@ -16,6 +16,8 @@ pub struct Config {
     pub jev: JevConfig,
     /// Cron schedules for autonomous dispatch.
     pub schedules: Vec<Schedule>,
+    /// File-change watch hooks for autonomous dispatch.
+    pub watches: Vec<Watch>,
 }
 
 /// A cron schedule: fire `goal` at `employee` on a cron cadence.
@@ -28,6 +30,33 @@ pub struct Schedule {
     pub employee: String,
     /// The natural-language goal to hand that employee.
     pub goal: String,
+}
+
+/// A watch hook: fire `goal` at `employee` when `path` changes. The `goal` may
+/// contain `{path}`, which is replaced with the path that changed. Changes are
+/// debounced (a burst of editor events collapses into one dispatch).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Watch {
+    /// The file or directory to watch. `~` is expanded to the home directory.
+    pub path: PathBuf,
+    /// The employee id to dispatch to.
+    pub employee: String,
+    /// The natural-language goal to hand that employee (`{path}` is templated).
+    pub goal: String,
+    /// Whether to recurse into subdirectories when `path` is a directory.
+    pub recursive: bool,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            employee: String::new(),
+            goal: String::new(),
+            recursive: true,
+        }
+    }
 }
 
 /// Jev (System One) classifier settings. Jev is an *optional* classifier — it is
@@ -50,6 +79,7 @@ impl Default for Config {
             workdir: None,
             jev: JevConfig::default(),
             schedules: Vec::new(),
+            watches: Vec::new(),
         }
     }
 }
@@ -145,6 +175,48 @@ mod tests {
         assert_eq!(cfg.schedules[0].cron, "0 9 * * 1-5");
         assert_eq!(cfg.schedules[0].employee, "planner");
         assert_eq!(cfg.schedules[0].goal, "Summarize yesterday's commits");
+    }
+
+    #[test]
+    fn deserializes_watches() {
+        let text = r#"
+            tick_rate = "100ms"
+            [[watches]]
+            path = "~/Projects/mywaker/src"
+            employee = "reviewer"
+            goal = "Review the latest change to {path}"
+            recursive = false
+        "#;
+        let cfg: Config = toml::from_str(text).expect("parse config");
+        assert_eq!(cfg.watches.len(), 1);
+        assert_eq!(cfg.watches[0].path, PathBuf::from("~/Projects/mywaker/src"));
+        assert_eq!(cfg.watches[0].employee, "reviewer");
+        assert_eq!(cfg.watches[0].goal, "Review the latest change to {path}");
+        assert!(!cfg.watches[0].recursive);
+    }
+
+    #[test]
+    fn watch_recurses_by_default() {
+        let text = r#"
+            [[watches]]
+            path = "src"
+            employee = "reviewer"
+            goal = "review {path}"
+        "#;
+        let cfg: Config = toml::from_str(text).expect("parse config");
+        assert!(cfg.watches[0].recursive);
+    }
+
+    #[test]
+    fn rejects_unknown_watch_field() {
+        let text = r#"
+            [[watches]]
+            path = "src"
+            employee = "reviewer"
+            goal = "x"
+            recurse = true
+        "#;
+        assert!(toml::from_str::<Config>(text).is_err());
     }
 
     #[test]

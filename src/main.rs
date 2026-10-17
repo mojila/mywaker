@@ -154,6 +154,7 @@ async fn main() -> Result<()> {
     let mut tui = Tui::new()?;
     let events = EventHandler::new(config.tick_rate, rx);
     let schedules = config.schedules.clone();
+    let watches = config.watches.clone();
 
     // Arm cron schedules so employees can start autonomously. The scheduler
     // sends into its own clone of the channel, which stays alive for the app's
@@ -162,6 +163,15 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(err) = mywaker::scheduler::run(scheduler_tx, schedules).await {
             tracing::error!("scheduler failed: {err}");
+        }
+    });
+
+    // Arm file-change watch hooks so a save can start an employee autonomously
+    // (the same dispatch path the scheduler uses).
+    let watcher_tx = tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = mywaker::watcher::run(watcher_tx, watches).await {
+            tracing::error!("watcher failed: {err}");
         }
     });
 

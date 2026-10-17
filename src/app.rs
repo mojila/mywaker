@@ -407,7 +407,10 @@ impl App {
                 self.push_to_chat(employee, TranscriptRole::Assistant, answer);
             }
             Message::ScheduledTask { employee, goal } => {
-                self.handle_scheduled_task(employee, goal);
+                self.handle_autonomous_task("⌛ scheduled task", employee, goal);
+            }
+            Message::WatchedTask { employee, goal } => {
+                self.handle_autonomous_task("👁 watched task", employee, goal);
             }
             Message::TaskAttemptFinished {
                 task_id,
@@ -2051,13 +2054,15 @@ impl App {
         }
     }
 
-    // --- scheduled tasks (autonomous dispatch) ---
+    // --- autonomous tasks (cron schedules + file watches) ---
 
-    /// A cron schedule fired: record a task and dispatch its first attempt.
-    fn handle_scheduled_task(&mut self, employee_id: String, goal: String) {
+    /// An autonomous trigger (a cron schedule or a file watch) fired: record a
+    /// task and dispatch its first attempt. `label` prefixes the log line so the
+    /// trigger source stays visible.
+    fn handle_autonomous_task(&mut self, label: &str, employee_id: String, goal: String) {
         let Some(index) = self.team_index_by_id(&employee_id) else {
             self.push_log(format!(
-                "scheduled task for unknown employee '{employee_id}' — skipped"
+                "{label} for unknown employee '{employee_id}' — skipped"
             ));
             return;
         };
@@ -2070,7 +2075,7 @@ impl App {
         self.team.set_status(index, EmployeeStatus::Thinking);
         self.team.set_last_task(index, Some(task_summary(&goal)));
         self.push_log(format!(
-            "⌛ scheduled task for {employee_id}: {}",
+            "{label} for {employee_id}: {}",
             task_summary(&goal)
         ));
 
