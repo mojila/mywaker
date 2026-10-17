@@ -6,6 +6,7 @@ use color_eyre::eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
 use crate::opencode::{AgentInfo, DEFAULT_PROVIDER, ModelRef};
+use crate::role::Role;
 
 /// Lifecycle status of an employee; drives the robot avatar and roster UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -28,6 +29,14 @@ impl EmployeeStatus {
             EmployeeStatus::Done => "done",
             EmployeeStatus::Error => "error",
         }
+    }
+
+    /// True while the employee is mid-turn — the predicate behind
+    /// [`Team::is_busy`] and [`Employee::is_busy`]. The terminal states (`Done`,
+    /// `Error`) are deliberately *not* active: the turn is over and the employee
+    /// can take more work.
+    pub fn is_active(self) -> bool {
+        matches!(self, EmployeeStatus::Thinking | EmployeeStatus::Working)
     }
 }
 
@@ -88,9 +97,22 @@ impl Employee {
         }
     }
 
-    /// A short human-readable status label.
-    pub fn status_label(&self) -> &'static str {
-        self.status.label()
+    /// True while this employee is mid-turn (`Thinking` / `Working`).
+    pub fn is_busy(&self) -> bool {
+        self.status.is_active()
+    }
+
+    /// The employee's workflow role, resolved from the stable id (which doubles
+    /// as the OpenCode agent id). This is the one place the id → [`Role`] mapping
+    /// happens: the pipeline's stage order and stage labels both read it, so the
+    /// id-as-role convention lives with the data rather than at the call sites.
+    pub fn workflow_role(&self) -> Role {
+        Role::from_label(&self.id)
+    }
+
+    /// The pipeline stage label for this employee (`"ENGINEER"`, …).
+    pub fn stage_label(&self) -> String {
+        self.workflow_role().label().to_ascii_uppercase()
     }
 
     /// The OpenCode agent backing this employee: the explicit `agent` override,
@@ -162,19 +184,28 @@ impl Team {
         self.employees.is_empty()
     }
 
-    /// True if any employee is actively working (drives the avatar).
+    /// True if any employee is actively working (drives the avatar). Active work
+    /// is the single predicate [`EmployeeStatus::is_active`], so the roster, the
+    /// avatar and the prompt queue never disagree about "busy".
     pub fn is_busy(&self) -> bool {
-        self.employees.iter().any(|employee| {
-            matches!(
-                employee.status,
-                EmployeeStatus::Thinking | EmployeeStatus::Working
-            )
-        })
+        self.employees.iter().any(Employee::is_busy)
+    }
+
+    /// True when the employee at `index` is mid-turn (`false` if out of range).
+    pub fn is_busy_at(&self, index: usize) -> bool {
+        self.employees.get(index).is_some_and(Employee::is_busy)
     }
 
     /// Set one employee's status by index (no-op if out of range).
     pub fn set_status(&mut self, index: usize, status: EmployeeStatus) {
         if let Some(employee) = self.employees.get_mut(index) {
+            employee.status = status;
+        }
+    }
+
+    /// Set one employee's status by id (no-op if the id is unknown).
+    pub fn set_status_by_id(&mut self, id: &str, status: EmployeeStatus) {
+        if let Some(employee) = self.employee_mut(id) {
             employee.status = status;
         }
     }
@@ -322,6 +353,68 @@ mod tests {
         assert_eq!(EmployeeStatus::Working.label(), "working");
         assert_eq!(EmployeeStatus::Done.label(), "done");
         assert_eq!(EmployeeStatus::Error.label(), "error");
+    }
+
+    #[test]
+    fn only_thinking_and_working_are_active() {
+        assert!(EmployeeStatus::Thinking.is_active());
+        assert!(EmployeeStatus::Working.is_active());
+        // Terminal states end the turn — they are not "busy".
+        assert!(!EmployeeStatus::Idle.is_active());
+        assert!(!EmployeeStatus::Done.is_active());
+        assert!(!EmployeeStatus::Error.is_active());
+    }
+
+    #[test]
+    fn busy_follows_active_statuses() {
+        let mut team = Team::starter();
+        assert!(!team.is_busy());
+
+        team.set_status(0, EmployeeStatus::Thinking);
+        assert!(team.is_busy());
+        assert!(team.is_busy_at(0));
+        assert!(!team.is_busy_at(1));
+        assert!(!team.is_busy_at(99)); // out of range, not a panic
+
+        team.set_status(0, EmployeeStatus::Done); // terminal → idle again
+        assert!(!team.is_busy());
+    }
+
+    #[test]
+    fn set_status_by_id_targets_the_named_employee() {
+        let mut team = Team::starter();
+        team.set_status_by_id("writer", EmployeeStatus::Working);
+        assert_eq!(
+            team.employee("writer").unwrap().status,
+            EmployeeStatus::Working
+        );
+        assert_eq!(
+            team.employee("planner").unwrap().status,
+            EmployeeStatus::Idle
+        );
+
+        team.set_status_by_id("nobody", EmployeeStatus::Error); // no-op
+        assert_eq!(
+            team.employee("planner").unwrap().status,
+            EmployeeStatus::Idle
+        );
+    }
+
+    #[test]
+    fn workflow_role_and_stage_label_derive_from_the_id() {
+        let team = Team::starter();
+        let planner = team.employee("planner").unwrap();
+        assert_eq!(planner.workflow_role(), crate::role::Role::Planner);
+        assert_eq!(planner.stage_label(), "PLANNER");
+        assert_eq!(
+            team.employee("researcher").unwrap().workflow_role(),
+            crate::role::Role::Researcher
+        );
+
+        // An id with no known role is `General`, not an error.
+        let stranger = Employee::new("qa", "Quinn", "Tester");
+        assert_eq!(stranger.workflow_role(), crate::role::Role::General);
+        assert_eq!(stranger.stage_label(), "GENERAL");
     }
 
     #[test]

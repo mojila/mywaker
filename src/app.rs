@@ -19,7 +19,6 @@ use crate::opencode::{
 };
 use crate::persistence::Store;
 use crate::projects::{self, Project};
-use crate::role::Role;
 use crate::task::{Task, TaskId, TaskStatus};
 use crate::team::{EmployeeStatus, Team, move_selection};
 use crate::tui::Tui;
@@ -1140,13 +1139,10 @@ impl App {
             .is_some_and(|chat| chat.session_id.is_some())
     }
 
-    /// True when `employee` is mid-turn (thinking or working) and so cannot take
-    /// a new prompt right now.
+    /// True when `employee` is mid-turn and so cannot take a new prompt right
+    /// now. Delegates to [`Team::is_busy_at`] so "busy" has one definition.
     fn employee_is_busy(&self, employee: usize) -> bool {
-        self.team
-            .employees()
-            .get(employee)
-            .is_some_and(|e| matches!(e.status, EmployeeStatus::Thinking | EmployeeStatus::Working))
+        self.team.is_busy_at(employee)
     }
 
     /// Queue `text` for `employee`, starting their session if none is already
@@ -1505,19 +1501,7 @@ impl App {
         // The hand-off "returned" (in some form), so stop tracking its deadline.
         chat.pending = None;
 
-        let final_status = messages
-            .iter()
-            .rev()
-            .find(|m| m.role() == "assistant" || m.role() == "idle")
-            .map(|m| {
-                if m.error.is_some() || m.finish.as_deref() == Some("error") {
-                    EmployeeStatus::Error
-                } else {
-                    EmployeeStatus::Done
-                }
-            })
-            .unwrap_or(EmployeeStatus::Idle);
-
+        let final_status = completion_status(&messages);
         self.team.set_status(employee, final_status);
 
         // Hand off any directives in the freshly completed assistant reply.
@@ -2251,10 +2235,8 @@ impl App {
             self.push_log(format!("✕ scheduled task failed: {summary}"));
         }
 
-        if let Some(employee_id) = &assigned
-            && let Some(employee) = self.team.employee_mut(employee_id)
-        {
-            employee.status = status;
+        if let Some(employee_id) = &assigned {
+            self.team.set_status_by_id(employee_id, status);
         }
         self.persist_store();
 
@@ -2432,10 +2414,7 @@ impl App {
         let mut indices: Vec<usize> = (0..self.team.len()).collect();
         indices.sort_by_key(|&i| {
             let employee = &self.team.employees()[i];
-            (
-                Role::from_label(&employee.id).order(),
-                employee.name.clone(),
-            )
+            (employee.workflow_role().order(), employee.name.clone())
         });
         indices
     }
@@ -2651,7 +2630,7 @@ impl App {
     }
 
     /// The persisted scheduled tasks, in insertion order (newest last). The
-    /// tasks panel re-sorts them for display via [`order_tasks`].
+    /// tasks panel re-sorts them for display via `order_tasks`.
     pub fn tasks(&self) -> &[Task] {
         &self.store.tasks
     }
@@ -2686,6 +2665,24 @@ pub(crate) fn order_tasks(tasks: &[Task]) -> Vec<usize> {
         (terminal, Reverse(task.created_at))
     });
     indices
+}
+
+/// The roster status implied by a completed turn's message list: the last
+/// assistant (or idle) message decides `Done` vs `Error`, and a transcript with
+/// no such message leaves the employee `Idle`.
+fn completion_status(messages: &[SessionMessage]) -> EmployeeStatus {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role() == "assistant" || m.role() == "idle")
+        .map(|m| {
+            if m.error.is_some() || m.finish.as_deref() == Some("error") {
+                EmployeeStatus::Error
+            } else {
+                EmployeeStatus::Done
+            }
+        })
+        .unwrap_or(EmployeeStatus::Idle)
 }
 
 /// The deliverable text of the last completed assistant reply — delegation

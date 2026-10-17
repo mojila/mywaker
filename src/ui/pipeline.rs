@@ -4,8 +4,9 @@
 //! employee with a live status and spinner. Jev is a shared, non-employee node
 //! every employee delegates questions to via `@jev`.
 //!
-//! Stages are ordered by routing role ([`Role::order`]): the first stage (the
-//! planner) is the tree's root and the rest form the leaf row.
+//! Stages are ordered by routing role (see [`Employee::workflow_role`] →
+//! [`Role::order`](crate::role::Role::order)): the first stage (the planner) is
+//! the tree's root and the rest form the leaf row.
 
 use ratatui::{
     Frame,
@@ -16,7 +17,6 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::role::Role;
 use crate::team::{Employee, EmployeeStatus};
 
 /// Braille spinner frames, indexed by the app tick (in sync with the avatar).
@@ -118,17 +118,12 @@ fn centered(area: Rect, width: u16) -> Rect {
     center
 }
 
-/// The workflow stage label for an employee, from their routing role.
-fn stage_label(employee: &Employee) -> String {
-    Role::from_label(&employee.id).label().to_ascii_uppercase()
-}
-
 fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, selected: bool) {
     let tick = app.frame();
     let color = status_color(employee.status);
 
     let title = Span::styled(
-        format!(" {} ", stage_label(employee)),
+        format!(" {} ", employee.stage_label()),
         Style::default().fg(color).add_modifier(if selected {
             Modifier::BOLD
         } else {

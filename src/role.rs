@@ -3,6 +3,10 @@
 //! This is a *display/ordering* concern, not model routing: each employee's
 //! role is derived from their (stable) id and only drives the pipeline
 //! diagram's stage order and labels.
+//!
+//! Resolution lives with the data owner — [`crate::team::Employee::workflow_role`]
+//! wraps [`Role::from_label`] — so the rest of the app asks an employee for its
+//! role instead of re-deriving it from the id at each call site.
 
 /// A team workflow role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1167,3 +1167,81 @@ fn pump_is_a_noop_without_a_client() {
 
     assert_eq!(app.chats[&0].queue_running, vec!["held"]);
 }
+
+/// The roster status after a turn comes from the last assistant (or idle)
+/// message: a clean finish is `Done`, an errored one is `Error`, and a
+/// transcript with no such message leaves the employee `Idle`.
+#[test]
+fn completion_status_reads_the_last_assistant_message() {
+    let messages = |assistant: serde_json::Value| -> Vec<SessionMessage> {
+        serde_json::from_value(serde_json::json!([
+            {"id": "u", "time": {"created": 1}, "text": "go", "type": "user"},
+            assistant,
+        ]))
+        .unwrap()
+    };
+
+    assert_eq!(
+        completion_status(&messages(serde_json::json!({
+            "id": "m", "time": {"created": 2, "completed": 3}, "type": "assistant",
+            "content": [{"type": "text", "text": "done"}], "finish": "done",
+        }))),
+        EmployeeStatus::Done
+    );
+
+    // `finish: "error"` and an explicit error body both grade as `Error`.
+    assert_eq!(
+        completion_status(&messages(serde_json::json!({
+            "id": "m", "time": {"created": 2, "completed": 3}, "type": "assistant",
+            "content": [{"type": "text", "text": "half"}], "finish": "error",
+        }))),
+        EmployeeStatus::Error
+    );
+    assert_eq!(
+        completion_status(&messages(serde_json::json!({
+            "id": "m", "time": {"created": 2, "completed": 3}, "type": "assistant",
+            "content": [{"type": "text", "text": "half"}],
+            "error": {"message": "budget exceeded"},
+        }))),
+        EmployeeStatus::Error
+    );
+
+    // The last turn wins over an earlier one.
+    let two_turns: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id": "u1", "time": {"created": 1}, "text": "go", "type": "user"},
+        {"id": "m1", "time": {"created": 2, "completed": 3}, "type": "assistant",
+         "content": [{"type": "text", "text": "half"}], "finish": "error"},
+        {"id": "u2", "time": {"created": 4}, "text": "retry", "type": "user"},
+        {"id": "m2", "time": {"created": 5, "completed": 6}, "type": "assistant",
+         "content": [{"type": "text", "text": "done"}], "finish": "done"},
+    ]))
+    .unwrap();
+    assert_eq!(completion_status(&two_turns), EmployeeStatus::Done);
+
+    // A user-only transcript has no completed turn to grade.
+    let user_only: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id": "u", "time": {"created": 1}, "text": "go", "type": "user"},
+    ]))
+    .unwrap();
+    assert_eq!(completion_status(&user_only), EmployeeStatus::Idle);
+}
+
+/// "Busy" has one definition: the app's per-employee check and the roster's
+/// aggregate predicate agree, and a terminal status frees the employee again.
+#[test]
+fn busy_predicate_is_shared_between_app_and_team() {
+    let (mut app, _rx) = make_app();
+    assert!(!app.employee_is_busy(0));
+    assert!(!app.team.is_busy());
+
+    app.team.set_status(0, EmployeeStatus::Working);
+    assert!(app.employee_is_busy(0));
+    assert!(app.team.is_busy());
+
+    app.team.set_status(0, EmployeeStatus::Done); // terminal → free again
+    assert!(!app.employee_is_busy(0));
+    assert!(!app.team.is_busy());
+
+    // An out-of-range index is simply "not busy".
+    assert!(!app.employee_is_busy(99));
+}
