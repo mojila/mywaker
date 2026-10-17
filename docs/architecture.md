@@ -395,17 +395,23 @@ those gaps, driven from the tick loop so the app stays in its TEA shape.
 - **Deadline + retry + abandon** — each tick, `tick_reliability` finds pending
   deliveries that have been silent past `HANDOFF_TIMEOUT`. `retry_or_abandon` re-sends
   the original instruction with a `retry_preamble` up to `MAX_ATTEMPTS`, then
-  `abandon` posts a deterministic `⚠ no deliverable from <name> (<reason>)` note.
+  `abandon` posts a deterministic `harness::abandon_note` — `⚠ no deliverable from
+  <name> (<reason>)`, or the same note without a reason when the worker finished
+  with an empty reply.
 - **Delivery failure surfacing** — `prompt` errors now emit `Message::DeliveryFailed`
   (instead of a silent log line). Delegated hand-offs retry; a direct user prompt just
   surfaces the error in the chat for a manual retry.
 - **Per-chain isolation** — the single `delegation_origin` global is replaced by
   `origin_of`/`depth_of` maps so concurrent chains don't clobber one another; a
-  `@user` deliverable routes to its own chain's origin.
-- **Fan-out guarantee** — `force_worker_contribution` injects the `⚠` note into any
-  fan-out still waiting on an abandoned/failed worker, and `aggregate_ready_fanouts`
-  (shared by `note_fanout_result`) aggregates every fan-out the moment all workers
-  have reported, real or synthetic — so a fan-out can no longer deadlock.
+  `@user` deliverable routes to its own chain's origin. `chain_origin`/`chain_depth`
+  are the only readers of those maps, so "which chat does this return to" and "how
+  deep is this chain" are answered in one place.
+- **Fan-out guarantee** — `fanouts_awaiting` is the one guard for "this worker is
+  still owed a contribution" (in the group, no output recorded, not yet aggregated);
+  the real path (`note_fanout_result`) and the synthetic one
+  (`force_worker_contribution`) both go through it, and `aggregate_ready_fanouts`
+  aggregates every fan-out the moment all workers have reported, real or synthetic —
+  so a fan-out can no longer deadlock or double-count a worker.
 
 ## 12. Telemetry (token usage, cache hit, RAM, CPU)
 

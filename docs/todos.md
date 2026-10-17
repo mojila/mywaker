@@ -75,7 +75,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 🧩 SPIKE: `create_session` response is wrapped in `{"data":{…}}` (was a `{id}` assumption) — fixed with `DataEnvelope`
 - [x] 💻 Create OpenCode session on `Enter` (workdir from `config.workdir`, else cwd)
 - [x] 💻 Input box (single-line) → send prompt → `POST /api/session/{id}/prompt`; a prompt typed while the employee is mid-turn (or before its session is ready) is queued (`Chat::queue_running`) and sent one per completed turn by `pump_employee_queue` (hooked into `handle_transcript`/`handle_session_created`/`handle_delivery_failed`), with `/new` dropping the old queue
-- [x] 🧪 unit: a prompt to a busy employee is queued (still transcribed + recalled), `next_queued` gating (idle **and** live session), and a no-op pump without a client
+- [x] 🧪 unit: a prompt to a busy employee is queued (still transcribed + recalled), `next_queued` gating (idle **and** live session), and a no-op pump without a client — the gate itself is one predicate, `App::can_prompt` (ready session + idle), shared by `send_prompt` and `next_queued`
 - [x] 💻 Stream SSE deltas into a live transcript (`session.text.delta` / `message.part.delta`), then replace with the canonical `GET …/message` transcript on completion (tolerant double-write)
 - [x] 💻 Status transitions fuel the avatar (reasoning→thinking, execution.started→working, succeeded→done, failed→error)
 - [x] 💻 `messages()` client + `SessionMessage`/`Part`/`MessageError` models (confirmed against a real payload)

@@ -74,10 +74,15 @@ pub fn retry_preamble(attempt: u8) -> String {
     )
 }
 
-/// Deterministic note injected when a hand-off is abandoned, so a fan-out still
-/// aggregates instead of waiting forever for a worker that will never respond.
-pub fn abandon_note(name: &str, reason: &str) -> String {
-    format!("⚠ no deliverable from {name} ({reason})")
+/// Deterministic note standing in for a deliverable that never arrived, so a
+/// fan-out still aggregates instead of waiting forever for a worker that will
+/// never respond. `reason` is omitted when the hand-off produced nothing at all
+/// (an empty reply), so the note reads as a statement rather than a diagnosis.
+pub fn abandon_note(name: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("⚠ no deliverable from {name} ({reason})"),
+        None => format!("⚠ no deliverable from {name}"),
+    }
 }
 
 #[cfg(test)]
@@ -123,8 +128,13 @@ mod tests {
         assert!(preamble.contains("attempt 2"));
         assert!(preamble.contains(&MAX_ATTEMPTS.to_string()));
 
-        let note = abandon_note("Bruno", "timed out");
-        assert!(note.contains("Bruno"));
-        assert!(note.contains("timed out"));
+        // A reason is spelled out in parentheses; no reason leaves the note as a
+        // bare statement — both name the worker whose deliverable is missing.
+        let with_reason = abandon_note("Bruno", Some("timed out"));
+        assert!(with_reason.contains("Bruno"));
+        assert!(with_reason.contains("timed out"));
+
+        let bare = abandon_note("Bruno", None);
+        assert_eq!(bare, "⚠ no deliverable from Bruno");
     }
 }

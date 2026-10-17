@@ -196,6 +196,12 @@ impl Team {
         self.employees.get(index).is_some_and(Employee::is_busy)
     }
 
+    /// The display name of the employee at `index`, or `None` when the roster has
+    /// no such entry (a stale id from persisted state, say).
+    pub fn name_at(&self, index: usize) -> Option<String> {
+        self.employees.get(index).map(|e| e.name.clone())
+    }
+
     /// Set one employee's status by index (no-op if out of range).
     pub fn set_status(&mut self, index: usize, status: EmployeeStatus) {
         if let Some(employee) = self.employees.get_mut(index) {
@@ -546,5 +552,13 @@ mod tests {
 
         writer.model = None;
         assert_eq!(writer.model_ref(), None);
+    }
+
+    #[test]
+    fn name_at_indexes_the_roster() {
+        let team = Team::starter();
+        assert_eq!(team.name_at(0).as_deref(), Some("Aria"));
+        assert_eq!(team.name_at(1).as_deref(), Some("Bruno"));
+        assert_eq!(team.name_at(99), None); // out of range, not a panic
     }
 }

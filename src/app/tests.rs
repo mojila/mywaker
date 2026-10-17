@@ -1245,3 +1245,123 @@ fn busy_predicate_is_shared_between_app_and_team() {
     // An out-of-range index is simply "not busy".
     assert!(!app.employee_is_busy(99));
 }
+
+// --- chat guards (one definition of "ready", one of "queue it") ---
+
+/// `Chat`'s own readiness predicates: a session id without a creation in flight
+/// is ready, and either one alone means "a session exists or is on its way".
+#[test]
+fn chat_readiness_predicates() {
+    let mut chat = Chat::default();
+    assert!(!chat.ready());
+    assert!(!chat.started_or_starting());
+
+    chat.creating = true;
+    assert!(!chat.ready());
+    assert!(chat.started_or_starting());
+
+    chat.session_id = Some("ses_1".into());
+    chat.creating = false;
+    assert!(chat.ready());
+    assert!(chat.started_or_starting());
+}
+
+/// `can_prompt` is the single gate both queue points use: it needs a ready
+/// session *and* an idle employee, so a session-less or mid-turn employee is
+/// queued instead of sent to.
+#[test]
+fn can_prompt_needs_a_ready_session_and_an_idle_employee() {
+    let (mut app, _rx) = make_app();
+    assert!(!app.can_prompt(0), "no chat at all");
+
+    // A session still being created is not ready to take a prompt.
+    app.chats.entry(0).or_default().creating = true;
+    assert!(!app.session_ready(0));
+    assert!(!app.can_prompt(0));
+
+    // Live session and idle: the one state that sends immediately.
+    let chat = app.chats.get_mut(&0).unwrap();
+    chat.creating = false;
+    chat.session_id = Some("ses_1".into());
+    app.team.set_status(0, EmployeeStatus::Idle);
+    assert!(app.can_prompt(0));
+
+    // Mid-turn: queued again, however ready the session is.
+    app.team.set_status(0, EmployeeStatus::Working);
+    assert!(app.session_ready(0));
+    assert!(!app.can_prompt(0));
+}
+
+/// Queueing asks for a session unconditionally — `begin_session` is its own
+/// guard, so a second prompt while one is being created neither starts another
+/// nor disturbs the queue.
+#[test]
+fn enqueue_prompt_starts_a_session_once_and_keeps_the_queue() {
+    let (mut app, _rx) = make_app();
+    app.enqueue_prompt(0, "first".into());
+    assert!(app.chats[&0].creating, "a session is on its way");
+    assert!(app.session_id_of(0).is_none());
+
+    app.enqueue_prompt(0, "second".into());
+    assert_eq!(app.chats[&0].queue_running, vec!["first", "second"]);
+    assert!(app.chats[&0].creating);
+
+    // With a live session, asking to begin is a no-op in the other direction too.
+    let chat = app.chats.get_mut(&0).unwrap();
+    chat.creating = false;
+    chat.session_id = Some("ses_1".into());
+    app.begin_session(0);
+    assert_eq!(app.session_id_of(0).as_deref(), Some("ses_1"));
+}
+
+// --- delegation-chain guards ---
+
+/// An employee the chain maps have never seen is its own origin at depth 0, and
+/// `inherit_chain` carries the origin down while bumping the depth — so `abandon`
+/// can tell "the origin is me" from "a distinct origin to report to".
+#[test]
+fn chain_origin_and_depth_default_then_inherit() {
+    let (mut app, _rx) = make_app();
+    assert_eq!(app.chain_origin(2), 2);
+    assert_eq!(app.chain_depth(2), 0);
+
+    app.inherit_chain(2, 1);
+    assert_eq!(app.chain_origin(1), 2);
+    assert_eq!(app.chain_depth(1), 1);
+
+    // The origin is inherited, not re-rooted, however deep the chain goes.
+    app.inherit_chain(1, 3);
+    assert_eq!(app.chain_origin(3), 2);
+    assert_eq!(app.chain_depth(3), 2);
+}
+
+// --- fan-out contribution guard ---
+
+/// A worker owes a fan-out exactly one contribution: the guard shared by the
+/// real and the synthetic path stops offering the fan-out once the worker is on
+/// record, and a fan-out that has already been aggregated is never offered again.
+#[test]
+fn a_worker_owes_a_fanout_once() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 3); // the planner; the reviewer (2) aggregates for it
+    app.fan_out(3, "ship it".to_string());
+
+    let id = *app.fanouts.keys().next().unwrap();
+    assert_eq!(app.fanouts[&id].workers, vec![0, 1]);
+    assert_eq!(app.fanouts_awaiting(0), vec![id]);
+
+    app.force_worker_contribution(0, "⚠ gone".to_string());
+    assert!(app.fanouts_awaiting(0).is_empty(), "already on record");
+    assert_eq!(app.fanouts[&id].outputs[&0], "⚠ gone");
+
+    // The source and the aggregator are not workers, so they owe nothing.
+    assert!(app.fanouts_awaiting(3).is_empty(), "the source");
+    assert!(app.fanouts_awaiting(2).is_empty(), "the aggregator");
+
+    // The last worker's contribution completes the fan-out: aggregated, and owed
+    // by nobody afterwards.
+    app.force_worker_contribution(1, "Draft copy.".to_string());
+    assert!(app.fanouts[&id].aggregated);
+    assert!(app.fanouts_awaiting(0).is_empty());
+    assert!(app.fanouts_awaiting(1).is_empty());
+}

@@ -112,6 +112,20 @@ struct Chat {
     queue_running: Vec<String>,
 }
 
+impl Chat {
+    /// True when this chat's session exists and can take a prompt — false while
+    /// one is still being created.
+    fn ready(&self) -> bool {
+        self.session_id.is_some() && !self.creating
+    }
+
+    /// True when a session exists or is already being created, which is exactly
+    /// when [`App::begin_session`] has nothing left to do.
+    fn started_or_starting(&self) -> bool {
+        self.session_id.is_some() || self.creating
+    }
+}
+
 /// A parallel fan-out: one goal broadcast to several workers, whose outputs are
 /// collected and handed to an aggregator (the reviewer) once they all finish.
 #[derive(Debug)]
@@ -905,11 +919,7 @@ impl App {
         let Some(employee) = self.chat_employee else {
             return;
         };
-        let Some(session_id) = self
-            .chats
-            .get(&employee)
-            .and_then(|chat| chat.session_id.clone())
-        else {
+        let Some(session_id) = self.session_id_of(employee) else {
             return;
         };
         if let Some(chat) = self.chats.get_mut(&employee) {
@@ -991,13 +1001,14 @@ impl App {
         self.begin_session(employee);
     }
 
-    /// Create the OpenCode session backing `employee`'s chat (skips if one is
-    /// already present or being created).
+    /// Create the OpenCode session backing `employee`'s chat. A no-op when one
+    /// already exists or is already being created, so callers may ask
+    /// unconditionally.
     fn begin_session(&mut self, employee: usize) {
         if self
             .chats
             .get(&employee)
-            .is_some_and(|c| c.session_id.is_some() || c.creating)
+            .is_some_and(Chat::started_or_starting)
         {
             return;
         }
@@ -1124,7 +1135,7 @@ impl App {
 
         // If the employee is mid-turn (or their session isn't ready yet), the
         // prompt is queued and sent once they're idle — see `pump_employee_queue`.
-        if self.employee_is_busy(employee) || !self.has_session(employee) {
+        if !self.can_prompt(employee) {
             self.enqueue_prompt(employee, text);
             return;
         }
@@ -1132,11 +1143,26 @@ impl App {
         self.dispatch_prompt(employee, text);
     }
 
-    /// True when `employee` has a live OpenCode session.
-    fn has_session(&self, employee: usize) -> bool {
+    /// A clone of `employee`'s live session id, when there is one.
+    fn session_id_of(&self, employee: usize) -> Option<String> {
         self.chats
             .get(&employee)
-            .is_some_and(|chat| chat.session_id.is_some())
+            .and_then(|chat| chat.session_id.clone())
+    }
+
+    /// True when `employee`'s chat has a session ready to take a prompt. This is
+    /// the one definition of "a session exists"; `creating` can never be set
+    /// alongside a session id, since [`Self::begin_session`] only starts one when
+    /// there is none and [`Self::handle_session_created`] clears both together.
+    fn session_ready(&self, employee: usize) -> bool {
+        self.chats.get(&employee).is_some_and(Chat::ready)
+    }
+
+    /// True when `employee` can take a prompt right now: a ready session and no
+    /// turn in flight. Both queue points gate on this, so "queue it instead of
+    /// sending it" has exactly one definition.
+    fn can_prompt(&self, employee: usize) -> bool {
+        self.session_ready(employee) && !self.employee_is_busy(employee)
     }
 
     /// True when `employee` is mid-turn and so cannot take a new prompt right
@@ -1150,9 +1176,7 @@ impl App {
     fn enqueue_prompt(&mut self, employee: usize, text: String) {
         let name = self
             .team
-            .employees()
-            .get(employee)
-            .map(|e| e.name.clone())
+            .name_at(employee)
             .unwrap_or_else(|| employee.to_string());
         self.push_log(format!("queued for {name}"));
         self.chats
@@ -1160,9 +1184,8 @@ impl App {
             .or_default()
             .queue_running
             .push(text);
-        if !self.has_session(employee) {
-            self.begin_session(employee);
-        }
+        // A no-op when the session already exists or is on its way.
+        self.begin_session(employee);
     }
 
     /// Drain the next queued prompt for `employee`, if they are idle with a
@@ -1184,7 +1207,7 @@ impl App {
     /// [`Self::pump_employee_queue`] so the gating can be exercised without a
     /// live client.
     fn next_queued(&mut self, employee: usize) -> Option<String> {
-        if !self.has_session(employee) || self.employee_is_busy(employee) {
+        if !self.can_prompt(employee) {
             return None;
         }
         let chat = self.chats.get_mut(&employee)?;
@@ -1198,11 +1221,7 @@ impl App {
     /// Send `text` to `employee`'s live session right now, marking them busy. The
     /// caller has already recorded it in the transcript and history.
     fn dispatch_prompt(&mut self, employee: usize, text: String) {
-        let Some(session_id) = self
-            .chats
-            .get(&employee)
-            .and_then(|chat| chat.session_id.clone())
-        else {
+        let Some(session_id) = self.session_id_of(employee) else {
             return;
         };
         if let Some(chat) = self.chats.get_mut(&employee) {
@@ -1215,7 +1234,13 @@ impl App {
         // The first prompt to an employee carries the team roster + delegation
         // protocol; later prompts go through verbatim.
         let prompt = self.bootstrap_prompt(employee, text);
+        self.spawn_prompt(employee, session_id, prompt);
+    }
 
+    /// Spawn one prompt delivery to a live session. A transport error comes back
+    /// as [`Message::DeliveryFailed`], so the caller's retry and queue logic sees
+    /// it as the turn ending badly rather than by silence.
+    fn spawn_prompt(&self, employee: usize, session_id: String, prompt: String) {
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -1635,12 +1660,7 @@ impl App {
         if let Some(chat) = self.chats.get_mut(&employee) {
             chat.bootstrapped = true;
         }
-        let name = self
-            .team
-            .employees()
-            .get(employee)
-            .map(|e| e.name.clone())
-            .unwrap_or_default();
+        let name = self.team.name_at(employee).unwrap_or_default();
         let context = team_context(&self.team, &name);
         format!("{context}\n\n{text}")
     }
@@ -1654,11 +1674,7 @@ impl App {
             .or_default()
             .outbox
             .push(instruction);
-        let ready = self
-            .chats
-            .get(&employee)
-            .is_some_and(|chat| chat.session_id.is_some() && !chat.creating);
-        if ready {
+        if self.session_ready(employee) {
             self.flush_outbox(employee);
         } else {
             self.begin_session(employee);
@@ -1667,10 +1683,11 @@ impl App {
 
     /// Send every queued delegation prompt out to `employee`'s live session.
     fn flush_outbox(&mut self, employee: usize) {
-        let Some(client) = self.client.clone() else {
+        // Without a client there is nowhere to send them: leave the outbox — and
+        // so the hand-off — intact for a later attempt.
+        if self.client.is_none() {
             return;
-        };
-        let tx = self.tx.clone();
+        }
 
         let (outbox, session_id) = {
             let Some(chat) = self.chats.get_mut(&employee) else {
@@ -1712,19 +1729,7 @@ impl App {
                 });
             }
             let session_id = session_id.clone();
-            let client = client.clone();
-            let tx = tx.clone();
-            let target = employee;
-            tokio::spawn(async move {
-                if let Err(err) = client.prompt(&session_id, &prompt).await {
-                    let _ = tx
-                        .send(Message::DeliveryFailed {
-                            target,
-                            reason: err.to_string(),
-                        })
-                        .await;
-                }
-            });
+            self.spawn_prompt(employee, session_id, prompt);
         }
     }
 
@@ -1792,7 +1797,7 @@ impl App {
             return;
         };
         // Bound the chain depth so `A → B → A → …` can't spin forever.
-        let depth = self.depth_of.get(&source).copied().unwrap_or(0);
+        let depth = self.chain_depth(source);
         if depth >= harness::MAX_CHAIN_DEPTH {
             self.push_log(format!(
                 "delegation chain depth limit reached at '{}'",
@@ -1898,24 +1903,14 @@ impl App {
     /// synthesis to the aggregator.
     fn note_fanout_result(&mut self, employee: usize, messages: &[SessionMessage]) {
         // Record this worker's output into every fan-out they're still owed to.
-        let affected: Vec<u64> = self
-            .fanouts
-            .iter()
-            .filter(|(_, f)| f.workers.contains(&employee) && !f.outputs.contains_key(&employee))
-            .map(|(id, _)| *id)
-            .collect();
+        let affected = self.fanouts_awaiting(employee);
 
         if !affected.is_empty() {
             let output = last_assistant_output(messages).unwrap_or_default();
             let output = if output.is_empty() {
-                format!(
-                    "⚠ no deliverable from {}",
-                    self.team
-                        .employees()
-                        .get(employee)
-                        .map(|e| e.name.clone())
-                        .unwrap_or_default()
-                )
+                // No text at all still counts as a contribution, so a fan-out
+                // waiting on this worker can complete.
+                harness::abandon_note(&self.team.name_at(employee).unwrap_or_default(), None)
             } else {
                 output
             };
@@ -1930,10 +1925,25 @@ impl App {
         self.aggregate_ready_fanouts();
     }
 
+    /// The ids of every fan-out still owed a contribution from `employee` — it
+    /// lists them as a worker, has no output from them yet, and has not been
+    /// aggregated. Both contribution paths (a real deliverable and a synthetic
+    /// `⚠` note) go through this, so a worker is never counted twice or missed.
+    fn fanouts_awaiting(&self, employee: usize) -> Vec<u64> {
+        self.fanouts
+            .iter()
+            .filter(|(_, fanout)| {
+                fanout.workers.contains(&employee)
+                    && !fanout.outputs.contains_key(&employee)
+                    && !fanout.aggregated
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Synthesize a fan-out's collected outputs and send them to the aggregator,
     /// instructing it to return a single deliverable to the user.
     fn aggregate_fanout(&mut self, id: u64) {
-        let team = self.team.employees().to_vec();
         let (aggregator, prompt) = {
             let Some(fanout) = self.fanouts.get_mut(&id) else {
                 return;
@@ -1946,10 +1956,7 @@ impl App {
             let mut prompt = String::from("The team has worked on this goal in parallel:\n");
             prompt.push_str(&format!("GOAL: {}\n", fanout.goal));
             for worker in &fanout.workers {
-                let name = team
-                    .get(*worker)
-                    .map(|e| e.name.clone())
-                    .unwrap_or_default();
+                let name = self.team.name_at(*worker).unwrap_or_default();
                 let output = fanout.outputs.get(worker).cloned().unwrap_or_default();
                 prompt.push_str(&format!("\n## {name}\n{output}\n"));
             }
@@ -1963,26 +1970,31 @@ impl App {
 
         self.push_log(format!(
             "fan-out #{id} complete — aggregating via {}",
-            team.get(aggregator)
-                .map(|e| e.name.clone())
-                .unwrap_or_default()
+            self.team.name_at(aggregator).unwrap_or_default()
         ));
         self.send_to_employee(aggregator, prompt);
     }
 
     // --- reliability (timeouts, retry, per-chain isolation) ---
 
+    /// The chat a chain's final answer returns to. A chain with no origin
+    /// recorded is its own origin.
+    fn chain_origin(&self, employee: usize) -> usize {
+        self.origin_of.get(&employee).copied().unwrap_or(employee)
+    }
+
+    /// How deep `employee` sits in its delegation chain (0 = a user-prompted
+    /// origin). An employee the chain maps have never seen counts as an origin.
+    fn chain_depth(&self, employee: usize) -> usize {
+        self.depth_of.get(&employee).copied().unwrap_or(0)
+    }
+
     /// Record that `target` now belongs to the same delegation chain as `source`,
     /// inheriting its origin (the chat the final answer returns to) and bumping
     /// the chain depth one step.
     fn inherit_chain(&mut self, source: usize, target: usize) {
-        let origin = self.origin_of.get(&source).copied().unwrap_or(source);
-        let depth = self
-            .depth_of
-            .get(&source)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let origin = self.chain_origin(source);
+        let depth = self.chain_depth(source).saturating_add(1);
         self.origin_of.insert(target, origin);
         self.depth_of.insert(target, depth);
     }
@@ -2052,21 +2064,17 @@ impl App {
     fn abandon(&mut self, employee: usize, _instruction: &str, reason: &str) {
         let name = self
             .team
-            .employees()
-            .get(employee)
-            .map(|e| e.name.clone())
+            .name_at(employee)
             .unwrap_or_else(|| employee.to_string());
-        let note = harness::abandon_note(&name, reason);
+        let note = harness::abandon_note(&name, Some(reason));
         self.push_to_chat(employee, TranscriptRole::Error, note.clone());
         self.team.set_status(employee, EmployeeStatus::Error);
 
-        // Surface the failure at the chain origin so the user sees it.
-        if let Some(origin) = self
-            .origin_of
-            .get(&employee)
-            .copied()
-            .filter(|&o| o != employee)
-        {
+        // Surface the failure at the chain origin so the user sees it. A chain with
+        // no origin recorded, or whose origin is this very employee, has no other
+        // chat to report to.
+        let origin = self.chain_origin(employee);
+        if origin != employee {
             self.push_to_chat(
                 origin,
                 TranscriptRole::Error,
@@ -2079,15 +2087,7 @@ impl App {
     /// Record a synthetic deliverable for `employee` into any fan-out still
     /// waiting on it, then aggregate anything that became complete.
     fn force_worker_contribution(&mut self, employee: usize, note: String) {
-        let affected: Vec<u64> = self
-            .fanouts
-            .iter()
-            .filter(|(_, f)| {
-                f.workers.contains(&employee) && !f.outputs.contains_key(&employee) && !f.aggregated
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in affected {
+        for id in self.fanouts_awaiting(employee) {
             if let Some(fanout) = self.fanouts.get_mut(&id) {
                 fanout.outputs.insert(employee, note.clone());
             }
@@ -2112,9 +2112,7 @@ impl App {
     fn handle_delivery_failed(&mut self, target: usize, reason: String) {
         let name = self
             .team
-            .employees()
-            .get(target)
-            .map(|e| e.name.clone())
+            .name_at(target)
             .unwrap_or_else(|| target.to_string());
         self.push_to_chat(
             target,
