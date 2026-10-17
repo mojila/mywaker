@@ -7,10 +7,11 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::event::EventHandler;
+use crate::jev::JevClient;
 use crate::message::Message;
-use crate::opencode::{AgentInfo, Event, OpenCode, ServerInfo, SessionMessage};
+use crate::opencode::{AgentInfo, Event, OpenCode, ProviderModel, ServerInfo, SessionMessage};
 use crate::projects::{self, Project};
-use crate::route::{JevClient, Role};
+use crate::role::Role;
 use crate::team::{EmployeeStatus, Team, move_selection};
 use crate::tui::Tui;
 use crate::ui;
@@ -31,6 +32,7 @@ pub enum Mode {
     Roster,
     Chat,
     Projects,
+    Models,
 }
 
 /// A rendered conversation line.
@@ -166,8 +168,6 @@ pub struct App {
     client: Option<OpenCode>,
     server_info: Option<ServerInfo>,
     agents: Vec<AgentInfo>,
-    /// Providers (sources) that hit a budget/quota limit; skipped on re-route.
-    exhausted_sources: HashSet<String>,
     connection_error: Option<String>,
     event_count: u64,
     last_event: Option<String>,
@@ -183,6 +183,10 @@ pub struct App {
     active_project: Option<Project>,
     /// Selection index in the project-picker list.
     project_selected: usize,
+    /// Models available through OpenCode's providers, for the model picker.
+    models: Vec<ProviderModel>,
+    /// Selection index in the model picker list.
+    model_selected: usize,
 
     mode: Mode,
     chat_employee: Option<usize>,
@@ -202,7 +206,7 @@ pub struct App {
     /// answer in a delegation chain is delivered back here.
     delegation_origin: Option<usize>,
     /// Jev (System One) decision client, used to answer `@jev` questions and
-    /// OpenCode `question.asked` prompts. `None` when no Kenari key is set.
+    /// OpenCode `form.created` prompts. `None` when no Kenari key is set.
     jev: Option<JevClient>,
     /// Active parallel fan-outs, keyed by a monotonic id.
     fanouts: HashMap<u64, FanOut>,
@@ -224,7 +228,6 @@ impl App {
             client: None,
             server_info: None,
             agents: Vec::new(),
-            exhausted_sources: HashSet::new(),
             connection_error: None,
             event_count: 0,
             last_event: None,
@@ -235,6 +238,8 @@ impl App {
             project_roots: Vec::new(),
             active_project: None,
             project_selected: 0,
+            models: Vec::new(),
+            model_selected: 0,
             mode: Mode::Roster,
             chat_employee: None,
             input: String::new(),
@@ -251,7 +256,7 @@ impl App {
     }
 
     /// Attach the Jev (System One) decision client, used to answer `@jev`
-    /// questions and OpenCode `question.asked` prompts.
+    /// questions and OpenCode `form.created` prompts.
     pub fn set_jev(&mut self, jev: Option<JevClient>) {
         self.jev = jev;
     }
@@ -290,7 +295,6 @@ impl App {
             Message::AgentsLoaded(agents) => {
                 self.push_log(format!("{} agents available", agents.len()));
                 self.agents = agents;
-                self.route_team_models();
             }
             Message::OpenCodeEvent(event) => {
                 self.event_count += 1;
@@ -306,12 +310,10 @@ impl App {
             Message::SkillInstallDone { employee, result } => {
                 self.handle_skill_install_done(employee, result);
             }
-            Message::ModelsAssigned(assigned) => {
-                let count = assigned.len();
-                for (index, model) in assigned {
-                    self.team.set_model(index, model);
-                }
-                self.push_log(format!("routed {count} employees to models"));
+            Message::ModelsLoaded(models) => {
+                self.push_log(format!("{} models available", models.len()));
+                self.models = models;
+                self.model_selected = self.model_selected.min(self.models.len().saturating_sub(1));
             }
             Message::JevAnswer { employee, answer } => {
                 self.push_to_chat(employee, TranscriptRole::Assistant, answer);
@@ -344,6 +346,7 @@ impl App {
                 }
                 KeyCode::Enter => self.start_chat(self.selected),
                 KeyCode::Char('p') | KeyCode::Char('P') => self.open_projects(),
+                KeyCode::Char('m') | KeyCode::Char('M') => self.open_models(),
                 _ => {}
             },
             Mode::Projects => match key.code {
@@ -357,6 +360,18 @@ impl App {
                         move_selection(self.project_selected, 1, self.projects.len());
                 }
                 KeyCode::Enter => self.select_project(),
+                _ => {}
+            },
+            Mode::Models => match key.code {
+                KeyCode::Esc => self.mode = Mode::Roster,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.model_selected =
+                        move_selection(self.model_selected, -1, self.models.len());
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.model_selected = move_selection(self.model_selected, 1, self.models.len());
+                }
+                KeyCode::Enter => self.assign_selected_model(),
                 _ => {}
             },
             Mode::Chat => self.handle_chat_key(key),
@@ -740,6 +755,7 @@ impl App {
         self.input.clear();
         self.input_cursor = 0;
         self.command_menu = None;
+        self.team.set_last_task(employee, None);
         // Drop the old session binding and start a fresh one (same worker).
         if let Some(chat) = self.chats.get_mut(&employee) {
             chat.session_id = None;
@@ -808,10 +824,13 @@ impl App {
             return;
         };
         let directory = self.workdir();
+        let employee_conf = self.team.employees().get(employee);
+        let agent = employee_conf.map(|e| e.agent_id().to_owned());
+        let model = employee_conf.and_then(|e| e.model.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = client
-                .create_session(&directory)
+                .create_session(&directory, agent.as_deref(), model.as_deref())
                 .await
                 .map_err(|err| err.to_string());
             let _ = tx.send(Message::SessionCreated { employee, result }).await;
@@ -893,6 +912,7 @@ impl App {
             chat.hist_index = None;
         }
         self.team.set_status(employee, EmployeeStatus::Thinking);
+        self.team.set_last_task(employee, Some(task_summary(&text)));
         // Remember where the chain started so the eventual final answer routes
         // back to the chat the user is actually looking at.
         self.delegation_origin = Some(employee);
@@ -1190,20 +1210,6 @@ impl App {
 
         self.team.set_status(employee, final_status);
 
-        // Fall back across providers when a source reports budget exhaustion.
-        let mut newly = false;
-        for source in exhausted_sources_in(&messages) {
-            if self.exhausted_sources.insert(source.clone()) {
-                self.push_log(format!(
-                    "budget exhausted on provider '{source}' — falling back"
-                ));
-                newly = true;
-            }
-        }
-        if newly {
-            self.route_team_models();
-        }
-
         // Hand off any directives in the freshly completed assistant reply.
         self.dispatch_delegations(employee, &messages);
 
@@ -1373,6 +1379,8 @@ impl App {
         };
 
         for instruction in outbox {
+            self.team
+                .set_last_task(employee, Some(task_summary(&instruction)));
             let prompt = self.bootstrap_prompt(employee, instruction);
             self.team.set_status(employee, EmployeeStatus::Thinking);
             let session_id = session_id.clone();
@@ -1617,32 +1625,62 @@ impl App {
         self.send_to_employee(aggregator, prompt);
     }
 
-    /// Kick off a background cross-provider fetch that routes each employee to a
-    /// model (skipping budget-exhausted sources), then assigns the results back
-    /// through the event channel.
-    fn route_team_models(&self) {
-        let roster = self.team.employees().to_vec();
-        let exhausted = self.exhausted_sources.clone();
+    /// Open the model picker and fetch the models available through OpenCode's
+    /// providers so the user can choose one for the selected employee.
+    fn open_models(&mut self) {
+        if self.client.is_none() {
+            self.push_log("not connected to OpenCode".to_string());
+            return;
+        }
+        self.model_selected = 0;
+        self.mode = Mode::Models;
+        self.load_models();
+    }
+
+    /// Fetch the models available through OpenCode's providers (for the model
+    /// picker). Results arrive back via [`Message::ModelsLoaded`].
+    fn load_models(&self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            match crate::route::route_roster_excluding(&roster, &exhausted).await {
-                Ok(selections) => {
-                    let assigned: Vec<(usize, String)> = selections
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(index, selection)| {
-                            selection.choice.map(|choice| (index, choice.id))
-                        })
-                        .collect();
-                    let _ = tx.send(Message::ModelsAssigned(assigned)).await;
+            match client.models().await {
+                Ok(models) => {
+                    let _ = tx.send(Message::ModelsLoaded(models)).await;
                 }
                 Err(err) => {
                     let _ = tx
-                        .send(Message::Log(format!("model route failed: {err}")))
+                        .send(Message::Log(format!("model list failed: {err}")))
                         .await;
                 }
             }
         });
+    }
+
+    /// Assign the highlighted model to the currently selected employee,
+    /// persisting the roster and returning to the dashboard.
+    fn assign_selected_model(&mut self) {
+        let Some(model) = self.models.get(self.model_selected).map(|m| m.id.clone()) else {
+            return;
+        };
+        let employee = self.selected;
+        self.team.set_model(employee, model.clone());
+        self.push_log(format!(
+            "{} → model {}",
+            self.team
+                .employees()
+                .get(employee)
+                .map(|e| e.name.as_str())
+                .unwrap_or("employee"),
+            model,
+        ));
+        if let Some(path) = Team::default_path()
+            && let Err(err) = self.team.save(&path)
+        {
+            self.push_log(format!("could not save team: {err}"));
+        }
+        self.mode = Mode::Roster;
     }
 
     fn workdir(&self) -> String {
@@ -1803,6 +1841,14 @@ impl App {
         self.project_selected
     }
 
+    pub fn models(&self) -> &[ProviderModel] {
+        &self.models
+    }
+
+    pub fn model_selected(&self) -> usize {
+        self.model_selected
+    }
+
     pub fn chat_employee_name(&self) -> Option<&str> {
         self.chat_employee
             .and_then(|index| self.team.employees().get(index))
@@ -1844,6 +1890,23 @@ impl App {
     }
 }
 
+/// A short, single-line summary of a task — the goal an employee is handed —
+/// for the tasks panel: first non-empty line, whitespace collapsed, truncated.
+fn task_summary(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let joined = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= 48 {
+        return joined;
+    }
+    let mut out: String = joined.chars().take(47).collect();
+    out.push('…');
+    out
+}
+
 /// The deliverable text of the last completed assistant reply — delegation
 /// directives stripped — used as a worker's contribution during aggregation.
 fn last_assistant_output(messages: &[SessionMessage]) -> Option<String> {
@@ -1883,8 +1946,7 @@ fn build_transcript(messages: &[SessionMessage]) -> Vec<TranscriptLine> {
             if role == TranscriptRole::Info && text.is_empty() {
                 return None;
             }
-            // Attribution: show the model alongside the assistant reply (relevant now
-            // that tasks are routed cross-provider).
+            // Attribution: show which model produced the assistant reply.
             let meta = (role == TranscriptRole::Assistant)
                 .then(|| message.model.as_ref().map(|m| m.id.as_str()))
                 .flatten()
@@ -1892,26 +1954,6 @@ fn build_transcript(messages: &[SessionMessage]) -> Vec<TranscriptLine> {
             Some(TranscriptLine { role, text, meta })
         })
         .collect()
-}
-
-/// Providers (by `model.providerID`) that reported a budget/quota exhaustion in
-/// this transcript. These become fallback exclusions on the next re-route.
-fn exhausted_sources_in(messages: &[SessionMessage]) -> HashSet<String> {
-    let mut sources = HashSet::new();
-    for message in messages {
-        if message
-            .error
-            .as_ref()
-            .is_some_and(|e| e.is_budget_exhausted())
-            && let Some(source) = message
-                .model
-                .as_ref()
-                .and_then(|m| m.provider_id.as_deref())
-        {
-            sources.insert(source.to_string());
-        }
-    }
-    sources
 }
 
 /// Connect to OpenCode and forward live events + status to the app channel.
@@ -1961,11 +2003,11 @@ pub async fn opencode_background(tx: Sender<Message>, jev: Option<JevClient>) {
     while let Some(event) = events.next().await {
         let message = match event {
             Ok(event) => {
-                // A session paused on a question must be answered (or it hangs
+                // A session paused on a form must be answered (or it hangs
                 // forever); resolve it out-of-band via Jev with a deterministic
                 // fallback, then keep the event flowing to the UI.
-                if event.is_question() {
-                    spawn_question_answer(client.clone(), jev.clone(), event.clone(), tx.clone());
+                if event.is_form() {
+                    spawn_form_answer(client.clone(), jev.clone(), event.clone(), tx.clone());
                 }
                 Message::OpenCodeEvent(event)
             }
@@ -1977,19 +2019,14 @@ pub async fn opencode_background(tx: Sender<Message>, jev: Option<JevClient>) {
     }
 }
 
-/// Answer an OpenCode `question.asked` request so the session resumes without
-/// waiting on human input. Each question is resolved with Jev (when available),
-/// falling back to a deterministic affirmative/first option answer.
-fn spawn_question_answer(
-    client: OpenCode,
-    jev: Option<JevClient>,
-    event: Event,
-    tx: Sender<Message>,
-) {
+/// Answer an OpenCode `form.created` request so the session resumes without
+/// waiting on human input. Each field is resolved with Jev (when available),
+/// falling back to a deterministic default.
+fn spawn_form_answer(client: OpenCode, jev: Option<JevClient>, event: Event, tx: Sender<Message>) {
     tokio::spawn(async move {
-        let Some(request) = event.question_request() else {
+        let Some(request) = event.form_request() else {
             let _ = tx
-                .send(Message::Log("question.asked without a payload".to_string()))
+                .send(Message::Log("form.created without a payload".to_string()))
                 .await;
             return;
         };
@@ -2001,52 +2038,62 @@ fn spawn_question_answer(
             Some(id) => id,
             None => {
                 let _ = tx
-                    .send(Message::Log("question without a session id".to_string()))
+                    .send(Message::Log("form without a session id".to_string()))
                     .await;
                 return;
             }
         };
-        let Some(request_id) = request.request_id.clone() else {
+        let Some(form_id) = request.form_id.clone() else {
             let _ = tx
-                .send(Message::Log("question without a request id".to_string()))
+                .send(Message::Log("form without an id".to_string()))
                 .await;
             return;
         };
 
-        let mut answers: Vec<Vec<String>> = Vec::with_capacity(request.questions.len());
-        let mut chosen: Vec<String> = Vec::with_capacity(request.questions.len());
-        for question in &request.questions {
-            let label = match &jev {
-                Some(jev) => match jev.answer_question(question).await {
-                    Ok(Some(choice)) => Some(choice),
+        let mut answer = serde_json::Map::with_capacity(request.fields.len());
+        let mut chosen: Vec<String> = Vec::with_capacity(request.fields.len());
+        for field in &request.fields {
+            let value = match &jev {
+                Some(jev) => match jev.answer_field(field).await {
+                    Ok(Some(value)) => Some(value),
                     _ => None,
                 },
                 None => None,
             };
-            let label = label.unwrap_or_else(|| crate::route::kenari::default_answer(question));
-            chosen.push(label.clone());
-            answers.push(vec![label]);
+            let value = value.unwrap_or_else(|| crate::jev::default_answer_field(field));
+            chosen.push(format!("{}={}", field.key, value_label(&value)));
+            answer.insert(field.key.clone(), value);
         }
 
-        match client
-            .reply_question(&session_id, &request_id, &answers)
-            .await
-        {
+        match client.reply_form(&session_id, &form_id, &answer).await {
             Ok(()) => {
                 let _ = tx
                     .send(Message::Log(format!(
-                        "answered question → {}",
+                        "answered form → {}",
                         chosen.join(", ")
                     )))
                     .await;
             }
             Err(err) => {
                 let _ = tx
-                    .send(Message::Log(format!("question reply failed: {err}")))
+                    .send(Message::Log(format!("form reply failed: {err}")))
                     .await;
             }
         }
     });
+}
+
+/// A compact log label for a form-field value.
+fn value_label(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(items) => {
+            items.iter().map(value_label).collect::<Vec<_>>().join(", ")
+        }
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -2056,6 +2103,23 @@ mod tests {
     fn make_app() -> (App, tokio::sync::mpsc::Receiver<Message>) {
         let (tx, rx) = tokio::sync::mpsc::channel::<Message>(16);
         (App::new(Config::default(), tx), rx)
+    }
+
+    #[test]
+    fn task_summary_takes_first_line_and_truncates() {
+        assert_eq!(task_summary("draft the intro"), "draft the intro");
+        // Blank leading line skipped, internal whitespace collapsed.
+        assert_eq!(
+            task_summary("\n   research   the best   runtime  \nmore\n"),
+            "research the best runtime"
+        );
+        // Long input truncates to 48 chars with an ellipsis.
+        let long = "x".repeat(100);
+        let summary = task_summary(&long);
+        assert_eq!(summary.chars().count(), 48);
+        assert!(summary.ends_with('…'));
+        // Empty input yields an empty string.
+        assert_eq!(task_summary("   \n  "), "");
     }
 
     fn event(event_type: &str, data: serde_json::Value) -> Event {
@@ -2234,7 +2298,7 @@ mod tests {
                 .any(|l| l.text.contains("build the launch plan"))
         );
         // …but not the aggregator (reviewer), which only synthesises later.
-        assert!(app.chats.get(&2).is_none());
+        assert!(!app.chats.contains_key(&2));
     }
 
     /// Once every worker contributes, the fan-out aggregates their outputs and
@@ -2548,41 +2612,6 @@ mod tests {
         assert_eq!(transcript[0].text, "go");
         assert_eq!(transcript[1].role, TranscriptRole::Assistant);
         assert_eq!(transcript[1].text, "hello");
-    }
-
-    #[test]
-    fn budget_error_excludes_provider_source() {
-        use crate::opencode::models::{MessageError, ModelRef, SessionMessage};
-
-        // A failed assistant message carries a budget error plus its provider.
-        let messages = vec![SessionMessage {
-            error: Some(MessageError {
-                error_type: Some("provider.auth".into()),
-                message: Some("Budget limit exceeded".into()),
-                status: Some(403),
-            }),
-            model: Some(ModelRef {
-                id: "anthropic/claude-opus-5.5".into(),
-                provider_id: Some("openrouter".into()),
-            }),
-            ..serde_json::from_value(serde_json::json!({
-                "id":"m2","time":{"created":1,"completed":2},"type":"assistant"
-            }))
-            .unwrap()
-        }];
-
-        let sources = exhausted_sources_in(&messages);
-        assert_eq!(sources.len(), 1);
-        assert!(sources.contains("openrouter"));
-
-        // Non-budget errors do NOT yield an exclusion.
-        let mut other = messages.clone();
-        other[0].error = Some(MessageError {
-            error_type: Some("provider.auth".into()),
-            message: Some("invalid api key".into()),
-            status: Some(401),
-        });
-        assert!(exhausted_sources_in(&other).is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::route::Role;
+use crate::role::Role;
 use crate::team::{Employee, EmployeeStatus};
 
 /// Braille spinner frames, indexed by the app tick (in sync with the avatar).

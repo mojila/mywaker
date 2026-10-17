@@ -84,7 +84,7 @@ async fn client_streams_and_reads_messages_from_fake_server() {
     let info = client.server_info().await.unwrap();
     assert_eq!(info.version, "2.0.30");
 
-    let session = client.create_session("/x").await.unwrap();
+    let session = client.create_session("/x", None, None).await.unwrap();
     assert_eq!(session.id, "ses_test");
 
     let events = client.events().unwrap();
@@ -166,7 +166,10 @@ async fn fans_out_n_parallel_prompts_via_joinset() {
     for _ in 0..3 {
         let client = client.clone();
         set.spawn(async move {
-            let session = client.create_session("/x").await.unwrap();
+            let session = client
+                .create_session("/x", Some("build"), None)
+                .await
+                .unwrap();
             client
                 .prompt(&session.id, "work the goal from your role")
                 .await

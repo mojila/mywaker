@@ -26,7 +26,7 @@ async fn main() -> color_eyre::eyre::Result<()> {
     println!("connected to OpenCode v{}", info.version);
 
     let dir = std::env::current_dir()?.to_string_lossy().to_string();
-    let session = client.create_session(&dir).await?;
+    let session = client.create_session(&dir, None, None).await?;
     println!("created session {}", session.id);
 
     let events = client.events()?;

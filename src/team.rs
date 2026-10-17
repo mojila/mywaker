@@ -46,11 +46,21 @@ pub struct Employee {
     /// Skills from the agent-skills ecosystem attached to this employee.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// OpenCode agent id backing this employee. Defaults to the employee's own
+    /// `id` (which doubles as the agent id) when unset.
+    #[serde(default)]
+    pub agent: Option<String>,
     /// Onboarding date (ISO), for the roster's "fun" field.
     pub onboarded: String,
-    /// The task currently assigned to this employee, if any (runtime-only).
+    /// The most recent task assigned to this employee (runtime-only).
+    ///
+    /// Set on prompt send (`App::send_prompt`) and peer delegation
+    /// (`App::flush_outbox`), cleared only by `App::reset_chat` (`/new` · `/clear`).
+    /// The live board keeps the *last* task — **not** cleared on `Done`/`Error` —
+    /// tinted by its final status, until the employee is reset or handed the next
+    /// task.
     #[serde(skip)]
-    pub current_task: Option<String>,
+    pub last_task: Option<String>,
     /// Current work status (runtime-only).
     #[serde(skip)]
     pub status: EmployeeStatus,
@@ -65,8 +75,9 @@ impl Employee {
             role: role.into(),
             model: None,
             skills: Vec::new(),
+            agent: None,
             onboarded: today_iso(),
-            current_task: None,
+            last_task: None,
             status: EmployeeStatus::Idle,
         }
     }
@@ -74,6 +85,12 @@ impl Employee {
     /// A short human-readable status label.
     pub fn status_label(&self) -> &'static str {
         self.status.label()
+    }
+
+    /// The OpenCode agent backing this employee: the explicit `agent` override,
+    /// else the employee's own id (which doubles as the agent id).
+    pub fn agent_id(&self) -> &str {
+        self.agent.as_deref().unwrap_or(&self.id)
     }
 }
 
@@ -140,6 +157,13 @@ impl Team {
     pub fn set_model(&mut self, index: usize, model: String) {
         if let Some(employee) = self.employees.get_mut(index) {
             employee.model = Some(model);
+        }
+    }
+
+    /// Set one employee's last task by index (no-op if out of range).
+    pub fn set_last_task(&mut self, index: usize, task: Option<String>) {
+        if let Some(employee) = self.employees.get_mut(index) {
+            employee.last_task = task;
         }
     }
 
@@ -330,21 +354,46 @@ mod tests {
     }
 
     #[test]
+    fn set_last_task_updates_and_clears() {
+        let mut team = Team::starter();
+        team.set_last_task(1, Some("draft the intro".to_string()));
+        assert_eq!(
+            team.employee("writer").and_then(|e| e.last_task.as_deref()),
+            Some("draft the intro")
+        );
+
+        team.set_last_task(1, None);
+        assert!(
+            team.employee("writer")
+                .and_then(|e| e.last_task.as_deref())
+                .is_none()
+        );
+
+        // Out-of-range index is a no-op, not a panic.
+        team.set_last_task(99, Some("x".to_string()));
+    }
+
+    #[test]
     fn round_trips_through_toml() {
         let mut team = Team::starter();
         team.add_skill("writer", "copywriting").unwrap();
         team.employee_mut("writer").unwrap().model = Some("openai/gpt-6-luna-pro".into());
+        team.employee_mut("writer").unwrap().agent = Some("code-gen".into());
 
         let text = toml::to_string_pretty(&team).unwrap();
         // Runtime fields are not persisted.
         assert!(!text.contains("status"));
-        assert!(!text.contains("current_task"));
+        assert!(!text.contains("last_task"));
 
         let loaded: Team = toml::from_str(&text).unwrap();
         assert_eq!(loaded.len(), 4);
         let writer = loaded.employee("writer").unwrap();
         assert_eq!(writer.skills, vec!["copywriting".to_string()]);
         assert_eq!(writer.model.as_deref(), Some("openai/gpt-6-luna-pro"));
+        assert_eq!(writer.agent.as_deref(), Some("code-gen"));
         assert_eq!(writer.status, EmployeeStatus::Idle);
+
+        // An employee without an explicit agent defaults to its own id.
+        assert_eq!(loaded.employee("planner").unwrap().agent_id(), "planner");
     }
 }

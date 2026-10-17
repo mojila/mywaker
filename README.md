@@ -4,8 +4,8 @@
 
 **mywaker** is a native Rust terminal app that turns [OpenCode](https://opencode.ai)
 into a roster of on-screen employees — each with an animated robot avatar, a live
-task stream, and a smart router that dispatches every task to the best (and most
-cost-efficient) model across your existing AI providers.
+task stream, and an explicit model selector that lets you assign a model to every
+employee.
 
 ```
 ┌─ mywaker · project: acme ───────────────────────────────────────┐
@@ -29,14 +29,16 @@ green done) while the robot avatar mirrors the aggregate state.
 - **Workflow pipeline** — the team rendered as a left → right diagram (plan →
   research → write → review), one stage box per employee with live status +
   model; the running stage lights up in its status colour.
+- **Live task board** — a right-hand panel listing every employee with their
+  latest task and status, updated as work streams in (per-employee `last_task`).
 - **Animated robot avatar** — a state-driven ASCII robot that idles, thinks,
   works, and wraps up in real time as streaming deltas arrive.
 - **Chat & live streaming** — talk to an employee and watch the response stream
   in over SSE, edge-cased to the parts OpenCode actually emits.
-- **Cross-provider model routing** — a provider-agnostic router merges Kenari's
-  public catalog with your existing OpenCode providers, normalizes them, and
-  scores every model by capability vs. cost. Task role and complexity are
-  inferred locally (no provider dependency); simple → cheap, hard → top-tier.
+- **Model selector** — list the models OpenCode's providers expose
+  (`mywaker model list`) and assign one per employee (`mywaker model set` or the
+  TUI picker via `m`). The chosen model is persisted to `team.toml` and applied
+  to that employee's sessions.
 
 ## Requirements
 
@@ -76,9 +78,9 @@ native distro.
 ## Run
 
 ```bash
-cargo run            # launch the TUI
-cargo run -- models  # route each employee to its best model
-cargo run -- route "research the best async runtime"  # pick a model for a task
+cargo run                  # launch the TUI
+mywaker model list         # list models from OpenCode's providers
+mywaker model set qa openai/gpt-6-luna-pro   # assign a model to an employee
 ```
 
 ## Manage employees & skills
@@ -107,29 +109,37 @@ mywaker skills add vercel-labs/agent-skills@react-best-practices -g  # install
 |---|---|
 | `↑` / `↓` or `j` / `k` | Select an employee |
 | `Enter` | Chat with the selected employee |
+| `m` | Pick a model for the selected employee |
 | `Esc` | Back / leave chat |
 | `q` | Quit |
 
-## Cross-provider routing
+## Model selection
 
-The provider-agnostic router (`src/route/`) merges models from **Kenari's
-public catalog** (`GET /v1/models`, IDR pricing) and your **existing OpenCode
-providers** (`GET /api/model`, USD → IDR) into one normalized list. It filters to
-chat-capable tool-using models and ranks them on a weighted score that balances
-capability (provider tier + reasoning + context + vision) against cost:
+Each employee's model is an explicit choice, not an automatic route. The model
+selector lists the models your **existing OpenCode providers** expose
+(`GET /api/model`) — exactly what the local service can run — and assigns one to
+an employee. The assignment is saved to `team.toml` and passed to the session
+when that employee's chat starts:
 
 ```bash
-$ mywaker models
-Aria (researcher) → anthropic/claude-opus-5.5 [anthropic] — researcher/medium: reasoning, vision · Rp64000/1M in
-Bruno (writer)   → openai/gpt-6-luna-pro      [openai]    — writer/medium: reasoning, vision · Rp1600/1M in
-Cleo (reviewer)  → openai/gpt-6-luna-pro      [openai]    — reviewer/medium: reasoning, vision · Rp1600/1M in
-Dex (planner)    → anthropic/claude-opus-5.5 [anthropic] — planner/medium: reasoning, vision · Rp64000/1M in
+$ mywaker model list
+  openai/gpt-6-luna-pro      [openai]    GPT-6 Luna Pro      $1.60/1M in
+✓ anthropic/claude-opus-5.5  [anthropic] Claude Opus 5.5     $64.00/1M in
+  meta/muse-spark-open       [openrouter] Muse Spark Open    $1.25/1M in
+
+$ mywaker model set writer openai/gpt-6-luna-pro
+assigned model 'openai/gpt-6-luna-pro' to 'writer'
 ```
 
-### Optional Jev classifier
+In the TUI, press `m` on the roster to open the picker, highlight a model, and
+press `Enter` to assign it to the selected employee.
 
-Task classification is a local heuristic (provider-agnostic). As an *option*, you
-can point a Jev (System One) classifier at any compatible endpoint from
+### Optional Jev answerer
+
+Jev (System One) is Kenari's typed decision model. mywaker uses it in two spots —
+answering `@jev <question>` delegations with a yes/no verdict, and auto-answering
+OpenCode `form.created` prompts so sessions never stall on human input. It is
+*opt-in*: configure any System One-compatible endpoint from
 `~/.config/mywaker/config.toml`:
 
 ```toml

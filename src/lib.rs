@@ -10,11 +10,12 @@
 pub mod app;
 pub mod config;
 pub mod event;
+pub mod jev;
 pub mod logging;
 pub mod message;
 pub mod opencode;
 pub mod projects;
-pub mod route;
+pub mod role;
 pub mod skills;
 pub mod team;
 pub mod tui;

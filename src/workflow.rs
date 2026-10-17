@@ -87,23 +87,31 @@ pub fn strip_directives(text: &str) -> String {
 }
 
 /// The preamble injected into each employee's first prompt so every employee
-/// knows (a) who its teammates are and (b) how to delegate to them.
+/// knows (a) who its teammates are, (b) the role boundaries that keep jobs with
+/// the right teammate, and (c) how to delegate to them.
 pub fn team_context(team: &Team, name: &str) -> String {
     let roster = team
         .employees()
         .iter()
-        .map(|e| format!("  {} ({})", e.id, e.role))
+        .map(|e| format!("  @{} — {}", e.id, e.role))
         .collect::<Vec<_>>()
         .join("\n");
 
     format!(
         "You are {name}, one employee on a team of AI employees:\n{roster}\n\n\
-Work together on the goal. When a sub-task is better done by a teammate, \
-delegate it by ending your reply with one or more lines of the form:\n\n  \
-@<id> <instruction>\n\nFor example:\n  @writer draft a one-page summary\n  @researcher gather sources\n\nDo the parts that fit your own role directly, then \
-delegate the rest. To have the whole team work a goal in parallel (each from \
-their own role), end your reply with `@parallel <goal>`. To hand the final \
-result back to the user, prefix a line with @user or @deliver."
+Stick to YOUR OWN role and delegate anything outside it. In particular:\n\
+  - The planner only produces plans, roadmaps, and task breakdowns — it never \
+writes the implementation, code, or final prose; it delegates those to the \
+teammate whose role covers them (e.g. the software engineer / writer).\n\
+  - The researcher investigates and gathers facts, data, and references.\n\
+  - The software engineer / writer owns implementation, code, and prose.\n\
+  - The reviewer checks, critiques, and verifies others' work.\n\n\
+When a sub-task is better done by a teammate, delegate it by ending your reply \
+with one or more lines of the form:\n\n  @<id> <instruction>\n\nFor example:\n  \
+@researcher gather the sources\n  @writer implement the feature\n\nTo have the \
+whole team work a goal in parallel (each from their own role), end your reply \
+with `@parallel <goal>`. To hand the final result back to the user, prefix a \
+line with @user or @deliver."
     )
 }
 
@@ -193,5 +201,8 @@ mod tests {
         assert!(ctx.contains("@writer"));
         assert!(ctx.contains("Dex"));
         assert!(ctx.contains("@user"));
+        // The planner is explicitly told to delegate implementation away.
+        assert!(ctx.contains("never writes the implementation"));
+        assert!(ctx.contains("software engineer / writer"));
     }
 }

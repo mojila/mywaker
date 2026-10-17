@@ -63,9 +63,11 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 
 - [x] 💻 Roster list (employees + status + avatar color) via `List`/`ListState` — extracted into `ui/dashboard.rs`
 - [x] 💻 Left panel wiring + keyboard navigation (↑↓/jk)
-- [x] 💻 Per-employee detail line (name · role · model · onboarded · task · status); `model`/`current_task` fields added to `Employee`
+- [x] 💻 Per-employee detail line (name · role · model · onboarded · task · status); `model`/`last_task` fields added to `Employee`
 - [x] 🧪 unit: selection clamp (`move_selection`), status text mapping (`EmployeeStatus::label`)
 - [x] ✅ dashboard shows the team and live status
+- [x] 💻 Right-side "tasks" panel (`src/ui/tasks.rs`) — every employee with its latest task + live status; `last_task` is set on prompt send/delegation (`send_prompt`/`flush_outbox`) and retained (tinted done/error) until `/new`·`/clear` or the next task. Layout is now robot (24) · pipeline (fill) · tasks (32).
+- [x] 🧪 unit: `task_summary` (first line, whitespace collapse, 48-char truncate), `Team::set_last_task`; render smoke tests assert the panel shows a task and degrades at narrow width
 
 ## M5 — Chat & streaming (`src/ui/chat.rs`)
 
@@ -80,7 +82,16 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 🧪 integration: `tests/opencode_fake.rs` (axum) drives the client over a scripted SSE server + `/message`
 - [ ] ✅ full live conversation loop (type → send → watch stream → result) — **blocked**: model inference hit the weekly budget cap (reset 2026-10-19); the loop is exercised via the fake server + unit tests until then
 
-## M5.5 — Kenari models router (`src/kenari/`)
+## M5.5 — model selector (superseded the Kenari models router)
+
+> **Superseded.** The cross-provider router below was removed in favour of an
+> explicit **model selector**: list models via `mywaker model list` (OpenCode
+> `GET /api/model`) and assign one per employee with `mywaker model set
+> <employee> <model>` or the TUI picker (Roster → `m`). The chosen model is
+> persisted to `team.toml` and actually passed to `create_session`. `role::Role`
+> (workflow ordering) and `jev::JevClient` (decision answerer) survive.
+
+（The following items record the original router work, now removed.）
 
 - [x] 💻 `kenari/models.rs` — serde types for `GET /v1/models` (`ModelInfo`, `Pricing`, `Modalities`); `sunset_at` is a unix timestamp, `pricing.unit = micro_idr_per_1m_tokens`
 - [x] 💻 `kenari/router.rs` — `Role` (mapped from employee id), `RoleProfile` (weights + price caps), `Router::route` (filter → weighted score), `ModelChoice` + human-readable `reason`
@@ -120,7 +131,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
   - Peer-to-peer delegation protocol: an assistant reply ends with line-leading `@<id> <instruction>` directives; the app relays each to the named employee (creating their session on demand). `@user`/`@deliver`/`@done` marks the final answer, routed back to the origin chat.
   - `src/workflow.rs` (`parse_delegations`, `is_final`, `team_context`) + app dispatch (`dispatch_delegations`/`send_to_employee`/`flush_outbox`), idempotent per message id, capped at 64 hand-offs to stop `A → B → A` cycles.
 - [x] 💻 First prompt to each employee carries a team-context preamble (roster + protocol) so anyone can delegate to anyone.
-- [x] 💻 `question.asked` auto-answer: the event loop resolves session questions via Jev (`JevClient::answer_question`) with a deterministic `default_answer` fallback, so delegated sessions never hang waiting on a human.
+- [x] 💻 `form.created` auto-answer: the event loop resolves session forms via Jev (`JevClient::answer_field`) with a deterministic `default_answer_field` fallback, so delegated sessions never hang waiting on a human. (OpenCode v2 renamed `question` → `form`; the reply endpoint is `POST /api/session/{id}/form/{formID}/reply`.)
 - [x] 💻 Jev as a delegated answerer: `@jev <question>` routes to Jev (`JevClient::answer_text`, a binary yes/no `choice`) and posts the verdict back to the asking employee's chat. The pipeline diagram (`src/ui/pipeline.rs`) renders a top-down tree — planner top, “jev” middle, researcher/writer/reviewer on the bottom row — with an on/off state.
 - [x] 💻 Aggregate results into a single deliverable view + review pass (`reviewer`)
   - Once every worker in a fan-out finishes (`note_fanout_result`), their stripped deliverables are collected and handed to the aggregator — the reviewer, else the planner — which synthesizes one deliverable and `@user`s it back (`aggregate_fanout`).

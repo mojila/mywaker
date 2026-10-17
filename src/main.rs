@@ -27,14 +27,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Route each employee to the best model (live catalog + existing providers).
-    Models,
-    /// Auto-find the best cross-provider model for a task description.
-    Route {
-        goal: String,
-        /// Providers/sources to skip (e.g. one that hit its budget limit).
-        #[arg(short, long)]
-        exclude: Vec<String>,
+    /// List available models and assign one to an employee (the model selector).
+    Model {
+        #[command(subcommand)]
+        cmd: ModelCmd,
     },
     /// Discover projects under ~/Projects (and any configured scan dirs).
     Projects {
@@ -51,6 +47,14 @@ enum Command {
         #[command(subcommand)]
         cmd: SkillsCmd,
     },
+}
+
+#[derive(Subcommand)]
+enum ModelCmd {
+    /// List models available through OpenCode's installed providers.
+    List,
+    /// Assign a model to an employee (persisted to team.toml).
+    Set { employee: String, model: String },
 }
 
 #[derive(Subcommand)]
@@ -127,8 +131,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Models) => return run_models().await,
-        Some(Command::Route { goal, exclude }) => return run_route(&goal, &exclude).await,
+        Some(Command::Model { cmd }) => return run_model(cmd).await,
         Some(Command::Projects { cmd }) => return run_projects(cmd),
         Some(Command::Employee { cmd }) => return run_employee(cmd),
         Some(Command::Skills { cmd }) => return run_skills(cmd),
@@ -143,9 +146,9 @@ async fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<Message>(256);
 
     // Connect to OpenCode and forward live events in the background. A Jev
-    // client (when a Kenari API key is configured) auto-answers any question the
+    // client (when a Kenari API key is configured) auto-answers any form the
     // session asks, so delegations never stall waiting on human input.
-    let jev = mywaker::route::JevClient::from_config(&config.jev);
+    let jev = mywaker::jev::JevClient::from_config(&config.jev);
     tokio::spawn(opencode_background(tx.clone(), jev.clone()));
 
     let mut tui = Tui::new()?;
@@ -243,70 +246,88 @@ fn rm_scan_dirs(dirs: Vec<std::path::PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// `mywaker models`: fetch the live model catalog(s) and route each employee.
-async fn run_models() -> Result<()> {
+/// `mywaker model [list|set <employee> <model>]`: the model selector.
+async fn run_model(cmd: ModelCmd) -> Result<()> {
+    match cmd {
+        ModelCmd::List => run_model_list().await,
+        ModelCmd::Set { employee, model } => run_model_set(&employee, &model),
+    }
+}
+
+/// List models available through OpenCode's installed providers, marking any
+/// model an employee is currently assigned to.
+async fn run_model_list() -> Result<()> {
+    use mywaker::opencode::OpenCode;
     use mywaker::team::Team;
 
-    let team = Team::load_or_starter();
-    let selections = mywaker::route::route_roster(team.employees()).await?;
+    let client = OpenCode::connect()
+        .await
+        .map_err(|err| eyre!("not connected to OpenCode: {err}"))?;
+    let models = client.models().await?;
 
-    for selection in &selections {
-        match &selection.choice {
-            Some(choice) => {
-                println!(
-                    "{} ({}) → {} [{} via {}] — {}",
-                    selection.name,
-                    selection.employee_id,
-                    choice.id,
-                    choice.provider,
-                    choice.source,
-                    choice.reason,
-                );
-            }
-            None => {
-                println!(
-                    "{} ({}) → no suitable model",
-                    selection.name, selection.employee_id,
-                );
-            }
-        }
+    let team = Team::load_or_starter();
+    let in_use: std::collections::HashSet<String> = team
+        .employees()
+        .iter()
+        .filter_map(|e| e.model.clone())
+        .collect();
+
+    if models.is_empty() {
+        println!("no models reported by OpenCode (`GET /api/model`)");
+        return Ok(());
     }
 
+    for model in &models {
+        let mark = if in_use.contains(&model.id) {
+            "✓ "
+        } else {
+            "  "
+        };
+        let name = model.name.clone().unwrap_or_default();
+        let provider = model.provider_id.clone().unwrap_or_else(|| model.vendor());
+        let cost = model
+            .input_cost()
+            .map(|c| format!("${c:.2}/1M in"))
+            .unwrap_or_else(|| "free".to_string());
+        let mut tags = Vec::new();
+        if model.is_tool_capable() {
+            tags.push("tools");
+        }
+        if model.is_reasoning() {
+            tags.push("reasoning");
+        }
+        let context = model
+            .context_length()
+            .map(|c| format!("{} ctx", c))
+            .unwrap_or_default();
+        println!(
+            "{mark}{}  [{provider}]  {name}  {cost}  {context}{}",
+            model.id,
+            if tags.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", tags.join("/"))
+            }
+        );
+    }
+
+    println!();
+    println!("a \"✓\" marks an employee's assigned model; assign with:");
+    println!("  mywaker model set <employee> <model>");
     Ok(())
 }
 
-/// `mywaker route "<task>"`: infer role + complexity with the provider-agnostic
-/// local classifier and pick the best model, printing the cross-provider
-/// fallback chain too.
-async fn run_route(goal: &str, excluded: &[String]) -> Result<()> {
-    let class = mywaker::route::TaskClass::infer(goal);
-    let mut plan = mywaker::route::auto_route_plan_with(class).await?;
-    for source in excluded {
-        plan.exclude(source);
-    }
+/// `mywaker model set <employee> <model>`: assign a model (persisted to
+/// team.toml). The next session for that employee runs on it.
+fn run_model_set(employee: &str, model: &str) -> Result<()> {
+    use mywaker::team::Team;
 
-    println!("task: {goal}");
-    println!(
-        "inferred: role={} complexity={}",
-        class.role.label(),
-        class.complexity.label(),
-    );
-    match plan.best() {
-        Some(choice) => {
-            println!(
-                "model: {} [{} via {}] — {}",
-                choice.id, choice.provider, choice.source, choice.reason
-            );
-        }
-        None => println!("model: none"),
-    }
-
-    // Show the cross-provider fallback chain (next distinct sources in order).
-    let chain: Vec<String> = plan.selectable_sources().into_iter().skip(1).collect();
-    if !chain.is_empty() {
-        println!("fallback providers: {}", chain.join(", "));
-    }
-
+    let mut team = Team::load_or_starter();
+    team.employee_mut(employee)
+        .ok_or_else(|| eyre!("no employee '{employee}'"))?
+        .model = Some(model.to_string());
+    team.save(&team_path()?)?;
+    println!("assigned model '{model}' to '{employee}'");
     Ok(())
 }
 

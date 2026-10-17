@@ -38,8 +38,8 @@ pub enum Message {
         employee: usize,
         result: Result<Vec<String>, String>,
     },
-    /// Kenari routed models for `(employee index, model id)` pairs.
-    ModelsAssigned(Vec<(usize, String)>),
+    /// The models available through OpenCode's providers, for the model picker.
+    ModelsLoaded(Vec<crate::opencode::ProviderModel>),
     /// Jev answered a delegated `@jev` question (for `employee`, who asked).
     JevAnswer { employee: usize, answer: String },
     /// A free-form line for the status log.

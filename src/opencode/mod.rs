@@ -9,8 +9,8 @@ use reqwest::Url;
 use serde::de::DeserializeOwned;
 
 pub use models::{
-    AgentInfo, Event, Location, MessageError, Part, ProviderModel, QuestionInfo, QuestionOption,
-    QuestionRequest, ServerInfo, SessionInfo, SessionMessage,
+    AgentInfo, Event, FormField, FormOption, FormRequest, Location, MessageError, Part,
+    ProviderModel, ServerInfo, SessionInfo, SessionMessage,
 };
 
 /// The fixed username OpenCode's local server expects in its `Basic` auth.
@@ -70,9 +70,24 @@ impl OpenCode {
         Ok(response.data)
     }
 
-    /// Create a session rooted at `directory`.
-    pub async fn create_session(&self, directory: &str) -> Result<SessionInfo> {
-        let body = serde_json::json!({ "location": { "directory": directory } });
+    /// Create a session rooted at `directory`, optionally bound to the named
+    /// agent (`None` → OpenCode's default agent) and to a model override
+    /// (`None` → the agent's own model). Binding each employee to its own agent
+    /// is what gives it a role-specific system prompt; the model is what the
+    /// user picked for that employee in the model selector.
+    pub async fn create_session(
+        &self,
+        directory: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<SessionInfo> {
+        let mut body = serde_json::json!({ "location": { "directory": directory } });
+        if let Some(agent) = agent {
+            body["agent"] = serde_json::Value::String(agent.to_owned());
+        }
+        if let Some(model) = model {
+            body["model"] = serde_json::Value::String(model.to_owned());
+        }
         let envelope: models::DataEnvelope<SessionInfo> =
             self.post_json("/api/session", &body).await?;
         Ok(envelope.data)
@@ -132,19 +147,19 @@ impl OpenCode {
         Ok(())
     }
 
-    /// Answer a pending question request (`question.asked`).
+    /// Answer a pending form (`form.created`).
     ///
-    /// `answers` lists one entry per question in the request, in order; each
-    /// entry is the array of selected option labels (a single element for a
-    /// single-choice question). After this the session resumes its turn.
-    pub async fn reply_question(
+    /// `answer` maps each field's `key` to its typed value (`Form.Answer`,
+    /// i.e. `{ "<key>": <string|number|boolean|string[]> }`). After this the
+    /// session resumes its turn.
+    pub async fn reply_form(
         &self,
         session_id: &str,
-        request_id: &str,
-        answers: &[Vec<String>],
+        form_id: &str,
+        answer: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
-        let body = serde_json::json!({ "answers": answers });
-        let path = format!("/api/session/{session_id}/question/{request_id}/reply");
+        let body = serde_json::json!({ "answer": answer });
+        let path = format!("/api/session/{session_id}/form/{form_id}/reply");
         let _: serde_json::Value = self.post_json(&path, &body).await?;
         Ok(())
     }

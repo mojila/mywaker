@@ -33,17 +33,13 @@ mywaker/
     ├── logging.rs            tracing → file
     ├── team.rs               Employee/roster model (maps to OpenCode agents)
     ├── workflow.rs           delegation protocol (parse `@id` directives, team preamble)
-    ├── route/                cross-provider router (provider-agnostic)
-    │   ├── mod.rs            orchestration (gather_candidates, route_roster, auto_route)
-    │   ├── models.rs         serde types (ModelInfo, Pricing, Modalities)
-    │   ├── router.rs         Role, TaskComplexity, Router, ModelChoice, TaskClass
-    │   ├── sources.rs        OpenCode provider model → ModelInfo adapter
-    │   └── kenari.rs         Kenari adapter: catalog client + optional Jev classifier
+    ├── jev.rs                Jev (System One) client — answers `@jev` + `form.created`
+    ├── role.rs               Role enum — workflow stage order/labels for the pipeline
     ├── task.rs               (planned M6) Task model, queue, retry, state machine
     ├── persistence.rs        (planned M6) JSON store (tasks, memory)
     ├── scheduler.rs          (planned M7) cron → dispatch events
     ├── opencode/
-    │   ├── mod.rs            client + request helpers (server_info/agents/create_session/prompt/wait/interrupt/reply_question/events)
+    │   ├── mod.rs            client + request helpers (server_info/agents/create_session/prompt/wait/interrupt/reply_form/events)
     │   ├── service.rs        discover `opencode service status`, read password
     │   ├── events.rs         SSE subscribe + typed event parse
     │   └── models.rs         serde types (Agent, Session, Event, ServerInfo)
@@ -113,7 +109,7 @@ Mirror of the OpenCode HTTP API shapes (confirmed against
 - `SessionMessage` ← `GET /api/session/{id}/message`
 - `Event` ← `GET /api/event` (SSE), discriminated by `type`
 - `ServerInfo` ← `GET /api/info` (version/health check)
-- `ModelInfo` ← `GET /api/model`
+- `ProviderModel` ← `GET /api/model`
 
 ---
 
@@ -264,67 +260,30 @@ load (serde `deny_unknown_fields`).
 
 ---
 
-## 9. Cross-provider model router (`src/route/`)
+## 9. Model selector
 
-`mywaker` routes each employee to the best model across **providers** — Kenari's
-catalog plus the user's existing OpenCode providers (OpenRouter, Clario, local
-MLX, …) — chosen live rather than hardcoding ids. The router is
-provider-agnostic: every model is normalized into a single `ModelInfo` shape
-and scored the same way regardless of which gateway it came from, and task
-classification is a local heuristic (no network, no provider dependency).
+`mywaker` does **not** auto-route employees to models. Each employee's model is
+chosen *explicitly* by the user via a **model selector**:
 
-- **Catalog** — `GET https://kenari.id/v1/models` (public, no API key) returns
-  `{ object:"list", data:[…] }`. Per model: `id`, `owned_by` (provider),
-  `context_length`, `max_output_tokens`, `endpoints`, `modalities`,
-  `reasoning`/`reasoning_options`, `tool_call`, `sunset_at` (unix ts), and
-  `pricing.unit = "micro_idr_per_1m_tokens"` (so IDR = micro / 1e6). `serde` uses
-  `rename_all = "snake_case"`.
+- **List** — the available models come from OpenCode's own providers
+  (`GET /api/model` → `ProviderModel`), so the list is exactly what the local
+  service can run. `mywaker model list` prints them (id, provider, name, cost,
+  context, tool/reasoning flags).
+- **Assign** — a model is persisted to `team.toml` as the employee's `model`
+  field, via `mywaker model set <employee> <model>`, or interactively in the TUI
+  (Roster → `m`) which lists models and assigns on Enter.
+- **Apply** — when a session is created for an employee
+  (`OpenCode::create_session`), the employee's chosen `model` is passed through as
+  the session's model override (alongside the bound agent). No model → the
+  agent's own default.
 
-- **Routing** — `Router::route(role, models)` (medium complexity) and
-  `Router::route_with(role, complexity, models)` filter first (chat endpoint,
-  `tool_call`, not sunset, `context_length ≥ min_context`, `require_reasoning`,
-  price caps) and then rank by a weighted score:
-
-  `score = w_capability·capability + w_reasoning·reasoning + w_context·context + w_vision·vision + w_cheap·cheap`
-
-  where `capability = provider_tier(owned_by) × model_grade(id)`. `provider_tier` is a
-  brand prior (anthropic/openai/deepseek > … > qwen > unknown); `model_grade` is a
-  name-derived intra-provider prior (`fable`/`opus` > `sonnet` > `sol`/`pro`/`max` >
-  `haiku`/`luna` > `flash`/`mini`). Both are documented **heuristics** — the catalog
-  exposes no benchmark score, and they exist only so a cheap `haiku` doesn't tie a
-  `sonnet`/`opus` whose other metadata is identical.
-
-- **Complexity** — `TaskComplexity::{Low,Medium,High}` drives the *budget band* (and
-  thus the model tier) on top of the role's trait weights, in `RoleProfile::for_task`:
-  - **Low** → `input ≤ Rp5k`, `output ≤ Rp25k`, no reasoning required, 8k context,
-    weights nudged toward cheap.
-  - **Medium** → the role's own caps/weights.
-  - **High** → uncapped, reasoning required, ≥128k context, weights nudged toward
-    capability.
-  `TaskComplexity::infer(goal)` classifies a description via cue words with a length
-  fallback.
-
-- **Roles** — `Role` maps from the employee id (`researcher`/`writer`/`reviewer`/
-  `planner`, else `General`) and can also be inferred from a task description
-  (`Role::from_goal`). Default picks against the live catalog: planner→`claude-opus`,
-  researcher→`claude-sonnet`, writer/reviewer→`claude-haiku` (capability roles pay for
-  quality, execution roles stay cheap). Weights/caps are tunable in
-  `RoleProfile::for_role`/`for_task`.
-
-- **Auto-route** — `route::auto_route(goal)` gathers candidates and classifies the
-  task in one step; the classification is `TaskClass::infer(goal)`, a local
-  heuristic (`Role::from_goal` + `TaskComplexity::infer`) with **no network or
-  provider dependency**. `Router::auto_route` does the same over an
-  already-fetched model list. Kenari's Jev (System One) classifier survives as an
-  *optional* adapter (`route::kenari::JevClient`) a caller may overlay out of
-  band — it is **not** on the default routing path.
-
-- **Wiring** — `KenariClient::list_models()` (`route::kenari`, needs reqwest
-  `rustls`; added in this milestone so the client speaks HTTPS) and
-  `route_roster(employees)` glue the results to the roster. The TUI assigns on `AgentsLoaded` (`Message::ModelsAssigned`) so each
-  employee's `model` shows in the dashboard; `mywaker models` prints the live routing
-  and `mywaker route "<task>"` prints the auto-route for a task description, both
-  without starting the TUI.
+The previous cross-provider *router* (Kenari catalog + weighted capability/cost
+scoring + task-complexity inference) was removed: automatic routing was assigning
+models the user never actually selected, and the routed `model` was never wired to
+the session. The role enum survives only as `role::Role`, used to order the team
+as a pipeline in the UI. Jev (System One) survives as `jev::JevClient`, used for
+`@jev` questions and `form.created` auto-answer — it is a *decision answerer*,
+unrelated to model selection.
 
 ---
 
@@ -354,12 +313,16 @@ can hand the final result back to the user.
    the origin chat (`App::delegation_origin`). A `MAX_DELEGATIONS` cap stops `A → B →
    A` cycles.
 
-4. **Question auto-answer** — `question.asked` events, which pause a session until
-   the user answers, are resolved out-of-band in the event loop
-   (`spawn_question_answer`): Jev (`JevClient::answer_question`) picks the answer
-   when available/confident, with a deterministic `default_answer` fallback, then the
-   client calls `reply_question` so the session resumes. This keeps an autonomous
-   delegation chain from ever stalling on a human prompt.
+4. **Form auto-answer** — `form.created` events, which pause a session until the
+   user supplies typed input for one or more fields, are resolved out-of-band in
+   the event loop (`spawn_form_answer`): Jev (`JevClient::answer_field`) picks
+   the value for choice-shaped fields (options / booleans) when available and
+   confident, with a deterministic `default_answer_field` fallback (field default,
+   else affirmative/first option), then the client calls `reply_form` so the
+   session resumes. This keeps an autonomous delegation chain from ever stalling
+   on a human prompt. (OpenCode v2 renamed its `question` flow to `form`; the
+   reply endpoint is `POST /api/session/{id}/form/{formID}/reply` with an
+   `{"answer": {fieldKey: value}}` body.)
 
 5. **Delegating to Jev** — an employee can hand a question straight to the decision
    model with `@jev <question>` (`route_to_jev`): the question is framed as a binary
@@ -383,3 +346,13 @@ can hand the final result back to the user.
    aggregator — the reviewer, else the planner, else the source — which
    synthesizes one deliverable and returns it with `@user`. The `/parallel
    <goal>` chat command drives the same fan-out directly from the user.
+
+7. **Agent binding** — each employee's session is created with its OpenCode agent
+   id (`Employee::agent_id()`, which defaults to the employee id, or an explicit
+   `agent` override in `team.toml`). This is what gives an employee a
+   role-specific system prompt — e.g. a `planner` agent that only plans — rather
+   than everyone running on OpenCode's default agent. The agents themselves are
+   defined in the target project's OpenCode config (`agents` in
+   `opencode.json(c)`; see `examples/opencode.agents.jsonc`). `team_context()`
+   additionally inlines the role boundaries so the planner is explicitly told to
+   delegate implementation (code/prose) to the software engineer / writer.

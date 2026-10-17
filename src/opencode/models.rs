@@ -98,7 +98,7 @@ pub struct Event {
     pub location: Option<Location>,
     #[serde(default)]
     pub data: serde_json::Value,
-    /// V2 events carry their payload under `properties` (e.g. `question.asked`)
+    /// V2 events carry their payload under `properties` (e.g. `form.created`)
     /// rather than `data`; kept raw so both surfaces are tolerated.
     #[serde(default)]
     pub properties: serde_json::Value,
@@ -158,16 +158,16 @@ impl Event {
         self.error_message().is_some_and(is_budget_message)
     }
 
-    /// True when this is a `question.asked` event (the session paused waiting
-    /// on the user to answer one or more questions).
-    pub fn is_question(&self) -> bool {
-        self.event_type == "question.asked"
+    /// True when this is a `form.created` event (the session paused waiting on
+    /// typed input for one or more form fields).
+    pub fn is_form(&self) -> bool {
+        self.event_type == "form.created"
     }
 
-    /// The question request this event carries, if any. The payload lives under
-    /// `properties` on the v2 surface and `data` on the m5 surface; we accept
-    /// whichever is populated.
-    pub fn question_request(&self) -> Option<QuestionRequest> {
+    /// The form request this event carries, if any. The payload lives under
+    /// `properties` on the v2 surface and `data` otherwise; we accept whichever
+    /// is populated.
+    pub fn form_request(&self) -> Option<FormRequest> {
         let payload = if !self.properties.is_null() {
             &self.properties
         } else {
@@ -211,9 +211,9 @@ pub struct MessageError {
 }
 
 impl MessageError {
-    /// True if this error means a provider is out of budget/quota, where the
-    /// right move is to route the task through a different provider rather than
-    /// retrying the same one.
+    /// True if this error means a provider is out of budget/quota. Callers can
+    /// surface this (e.g. suggest picking a different model) rather than retry
+    /// the same provider.
     pub fn is_budget_exhausted(&self) -> bool {
         let by_status = matches!(self.status, Some(402 | 429));
         let by_type = self.error_type.as_deref().is_some_and(budget_related_type);
@@ -355,47 +355,62 @@ fn part_tool_label(part: &Part) -> String {
     }
 }
 
-/// One choice offered by a [`QuestionInfo`] (`{ label, description }`).
+/// One option offered by a [`FormField`] (`{ value, label, description }`).
+///
+/// The `value` is what the reply endpoint expects back as the answer; `label`
+/// is the display text and `description` the longer explanation.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QuestionOption {
+pub struct FormOption {
+    #[serde(default)]
+    pub value: String,
     #[serde(default)]
     pub label: String,
     #[serde(default)]
     pub description: String,
 }
 
-/// A single question in a [`QuestionRequest`] (`question.asked`).
+/// One typed field of a [`FormRequest`] (`form.created`).
+///
+/// OpenCode v2's "form" flow has typed fields: `string`, `number`, `integer`,
+/// `boolean`, `multiselect`, and `external`. Only the subset the app consumes
+/// is modeled; unknown keys (e.g. `minLength`, `when`) are ignored.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QuestionInfo {
+pub struct FormField {
+    /// The field key the answer map is keyed by.
     #[serde(default)]
-    pub question: String,
+    pub key: String,
+    /// Discriminator: `string` | `number` | `integer` | `boolean` | `multiselect` | `external`.
+    #[serde(rename = "type", default)]
+    pub field_type: String,
     #[serde(default)]
-    pub header: String,
+    pub title: String,
     #[serde(default)]
-    pub options: Vec<QuestionOption>,
+    pub description: String,
     #[serde(default)]
-    pub multiple: bool,
-    #[serde(default = "default_true")]
+    pub options: Vec<FormOption>,
+    /// True when a free-form (custom) entry is allowed alongside the options.
+    #[serde(default)]
     pub custom: bool,
+    /// The field's default value, if any.
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
 }
 
-/// A pending question request: `{ id, sessionID, questions, tool? }`.
+/// A pending form request: `{ id, sessionID, title, fields }`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QuestionRequest {
-    /// The request id (`queue_…`); the reply endpoint is scoped by it.
+pub struct FormRequest {
+    /// The form id (`frm_…`); the reply endpoint is scoped by it.
     #[serde(default, rename = "id")]
-    pub request_id: Option<String>,
+    pub form_id: Option<String>,
     #[serde(default, rename = "sessionID")]
     pub session_id: Option<String>,
     #[serde(default)]
-    pub questions: Vec<QuestionInfo>,
-}
-
-fn default_true() -> bool {
-    true
+    pub title: String,
+    #[serde(default)]
+    pub fields: Vec<FormField>,
 }
 
 /// Pagination cursor for message-list responses, carried as `{ previous, next }`.
@@ -424,7 +439,7 @@ pub struct MessagesResponse {
 ///
 /// OpenCode lists every model across the user's *existing* providers (e.g.
 /// `openrouter`, `clario`, `meta`, `opencode`, `mlx`, `kenari`), so this is
-/// the "cross-provider" source the router merges with Kenari's own catalog.
+/// the catalog the model selector offers for per-employee assignment.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModel {
@@ -643,6 +658,68 @@ mod tests {
         let last: MessagesResponse =
             serde_json::from_str(r#"{"data":[],"cursor":{"previous":"x","next":null}}"#).unwrap();
         assert!(last.cursor.as_ref().unwrap().next.is_none());
+    }
+
+    #[test]
+    fn deserializes_form_request_and_fields() {
+        // Mirrors a real `form.created` payload: typed fields with options,
+        // custom entry, and a default value.
+        let raw = r#"{
+            "id": "frm_123",
+            "sessionID": "ses_1",
+            "title": "How should I proceed?",
+            "fields": [
+                {"key": "action", "type": "string", "title": "Action",
+                 "options": [
+                     {"value": "implement", "label": "Implement it", "description": "Write the code"},
+                     {"value": "plan", "label": "Just plan"}
+                 ]},
+                {"key": "confirm", "type": "boolean", "title": "Confirm?", "default": true},
+                {"key": "tags", "type": "multiselect", "options": [{"value": "a", "label": "A"}, {"value": "b", "label": "B"}]},
+                {"key": "note", "type": "string", "custom": true, "placeholder": "anything"}
+            ]
+        }"#;
+        let req: FormRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.form_id.as_deref(), Some("frm_123"));
+        assert_eq!(req.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(req.fields.len(), 4);
+
+        let action = &req.fields[0];
+        assert_eq!(action.key, "action");
+        assert_eq!(action.field_type, "string");
+        assert_eq!(action.options.len(), 2);
+        assert_eq!(action.options[0].value, "implement");
+        assert_eq!(action.options[0].label, "Implement it");
+
+        let confirm = &req.fields[1];
+        assert_eq!(confirm.field_type, "boolean");
+        assert_eq!(confirm.default, Some(serde_json::json!(true)));
+
+        assert_eq!(req.fields[2].field_type, "multiselect");
+        assert!(req.fields[3].custom);
+    }
+
+    #[test]
+    fn detects_form_event_and_reads_payload() {
+        let event: Event = serde_json::from_str(
+            r#"{"id":"e1","type":"form.created","properties":{"id":"frm_1","sessionID":"ses_9","fields":[]}}"#,
+        )
+        .unwrap();
+        assert!(event.is_form());
+        assert!(
+            !Event {
+                id: "e".into(),
+                created: None,
+                event_type: "session.text.delta".into(),
+                location: None,
+                data: serde_json::Value::Null,
+                properties: serde_json::Value::Null,
+            }
+            .is_form()
+        );
+        let req = event.form_request().expect("form payload");
+        assert_eq!(req.form_id.as_deref(), Some("frm_1"));
+        assert_eq!(req.session_id.as_deref(), Some("ses_9"));
     }
 
     #[test]

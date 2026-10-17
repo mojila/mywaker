@@ -1,9 +1,11 @@
 //! The ratatui renderer: title bar, robot avatar, team pipeline, chat, log, help.
 
 mod chat;
+mod models;
 mod pipeline;
 mod projects;
 mod robot;
+mod tasks;
 
 use ratatui::{
     Frame,
@@ -87,11 +89,17 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
     match app.mode() {
         Mode::Chat => chat::render(frame, app, area),
         Mode::Projects => projects::render(frame, app, area),
+        Mode::Models => models::render(frame, app, area),
         Mode::Roster => {
-            let [robot_area, team_area] =
-                Layout::horizontal([Constraint::Length(24), Constraint::Fill(1)]).areas(area);
+            let [robot_area, team_area, tasks_area] = Layout::horizontal([
+                Constraint::Length(24),
+                Constraint::Fill(1),
+                Constraint::Length(32),
+            ])
+            .areas(area);
             render_robot_widget(frame, app, robot_area);
             pipeline::render(frame, app, team_area);
+            tasks::render(frame, app, tasks_area);
         }
     }
 }
@@ -159,8 +167,20 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             "chat ".dim(),
             " p ".bold().cyan(),
             "projects ".dim(),
+            " m ".bold().cyan(),
+            "model ".dim(),
             " q ".bold().cyan(),
             "quit ".dim(),
+        ]),
+        Mode::Models => Line::from(vec![
+            " ↑/k ".bold().cyan(),
+            "move ".dim(),
+            " ↓/j ".bold().cyan(),
+            "move ".dim(),
+            " Enter ".bold().cyan(),
+            "assign ".dim(),
+            " Esc ".bold().cyan(),
+            "back ".dim(),
         ]),
         Mode::Projects => Line::from(vec![
             " ↑/k ".bold().cyan(),
