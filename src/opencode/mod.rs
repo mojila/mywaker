@@ -43,9 +43,10 @@ impl OpenCode {
         Ok(Self::with_base(base, &password))
     }
 
-    /// Like [`connect`], but starts the background service first when it isn't
-    /// already running. Used by the interactive TUI so startup never dead-ends
-    /// on a "no service" error; CLI one-shots keep the fail-fast [`connect`].
+    /// Like [`Self::connect`], but starts the background service first when it
+    /// isn't already running. Used by the interactive TUI so startup never
+    /// dead-ends on a "no service" error; CLI one-shots keep the fail-fast
+    /// [`Self::connect`].
     pub async fn connect_or_start() -> Result<Self> {
         let base = service::ensure_started().await?;
         let password = service::password()?;

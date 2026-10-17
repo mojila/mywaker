@@ -39,7 +39,7 @@ const START_READY_POLL: Duration = Duration::from_millis(300);
 /// return its endpoint. When `opencode service status` reports nothing, this
 /// fires `opencode service start` (detached, with nulled stdio so it can't bind
 /// to the alternate screen) and polls until the service advertises an endpoint
-/// or [`START_READY_TIMEOUT`] elapses.
+/// or the start timeout (`START_READY_TIMEOUT`) elapses.
 pub async fn ensure_started() -> Result<Url> {
     if let Some(url) = discover().await? {
         return Ok(url);

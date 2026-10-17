@@ -59,9 +59,11 @@ Expected at the time of writing (`0.11.0` + the unreleased mouse feature):
   `tests/live_employees.rs` — the last also wants inference budget); they are run
   by hand, not as part of a release. The counts grow every release — what has to
   hold is **0 failed** and **only the live tests ignored**.
-- `cargo doc --no-deps` — exactly **3** warnings, all deliberate: `ensure_started`
-  links the private `START_READY_TIMEOUT`, and two unresolved `` `connect` `` links
-  in `src/opencode/mod.rs`. Fix anything new rather than adding to the list.
+- `cargo doc --no-deps` — **no warnings**. Three longstanding ones were cleared
+  after `0.12.0`: a public `ensure_started` linked the private
+  `START_READY_TIMEOUT`, and two `connect` links in `src/opencode/mod.rs` needed
+  their `Self::` prefix. Treat a new warning as a release blocker, not as a
+  fixture to explain away.
 
 Confirm the user-facing documents describe what you are shipping:
 
