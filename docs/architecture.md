@@ -327,7 +327,7 @@ can hand the final result back to the user.
 
 4. **Form auto-answer** — `form.created` events, which pause a session until the
    user supplies typed input for one or more fields, are resolved out-of-band in
-   the event loop (`spawn_form_answer`): Jev (`JevClient::answer_field`) picks
+   the event loop (`spawn_form_answer`): Jev (`jev::answer_field_or_default`) picks
    the value for choice-shaped fields (options / booleans) when available and
    confident, with a deterministic `default_answer_field` fallback (field default,
    else affirmative/first option), then the client calls `reply_form` so the
@@ -338,9 +338,12 @@ can hand the final result back to the user.
 
 5. **Delegating to Jev** — an employee can hand a question straight to the decision
    model with `@jev <question>` (`route_to_jev`): the question is framed as a binary
-   yes/no `choice` (`JevClient::answer_text`), and the verdict is posted back into
-   the asking employee's chat (`Message::JevAnswer`). With no Jev client configured
-   it answers "yes" deterministically. The **pipeline diagram** (`src/ui/pipeline.rs`)
+   yes/no `choice` (`jev::answer_text_or_default`), and the verdict is posted back
+   into the asking employee's chat (`Message::JevAnswer`). With no Jev client
+   configured it answers `FALLBACK_VERDICT` ("yes") deterministically. Both Jev
+   surfaces share one transport (`JevClient::ask`), one confidence gate
+   (`confident_choice`) and one shape of deterministic fallback. The **pipeline
+   diagram** (`src/ui/pipeline.rs`)
    shows Jev as a node reached from the planner above and the employees below:
    the diagram is a top-down tree — planner on top, **Jev** in the middle, and the
    remaining employees (researcher, writer, reviewer, …) fanned out along the

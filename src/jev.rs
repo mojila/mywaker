@@ -4,11 +4,14 @@
 //! `noul`) against a `state`. mywaker uses it in two places:
 //!
 //! 1. **OpenCode `form.created` auto-answer** — a session paused on a form has
-//!    each choice-shaped field resolved with [`JevClient::answer_field`],
-//!    falling back to [`default_answer_field`] when Jev is unavailable or
-//!    uncertain.
+//!    each choice-shaped field resolved with [`answer_field_or_default`], so the
+//!    session always resumes.
 //! 2. **`@jev <question>` delegation** — a teammate's yes/no question is framed
-//!    as a binary `choice` and answered with [`JevClient::answer_text`].
+//!    as a binary `choice` and answered with [`answer_text_or_default`].
+//!
+//! Both surfaces go through the same three steps, defined once each: ask
+//! (`JevClient::ask`), gate on confidence (`confident_choice`), and fall back
+//! deterministically ([`default_answer_field`] / [`FALLBACK_VERDICT`]).
 
 use color_eyre::eyre::{Result, WrapErr};
 use serde_json::Value;
@@ -22,6 +25,9 @@ pub const DEFAULT_SYSTEMONE_URL: &str = "https://kenari.id/v1/systemone";
 pub const DEFAULT_JEV_MODEL: &str = "jev-1-13-free";
 /// Minimum confidence to trust Jev for a given dimension.
 const MIN_CONFIDENCE: f64 = 0.55;
+/// The verdict used when Jev is unavailable or uncertain on a free-form
+/// question: proceed rather than stall the delegation chain.
+pub const FALLBACK_VERDICT: &str = "yes";
 
 /// Minimal client for a System One (Jev) endpoint.
 #[derive(Debug, Clone)]
@@ -89,27 +95,53 @@ impl JevClient {
     /// [`default_answer_field`]); `Err` is a transport/HTTP error. Free-text or
     /// numeric fields (no options) yield `Ok(None)`.
     pub async fn answer_field(&self, field: &FormField) -> Result<Option<serde_json::Value>> {
-        let criteria = field_criteria(field);
-        let criteria = match criteria {
-            Some(criteria) => criteria,
-            None => return Ok(None),
+        let Some(criteria) = field_criteria(field) else {
+            return Ok(None);
         };
 
-        let state = if field.title.is_empty() {
-            field.description.clone()
-        } else if field.description.is_empty() {
-            field.title.clone()
-        } else {
-            format!("{}: {}", field.title, field.description)
-        };
+        let json = self
+            .ask(
+                &field_state(field),
+                "Choose the single best answer to the question.",
+                criteria,
+            )
+            .await?;
+        Ok(map_field_choice(&json, field))
+    }
 
+    /// Answer a free-form yes/no question as a binary `choice` ("yes" / "no").
+    ///
+    /// Jev is a *typed decider*, not a chat model, so a free question is framed
+    /// as a confident yes/no verdict. `Ok(None)` means Jev was unavailable or
+    /// uncertain — callers fall back to [`FALLBACK_VERDICT`] via
+    /// [`answer_text_or_default`].
+    pub async fn answer_text(&self, question: &str) -> Result<Option<String>> {
+        let json = self
+            .ask(
+                question,
+                "Answer the question with a confident yes or no verdict.",
+                serde_json::json!({
+                    "yes": "affirmative — the answer is yes / true / proceed / correct",
+                    "no": "negative — the answer is no / false / stop / incorrect"
+                }),
+            )
+            .await?;
+        Ok(parse_yes_no(&json))
+    }
+
+    /// POST one `choice` question to System One and decode its answer envelope.
+    ///
+    /// The single transport path behind [`answer_field`](Self::answer_field) and
+    /// [`answer_text`](Self::answer_text): both frame their question as a
+    /// `choice` and differ only in the `state`, instructions, and criteria.
+    async fn ask(&self, state: &str, instructions: &str, criteria: Value) -> Result<Value> {
         let body = serde_json::json!({
             "model": self.model,
             "state": state,
             "questions": {
                 "answer": {
                     "type": "choice",
-                    "instructions": "Choose the single best answer to the question.",
+                    "instructions": instructions,
                     "criteria": criteria,
                 }
             }
@@ -126,106 +158,97 @@ impl JevClient {
             .error_for_status()
             .wrap_err("POST systemone")?;
 
-        let json: Value = response.json().await.wrap_err("decode systemone answer")?;
-        Ok(map_field_choice(&json, field))
-    }
-
-    /// Answer a free-form yes/no question as a binary `choice` ("yes" / "no").
-    ///
-    /// Jev is a *typed decider*, not a chat model, so a free question is framed
-    /// as a confident yes/no verdict. `Ok(None)` means Jev was unavailable or
-    /// uncertain — callers fall back to a deterministic affirmative.
-    pub async fn answer_text(&self, question: &str) -> Result<Option<String>> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "state": question,
-            "questions": {
-                "answer": {
-                    "type": "choice",
-                    "instructions": "Answer the question with a confident yes or no verdict.",
-                    "criteria": {
-                        "yes": "affirmative — the answer is yes / true / proceed / correct",
-                        "no": "negative — the answer is no / false / stop / incorrect"
-                    }
-                }
-            }
-        });
-
-        let response = self
-            .http
-            .post(&self.endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .wrap_err("POST systemone")?
-            .error_for_status()
-            .wrap_err("POST systemone")?;
-
-        let json: Value = response.json().await.wrap_err("decode systemone answer")?;
-        Ok(parse_yes_no(&json))
+        response.json().await.wrap_err("decode systemone answer")
     }
 }
 
-/// Parse a binary yes/no `choice` verdict from a System One answer envelope.
-fn parse_yes_no(json: &Value) -> Option<String> {
+/// A form field's answer, resolved end-to-end: Jev's confident value when a
+/// client is attached, else the deterministic [`default_answer_field`]. Never
+/// fails — this is the policy the `form.created` auto-answer relies on, since a
+/// session paused on a form would otherwise hang forever.
+pub async fn answer_field_or_default(
+    jev: Option<&JevClient>,
+    field: &FormField,
+) -> serde_json::Value {
+    if let Some(jev) = jev
+        && let Ok(Some(value)) = jev.answer_field(field).await
+    {
+        return value;
+    }
+    default_answer_field(field)
+}
+
+/// A free-form question answered end-to-end: Jev's confident verdict when a
+/// client is attached, else the deterministic [`FALLBACK_VERDICT`]. Never fails.
+pub async fn answer_text_or_default(jev: Option<&JevClient>, question: &str) -> String {
+    match jev {
+        Some(jev) => match jev.answer_text(question).await {
+            Ok(Some(answer)) => answer,
+            _ => FALLBACK_VERDICT.to_owned(),
+        },
+        None => FALLBACK_VERDICT.to_owned(),
+    }
+}
+
+/// The `state` sent to Jev for a field: its title, its description, or both.
+fn field_state(field: &FormField) -> String {
+    if field.title.is_empty() {
+        field.description.clone()
+    } else if field.description.is_empty() {
+        field.title.clone()
+    } else {
+        format!("{}: {}", field.title, field.description)
+    }
+}
+
+/// The `choice` string from a System One answer envelope, gated on
+/// [`MIN_CONFIDENCE`]. `None` when the envelope is malformed or Jev was unsure —
+/// the gate both answer paths share.
+fn confident_choice(json: &Value) -> Option<&str> {
     let answer = json.get("answers")?.get("answer")?;
     let confidence = answer
         .get("confidence")
-        .and_then(|v| v.as_f64())
+        .and_then(Value::as_f64)
         .unwrap_or(1.0);
     if confidence < MIN_CONFIDENCE {
         return None;
     }
-    answer
-        .get("choice")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_ascii_lowercase())
+    answer.get("choice")?.as_str()
+}
+
+/// Parse a binary yes/no `choice` verdict from a System One answer envelope.
+fn parse_yes_no(json: &Value) -> Option<String> {
+    confident_choice(json).map(|choice| choice.to_ascii_lowercase())
 }
 
 /// The choice criteria used to ask Jev about a field: `None` when the field is
 /// not a typed choice (free-text/number rather than booleans or options).
-fn field_criteria(field: &FormField) -> Option<serde_json::Map<String, Value>> {
+fn field_criteria(field: &FormField) -> Option<Value> {
     if field.field_type == "boolean" {
-        let mut m = serde_json::Map::new();
-        m.insert(
-            "true".to_string(),
-            Value::String("affirmative — yes / true / proceed / confirm".to_string()),
-        );
-        m.insert(
-            "false".to_string(),
-            Value::String("negative — no / false / stop / decline".to_string()),
-        );
-        return Some(m);
+        return Some(serde_json::json!({
+            "true": "affirmative — yes / true / proceed / confirm",
+            "false": "negative — no / false / stop / decline"
+        }));
     }
     if field.options.is_empty() {
         return None;
     }
-    let mut m = serde_json::Map::new();
+    let mut criteria = serde_json::Map::new();
     for option in &field.options {
         let description = if option.description.is_empty() {
             option.label.clone()
         } else {
             option.description.clone()
         };
-        m.insert(option.value.clone(), Value::String(description));
+        criteria.insert(option.value.clone(), Value::String(description));
     }
-    Some(m)
+    Some(Value::Object(criteria))
 }
 
 /// Map a System One `choice` answer envelope into the field's typed value,
 /// confidence-gated. `None` when missing or below [`MIN_CONFIDENCE`].
 fn map_field_choice(json: &Value, field: &FormField) -> Option<serde_json::Value> {
-    let answer = json.get("answers")?.get("answer")?;
-    let confidence = answer
-        .get("confidence")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0);
-    if confidence < MIN_CONFIDENCE {
-        return None;
-    }
-    let choice = answer.get("choice")?.as_str()?;
-    Some(typed_value(field, choice))
+    Some(typed_value(field, confident_choice(json)?))
 }
 
 /// Shape Jev's `choice` string into the field's expected JSON value type.
@@ -408,5 +431,112 @@ mod tests {
 
         // Missing answer envelope is None.
         assert_eq!(parse_yes_no(&serde_json::json!({})), None);
+    }
+
+    /// The confidence gate is shared: a missing `confidence` field counts as
+    /// certain, and a choice with no `answers` envelope yields nothing.
+    #[test]
+    fn confident_choice_defaults_confidence_and_rejects_malformed() {
+        let missing_confidence = serde_json::json!({
+            "answers": { "answer": { "choice": "a" } }
+        });
+        assert_eq!(confident_choice(&missing_confidence), Some("a"));
+
+        assert_eq!(confident_choice(&serde_json::json!({"answers": {}})), None);
+        assert_eq!(
+            confident_choice(&serde_json::json!({"answers": {"answer": {"confidence": 0.9}}})),
+            None
+        );
+    }
+
+    #[test]
+    fn field_state_joins_title_and_description() {
+        let field = |title: &str, description: &str| FormField {
+            key: "k".into(),
+            field_type: "string".into(),
+            title: title.into(),
+            description: description.into(),
+            options: Vec::new(),
+            custom: false,
+            default: None,
+        };
+
+        assert_eq!(
+            field_state(&field("Deploy?", "Ship it to prod")),
+            "Deploy?: Ship it to prod"
+        );
+        // Either half alone is used verbatim; both empty stays empty.
+        assert_eq!(field_state(&field("", "Ship it")), "Ship it");
+        assert_eq!(field_state(&field("Deploy?", "")), "Deploy?");
+        assert_eq!(field_state(&field("", "")), "");
+    }
+
+    #[test]
+    fn field_criteria_is_shaped_by_field_type() {
+        let option = |value: &str, label: &str, description: &str| FormOption {
+            value: value.into(),
+            label: label.into(),
+            description: description.into(),
+        };
+        let with_options = |field_type: &str, options: Vec<FormOption>| FormField {
+            key: "k".into(),
+            field_type: field_type.into(),
+            title: String::new(),
+            description: String::new(),
+            options,
+            custom: false,
+            default: None,
+        };
+
+        // A boolean becomes a typed true/false choice.
+        let criteria = field_criteria(&with_options("boolean", Vec::new())).unwrap();
+        assert_eq!(criteria.as_object().unwrap().len(), 2);
+        assert!(criteria.get("true").is_some());
+        assert!(criteria.get("false").is_some());
+
+        // Options are keyed by value and described by description, falling back
+        // to the label when there is none.
+        let criteria = field_criteria(&with_options(
+            "string",
+            vec![
+                option("a", "Alpha", "the first one"),
+                option("b", "Beta", ""),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(criteria["a"], serde_json::json!("the first one"));
+        assert_eq!(criteria["b"], serde_json::json!("Beta"));
+
+        // Free text and numbers are not typed choices.
+        assert!(field_criteria(&with_options("string", Vec::new())).is_none());
+        assert!(field_criteria(&with_options("number", Vec::new())).is_none());
+    }
+
+    /// Both surfaces resolve end-to-end without a client: the deterministic
+    /// fallbacks apply rather than the caller having to branch.
+    #[tokio::test]
+    async fn or_default_helpers_fall_back_without_a_client() {
+        let field = FormField {
+            key: "k".into(),
+            field_type: "string".into(),
+            title: "Which?".into(),
+            description: String::new(),
+            options: vec![FormOption {
+                value: "Alpha".into(),
+                label: "Alpha".into(),
+                description: String::new(),
+            }],
+            custom: false,
+            default: None,
+        };
+
+        assert_eq!(
+            answer_field_or_default(None, &field).await,
+            serde_json::json!("Alpha")
+        );
+        assert_eq!(
+            answer_text_or_default(None, "is this plan sound?").await,
+            FALLBACK_VERDICT
+        );
     }
 }

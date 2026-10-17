@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::event::EventHandler;
 use crate::harness::{self, PendingDelivery};
-use crate::jev::JevClient;
+use crate::jev::{FALLBACK_VERDICT, JevClient, answer_field_or_default, answer_text_or_default};
 use crate::message::Message;
 use crate::opencode::{
     AgentInfo, Event, ModelRef, OpenCode, ProviderModel, ServerInfo, SessionMessage, pick_provider,
@@ -1805,19 +1805,22 @@ impl App {
     }
 
     /// Ask Jev to answer `question` and post the verdict back into `source`'s
-    /// chat. Without a configured Jev client, falls back to a deterministic "yes".
+    /// chat. Without a configured Jev client the deterministic fallback verdict
+    /// is posted in-process — nothing to await, so nothing to spawn.
     fn route_to_jev(&mut self, source: usize, question: String) {
         self.push_to_chat(source, TranscriptRole::Info, format!("🤖 @jev: {question}"));
-        let Some(jev) = self.jev.clone() else {
-            self.push_to_chat(source, TranscriptRole::Assistant, "yes".to_string());
+        if self.jev.is_none() {
+            self.push_to_chat(
+                source,
+                TranscriptRole::Assistant,
+                FALLBACK_VERDICT.to_string(),
+            );
             return;
-        };
+        }
+        let jev = self.jev.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let answer = match jev.answer_text(&question).await {
-                Ok(Some(answer)) => answer,
-                _ => "yes".to_string(),
-            };
+            let answer = answer_text_or_default(jev.as_ref(), &question).await;
             let _ = tx
                 .send(Message::JevAnswer {
                     employee: source,
@@ -2916,14 +2919,7 @@ fn spawn_form_answer(client: OpenCode, jev: Option<JevClient>, event: Event, tx:
         let mut answer = serde_json::Map::with_capacity(request.fields.len());
         let mut chosen: Vec<String> = Vec::with_capacity(request.fields.len());
         for field in &request.fields {
-            let value = match &jev {
-                Some(jev) => match jev.answer_field(field).await {
-                    Ok(Some(value)) => Some(value),
-                    _ => None,
-                },
-                None => None,
-            };
-            let value = value.unwrap_or_else(|| crate::jev::default_answer_field(field));
+            let value = answer_field_or_default(jev.as_ref(), field).await;
             chosen.push(format!("{}={}", field.key, value_label(&value)));
             answer.insert(field.key.clone(), value);
         }
