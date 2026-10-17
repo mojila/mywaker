@@ -1,5 +1,8 @@
 //! Discover the local OpenCode background service and read its credentials.
 
+use std::process::Stdio;
+use std::time::Duration;
+
 use color_eyre::eyre::{Result, WrapErr};
 use reqwest::Url;
 use serde::Deserialize;
@@ -25,6 +28,44 @@ pub async fn discover() -> Result<Option<Url>> {
     }
 
     Ok(None)
+}
+
+/// How long to wait for a freshly started service to answer `service status`.
+const START_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay between readiness polls while the service is starting.
+const START_READY_POLL: Duration = Duration::from_millis(300);
+
+/// Ensure the background service is running, starting it if necessary, and
+/// return its endpoint. When `opencode service status` reports nothing, this
+/// fires `opencode service start` (detached, with nulled stdio so it can't bind
+/// to the alternate screen) and polls until the service advertises an endpoint
+/// or [`START_READY_TIMEOUT`] elapses.
+pub async fn ensure_started() -> Result<Url> {
+    if let Some(url) = discover().await? {
+        return Ok(url);
+    }
+
+    tracing::info!("OpenCode service not running; starting it");
+    // `opencode service start` daemonizes and returns; don't wait on it or let
+    // it inherit the terminal. We just poll `service status` below.
+    let _ = tokio::process::Command::new("opencode")
+        .args(["service", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    let deadline = std::time::Instant::now() + START_READY_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(START_READY_POLL).await;
+        if let Some(url) = discover().await? {
+            return Ok(url);
+        }
+    }
+
+    Err(color_eyre::eyre::eyre!(
+        "OpenCode service did not become ready after start; run `opencode service start` manually"
+    ))
 }
 
 /// The local service password. Combined with the fixed `opencode` username it

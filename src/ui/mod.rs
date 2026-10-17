@@ -20,6 +20,13 @@ use crate::usage::{fmt_bytes, fmt_count};
 
 use robot::{RobotState, render as render_robot};
 
+/// Braille spinner frames shared by the connecting and shutdown indicators.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn spinner_at(frame: u64) -> &'static str {
+    SPINNER[(frame as usize / 2) % SPINNER.len()]
+}
+
 pub fn render(frame: &mut Frame, app: &App) {
     let [title_area, main_area, log_area, help_area] = Layout::vertical([
         Constraint::Length(1),
@@ -33,6 +40,11 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_main(frame, app, main_area);
     render_log(frame, app, log_area);
     render_help(frame, app, help_area);
+
+    if app.is_shutting_down() {
+        render_shutdown(frame, app, frame.area());
+        return;
+    }
 
     if app.show_help() {
         render_help_overlay(frame, frame.area());
@@ -85,8 +97,8 @@ fn connection_line(app: &App) -> Line<'static> {
         ]);
     }
     Line::from(vec![
-        Span::styled("◌ ", Color::Yellow),
-        Span::styled("connecting…".to_string(), Color::Gray),
+        Span::styled(spinner_at(app.frame()).to_string(), Color::Yellow),
+        Span::styled(" connecting…".to_string(), Color::Gray),
     ])
 }
 
@@ -326,4 +338,48 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         .bg(Color::Black)
         .title(" help ".bold().cyan());
     frame.render_widget(Paragraph::new(help_lines()).block(block), popup);
+}
+
+/// A full-screen "shutting down…" overlay with an animated spinner, shown for a
+/// few frames between quit and terminal restore.
+fn render_shutdown(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(Clear, area);
+    let popup = centered(area, 44, 8);
+
+    let spinner = spinner_at(app.shutdown_frame());
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                spinner.to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  shutting down…",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "flushing state…",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Color::DarkGray)
+        .bg(Color::Black)
+        .title(" mywaker ".bold().cyan());
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center),
+        popup,
+    );
 }

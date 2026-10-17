@@ -4,7 +4,7 @@ use tokio::sync::mpsc::Sender;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::event::EventHandler;
@@ -28,6 +28,11 @@ use crate::workflow::{
 
 /// Maximum number of retained status-log lines.
 const LOG_LIMIT: usize = 64;
+
+/// The graceful-shutdown overlay lingers for a few animation frames so the
+/// user sees the app shut down cleanly rather than the screen vanishing.
+const SHUTDOWN_TICK: Duration = Duration::from_millis(80);
+const SHUTDOWN_FRAMES: u64 = 8;
 
 /// Which screen is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +184,11 @@ pub struct App {
     last_event: Option<String>,
     log: Vec<String>,
     frame: u64,
-    should_quit: bool,
+    /// True once quit is requested: the app renders a brief "shutting down"
+    /// overlay (with a spinner), flushes state, then exits.
+    shutting_down: bool,
+    /// Animation frame for the shutdown overlay.
+    shutdown_frame: u64,
 
     /// Projects discovered under the projects root (refreshed on entry).
     projects: Vec<Project>,
@@ -254,7 +263,8 @@ impl App {
             last_event: None,
             log: vec!["connecting to OpenCode…".into()],
             frame: 0,
-            should_quit: false,
+            shutting_down: false,
+            shutdown_frame: 0,
             projects: Vec::new(),
             project_roots: Vec::new(),
             active_project: None,
@@ -300,17 +310,38 @@ impl App {
 
     pub async fn run(&mut self, tui: &mut Tui, mut events: EventHandler) -> Result<()> {
         loop {
+            if self.shutting_down {
+                // Graceful shutdown: animate the overlay for a few frames so
+                // the terminal stays put while state is flushed, then return.
+                self.shutdown_frame = self.shutdown_frame.wrapping_add(1);
+                tui.draw(|frame| ui::render(frame, self))?;
+                if self.shutdown_frame >= SHUTDOWN_FRAMES {
+                    break;
+                }
+                tokio::time::sleep(SHUTDOWN_TICK).await;
+                continue;
+            }
+
             tui.draw(|frame| ui::render(frame, self))?;
 
             let message = events.next().await?;
             self.update(message);
-
-            if self.should_quit {
-                break;
-            }
         }
 
         Ok(())
+    }
+
+    /// Begin graceful shutdown: flush state, stop in-flight work, and let the run
+    /// loop animate the "shutting down" overlay before relinquishing the terminal.
+    fn initiate_shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        self.shutdown_frame = 0;
+        // Stop the current generation (best effort) and force a final store write.
+        self.interrupt_current();
+        self.persist_store();
     }
 
     fn update(&mut self, message: Message) {
@@ -376,7 +407,7 @@ impl App {
                 self.handle_task_attempt(task_id, succeeded, result);
             }
             Message::Log(line) => self.push_log(line),
-            Message::Quit => self.should_quit = true,
+            Message::Quit => self.initiate_shutdown(),
         }
     }
 
@@ -394,7 +425,7 @@ impl App {
                 self.handle_chat_key(key);
                 return;
             }
-            self.should_quit = true;
+            self.initiate_shutdown();
             return;
         }
 
@@ -406,7 +437,7 @@ impl App {
 
         match self.mode {
             Mode::Roster => match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.initiate_shutdown(),
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
                     self.move_selection_stage(-1);
                 }
@@ -2304,6 +2335,16 @@ impl App {
         self.frame
     }
 
+    /// Whether the app is mid graceful-shutdown (rendering the shutdown overlay).
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down
+    }
+
+    /// Shutdown overlay animation frame (driven locally, not by the tick).
+    pub fn shutdown_frame(&self) -> u64 {
+        self.shutdown_frame
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -2571,7 +2612,18 @@ fn build_transcript(messages: &[SessionMessage]) -> Vec<TranscriptLine> {
 pub async fn opencode_background(tx: Sender<Message>, jev: Option<JevClient>) {
     use futures::StreamExt;
 
-    let client = match OpenCode::connect().await {
+    // When no service is running, surface a "starting…" status before connect
+    // (connect_or_start starts the service and blocks until it's ready).
+    let running = matches!(crate::opencode::service::discover().await, Ok(Some(_)));
+    if !running {
+        let _ = tx
+            .send(Message::Log(
+                "OpenCode service not running — starting…".to_string(),
+            ))
+            .await;
+    }
+
+    let client = match OpenCode::connect_or_start().await {
         Ok(client) => client,
         Err(err) => {
             let _ = tx.send(Message::ConnectionFailed(err.to_string())).await;

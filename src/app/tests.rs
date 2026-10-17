@@ -585,6 +585,43 @@ fn renders_projects_mode() {
     terminal.draw(|frame| ui::render(frame, &app)).unwrap();
 }
 
+#[test]
+fn quit_enters_shutdown_state() {
+    let (mut app, _rx) = make_app();
+    assert!(!app.is_shutting_down());
+
+    // A quit message begins graceful shutdown exactly once (idempotent).
+    app.update(Message::Quit);
+    assert!(app.is_shutting_down());
+
+    // A second quit shouldn't reset the shutdown animation frame.
+    app.shutdown_frame = 7;
+    app.update(Message::Quit);
+    assert_eq!(app.shutdown_frame(), 7);
+}
+
+#[test]
+fn renders_shutdown_overlay_without_panicking() {
+    let (mut app, _rx) = make_app();
+    app.update(Message::Quit);
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        text.contains("shutting down"),
+        "shutdown overlay text missing"
+    );
+}
+
 // --- reliability (deadline / retry / abandon) ---
 
 fn stale_pending(instruction: &str, attempts: u8) -> PendingDelivery {

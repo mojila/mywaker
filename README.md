@@ -46,7 +46,9 @@ green done) while the robot avatar mirrors the aggregate state.
 ## Requirements
 
 - Rust `1.88+` (edition 2024)
-- A running OpenCode v2 background service (`opencode service start`)
+- An OpenCode v2 background service. On startup mywaker will start it
+  automatically if it isn't running (`opencode service start`), showing a
+  spinner until it's ready.
 
 ## Install
 
