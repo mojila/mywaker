@@ -117,7 +117,12 @@ definitions are in [`examples/`](examples/):
   `planner` / `researcher` / `writer` / `reviewer` agents as an `opencode.jsonc`
   `agents` block you can drop in or merge.
 - [`examples/agents/*.md`](examples/agents) — the same roles as individual
-  markdown agent files, for the `.opencode/agents/` directory.
+  markdown agent files. Copy them into `~/.config/opencode/agents/` (global,
+  available in every project) or a project's `.opencode/agents/` (project-local).
+
+If an employee's agent id isn't defined anywhere, the employee still starts a
+session — it falls back to OpenCode's default agent (with a note in the log)
+rather than failing with `Agent not found`.
 
 ## Controls
 
