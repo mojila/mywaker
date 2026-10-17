@@ -90,6 +90,31 @@ impl OpenCode {
         Ok(envelope.data)
     }
 
+    /// Create a session for `agent`, falling back to OpenCode's default agent
+    /// when the named agent isn't defined in the project.
+    ///
+    /// Binding an employee to a role-specific agent is a nice-to-have (it gives
+    /// the session a bespoke system prompt); a session must still start when
+    /// that agent hasn't been defined yet. On a `400 Agent not found` this
+    /// retries once without the agent. Returns `(session, used_agent)` — the
+    /// second field is `false` on the fallback path, so callers can surface a
+    /// note instead of a silent downgrade.
+    pub async fn create_session_with_agent_fallback(
+        &self,
+        directory: &str,
+        agent: Option<&str>,
+        model: Option<&ModelRef>,
+    ) -> Result<(SessionInfo, bool)> {
+        match self.create_session(directory, agent, model).await {
+            Ok(session) => Ok((session, true)),
+            Err(err) if agent.is_some() && is_agent_not_found(&err) => {
+                let session = self.create_session(directory, None, model).await?;
+                Ok((session, false))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Fetch the full transcript of a session.
     ///
     /// The endpoint returns messages newest-first by default and pages by an
@@ -270,6 +295,16 @@ fn body_detail(body: &str) -> Option<String> {
         .get("message")
         .and_then(|m| m.as_str())
         .map(str::to_owned)
+}
+
+/// Whether an error means "the named agent doesn't exist" — i.e. we should fall
+/// back to OpenCode's default agent rather than failing the session.
+fn is_agent_not_found(err: &color_eyre::eyre::Report) -> bool {
+    // `{err:#}` prints the full source chain, so the check holds whether the
+    // message is the top error or a wrapped cause.
+    format!("{err:#}")
+        .to_ascii_lowercase()
+        .contains("agent not found")
 }
 
 #[cfg(test)]

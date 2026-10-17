@@ -908,10 +908,25 @@ impl App {
         let model = employee_conf.and_then(|e| e.model_ref());
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = client
-                .create_session(&directory, agent.as_deref(), model.as_ref())
-                .await
-                .map_err(|err| format!("{err:#}"));
+            let created = client
+                .create_session_with_agent_fallback(&directory, agent.as_deref(), model.as_ref())
+                .await;
+
+            let result = match created {
+                Ok((session, true)) => Ok(session),
+                Ok((session, false)) => {
+                    if let Some(agent_name) = agent.as_deref() {
+                        let _ = tx
+                            .send(Message::Log(format!(
+                                "agent '{agent_name}' not defined — using OpenCode's default agent"
+                            )))
+                            .await;
+                    }
+                    Ok(session)
+                }
+                Err(err) => Err(format!("{err:#}")),
+            };
+
             let _ = tx.send(Message::SessionCreated { employee, result }).await;
         });
     }
@@ -2453,8 +2468,8 @@ async fn run_task_attempt(
     goal: &str,
     attempts: u8,
 ) -> Result<String, String> {
-    let session = client
-        .create_session(directory, agent, model)
+    let (session, _used_agent) = client
+        .create_session_with_agent_fallback(directory, agent, model)
         .await
         .map_err(|err| format!("session failed: {err:#}"))?;
     let session_id = session.id;

@@ -9,16 +9,20 @@ use std::sync::{Arc, Mutex};
 use axum::{
     Json, Router,
     extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use mywaker::opencode::OpenCode;
 use reqwest::Url;
 use serde_json::{Value, json};
 
-/// Shared fake-server state: the prompts it has received, in order.
+/// Shared fake-server state: the prompts and requested session agents it has
+/// received, in order.
 #[derive(Clone, Default)]
 struct FakeState {
     prompts: Arc<Mutex<Vec<String>>>,
+    session_agents: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 async fn info() -> Json<Value> {
@@ -35,8 +39,24 @@ async fn agents() -> Json<Value> {
     }))
 }
 
-async fn create_session() -> Json<Value> {
-    Json(json!({ "data": { "id": "ses_test", "title": "fake session" } }))
+async fn create_session(State(state): State<FakeState>, Json(body): Json<Value>) -> Response {
+    let agent = body.get("agent").and_then(Value::as_str).map(str::to_owned);
+
+    // Simulate a project that defined agents for everyone except "missing".
+    if agent.as_deref() == Some("missing") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Agent not found: missing" })),
+        )
+            .into_response();
+    }
+
+    state.session_agents.lock().unwrap().push(agent);
+    (
+        StatusCode::OK,
+        Json(json!({ "data": { "id": "ses_test", "title": "fake session" } })),
+    )
+        .into_response()
 }
 
 async fn prompt(
@@ -150,4 +170,37 @@ async fn wait_endpoint_is_accepted() {
     client.create_session("/work", None, None).await.unwrap();
     // The experimental wait endpoint can drift; here it is served and accepted.
     assert!(client.wait("ses_test").await.is_ok());
+}
+
+#[tokio::test]
+async fn missing_agent_falls_back_to_default() {
+    let (client, state) = start_server().await;
+
+    // "missing" is not a defined agent: the server rejects it, and the client
+    // must retry without the agent so the session still starts.
+    let (session, used_agent) = client
+        .create_session_with_agent_fallback("/work", Some("missing"), None)
+        .await
+        .unwrap();
+    assert_eq!(session.id, "ses_test");
+    assert!(!used_agent, "fallback path should report the downgrade");
+
+    // The server saw the rejected agent first, then a session with no agent.
+    let agents = state.session_agents.lock().unwrap();
+    assert_eq!(agents.as_slice(), [None]);
+}
+
+#[tokio::test]
+async fn defined_agent_binds_directly() {
+    let (client, state) = start_server().await;
+
+    let (session, used_agent) = client
+        .create_session_with_agent_fallback("/work", Some("researcher"), None)
+        .await
+        .unwrap();
+    assert_eq!(session.id, "ses_test");
+    assert!(used_agent, "defined agent should bind on the first try");
+
+    let agents = state.session_agents.lock().unwrap();
+    assert_eq!(agents.as_slice(), [Some("researcher".to_string())]);
 }
