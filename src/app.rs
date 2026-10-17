@@ -1,6 +1,8 @@
 use color_eyre::eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::Sender;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -209,8 +211,12 @@ pub struct App {
     mode: Mode,
     chat_employee: Option<usize>,
     input: String,
-    /// Cursor position within `input`, in characters (0..=len).
+    /// Cursor position within `input`, in grapheme clusters (0..=len).
     input_cursor: usize,
+    /// Horizontal scroll offset for the input line, in display columns: how far
+    /// the input body has been scrolled right to keep the cursor in view when
+    /// the prompt overflows the terminal width.
+    input_scroll: usize,
     /// Last known terminal size, for page-scroll estimation.
     last_size: (u16, u16),
     /// Per-employee chat state, keyed by roster index.
@@ -276,6 +282,7 @@ impl App {
             chat_employee: None,
             input: String::new(),
             input_cursor: 0,
+            input_scroll: 0,
             last_size: (80, 24),
             chats: HashMap::new(),
             command_menu: None,
@@ -351,7 +358,10 @@ impl App {
                 self.tick_reliability();
                 self.metrics.refresh();
             }
-            Message::Resize(w, h) => self.last_size = (w, h),
+            Message::Resize(w, h) => {
+                self.last_size = (w, h);
+                self.follow_input_cursor();
+            }
             Message::Key(key) => self.handle_key(key),
             Message::Paste(text) => self.handle_paste(&text),
             Message::Connected { client, info } => {
@@ -622,105 +632,153 @@ impl App {
         if option.takes_arg {
             self.input.push(' ');
         }
+        self.input_cursor = self.grapheme_len();
+        self.input_scroll = 0;
         self.command_menu = None;
     }
 
     // --- input editing (cursor-based line editor) ---
 
-    /// Byte offset of the cursor within `self.input`, at a char boundary.
+    /// Byte offset of the cursor within `self.input`, at a grapheme-cluster
+    /// (hence char) boundary.
     fn input_byte_offset(&self) -> usize {
         self.input
-            .char_indices()
+            .grapheme_indices(true)
             .nth(self.input_cursor)
             .map(|(i, _)| i)
             .unwrap_or(self.input.len())
     }
 
-    /// Char boundaries of `self.input` (len + 1 elements, both ends included).
-    fn char_boundaries(&self) -> Vec<usize> {
-        let mut v: Vec<usize> = self.input.char_indices().map(|(i, _)| i).collect();
+    /// Byte offsets of every grapheme-cluster boundary in `self.input`
+    /// (len + 1 elements, both ends included).
+    fn grapheme_boundaries(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.input.grapheme_indices(true).map(|(i, _)| i).collect();
         v.push(self.input.len());
         v
     }
 
+    /// The number of grapheme clusters in `self.input`.
+    fn grapheme_len(&self) -> usize {
+        self.input.graphemes(true).count()
+    }
+
+    /// Clamp the cursor into `0..=grapheme_len` as a defensive bound.
+    fn clamp_cursor(&mut self) {
+        let len = self.grapheme_len();
+        if self.input_cursor > len {
+            self.input_cursor = len;
+        }
+    }
+
+    /// Display columns available for the input body — the prompt (`> `) and the
+    /// panel's two side borders aside — derived from the terminal width.
+    fn input_body_width(&self) -> usize {
+        (self.last_size.0 as usize).saturating_sub(4)
+    }
+
+    /// Keep the input horizontally scrolled so the cursor stays within the body
+    /// window. Called after the input or cursor changes, and on resize.
+    fn follow_input_cursor(&mut self) {
+        let width = self.input_body_width();
+        if width == 0 {
+            self.input_scroll = 0;
+            return;
+        }
+        let cursor_col = self.input[..self.input_byte_offset()].width();
+        if cursor_col >= self.input_scroll + width {
+            self.input_scroll = cursor_col + 1 - width;
+        } else if cursor_col < self.input_scroll {
+            self.input_scroll = cursor_col;
+        }
+    }
+
     fn cursor_left(&mut self) {
         self.input_cursor = self.input_cursor.saturating_sub(1);
+        self.follow_input_cursor();
     }
 
     fn cursor_right(&mut self) {
-        if self.input_cursor < self.input.chars().count() {
+        self.clamp_cursor();
+        if self.input_cursor < self.grapheme_len() {
             self.input_cursor += 1;
         }
+        self.follow_input_cursor();
     }
 
     fn cursor_home(&mut self) {
         self.input_cursor = 0;
+        self.follow_input_cursor();
     }
 
     fn cursor_end(&mut self) {
-        self.input_cursor = self.input.chars().count();
+        self.input_cursor = self.grapheme_len();
+        self.follow_input_cursor();
     }
 
     fn input_insert(&mut self, c: char) {
         let at = self.input_byte_offset();
         self.input.insert(at, c);
-        self.input_cursor += 1;
+        // Place the cursor just past the inserted char: if it merged with the
+        // preceding cluster (a combining mark), the cursor sits at that cluster's
+        // end rather than overrunning the grapheme count.
+        self.input_cursor = self
+            .input
+            .grapheme_indices(true)
+            .take_while(|(i, _)| *i <= at)
+            .count();
         self.reset_hist_navigation();
+        self.follow_input_cursor();
     }
 
     fn input_delete_backward(&mut self) {
+        self.clamp_cursor();
         if self.input_cursor == 0 {
             return;
         }
-        let bounds = self.char_boundaries();
+        let bounds = self.grapheme_boundaries();
         let start = bounds[self.input_cursor - 1];
         let end = bounds[self.input_cursor];
         self.input.replace_range(start..end, "");
         self.input_cursor -= 1;
         self.reset_hist_navigation();
+        self.follow_input_cursor();
     }
 
     fn input_delete_forward(&mut self) {
-        if self.input_cursor >= self.input.chars().count() {
+        self.clamp_cursor();
+        if self.input_cursor >= self.grapheme_len() {
             return;
         }
-        let bounds = self.char_boundaries();
+        let bounds = self.grapheme_boundaries();
         let start = bounds[self.input_cursor];
         let end = bounds[self.input_cursor + 1];
         self.input.replace_range(start..end, "");
         self.reset_hist_navigation();
+        self.follow_input_cursor();
     }
 
     fn input_delete_word(&mut self) {
-        let mut c = self.input_cursor;
-        while c > 0
-            && self
-                .input
-                .chars()
-                .nth(c - 1)
-                .is_some_and(|ch| ch.is_whitespace())
-        {
+        let graphemes: Vec<&str> = self.input.graphemes(true).collect();
+        let is_space = |g: &str| g.chars().all(char::is_whitespace);
+        let mut c = self.input_cursor.min(graphemes.len());
+        while c > 0 && is_space(graphemes[c - 1]) {
             c -= 1;
         }
-        while c > 0
-            && self
-                .input
-                .chars()
-                .nth(c - 1)
-                .is_some_and(|ch| !ch.is_whitespace())
-        {
+        while c > 0 && !is_space(graphemes[c - 1]) {
             c -= 1;
         }
-        let bounds = self.char_boundaries();
+        let bounds = self.grapheme_boundaries();
         let start = bounds[c];
-        let end = bounds[self.input_cursor];
+        let end = bounds[self.input_cursor.min(graphemes.len())];
         self.input.replace_range(start..end, "");
         self.input_cursor = c;
         self.reset_hist_navigation();
         self.sync_command_menu();
+        self.follow_input_cursor();
     }
 
     fn input_delete_to_start(&mut self) {
+        self.clamp_cursor();
         if self.input_cursor == 0 {
             return;
         }
@@ -729,6 +787,7 @@ impl App {
         self.input_cursor = 0;
         self.reset_hist_navigation();
         self.sync_command_menu();
+        self.follow_input_cursor();
     }
 
     /// Insert a bracketed paste into the input at the cursor.
@@ -738,9 +797,10 @@ impl App {
         }
         let at = self.input_byte_offset();
         self.input.insert_str(at, text);
-        self.input_cursor += text.chars().count();
+        self.input_cursor += text.graphemes(true).count();
         self.reset_hist_navigation();
         self.sync_command_menu();
+        self.follow_input_cursor();
     }
 
     // --- history recall ---
@@ -769,8 +829,9 @@ impl App {
                 self.input = chat.history[next].clone();
             }
         }
-        self.input_cursor = self.input.chars().count();
+        self.input_cursor = self.input.graphemes(true).count();
         self.command_menu = None;
+        self.follow_input_cursor();
     }
 
     fn history_down(&mut self) {
@@ -791,8 +852,9 @@ impl App {
             chat.hist_index = None;
             self.input = std::mem::take(&mut chat.history_draft);
         }
-        self.input_cursor = self.input.chars().count();
+        self.input_cursor = self.input.graphemes(true).count();
         self.command_menu = None;
+        self.follow_input_cursor();
     }
 
     /// Clear history navigation on the first fresh edit after a recall.
@@ -864,6 +926,7 @@ impl App {
         };
         self.input.clear();
         self.input_cursor = 0;
+        self.input_scroll = 0;
         self.command_menu = None;
         self.team.set_last_task(employee, None);
         // Drop the old session binding and start a fresh one (same worker).
@@ -891,6 +954,7 @@ impl App {
         self.chat_employee = Some(employee);
         self.input.clear();
         self.input_cursor = 0;
+        self.input_scroll = 0;
         self.command_menu = None;
 
         let chat = self.chats.entry(employee).or_default();
@@ -1009,6 +1073,7 @@ impl App {
         }
         self.input.clear();
         self.input_cursor = 0;
+        self.input_scroll = 0;
         self.command_menu = None;
 
         // Chat-local slash commands are handled here and never sent to the
@@ -1318,6 +1383,7 @@ impl App {
         self.chat_employee = None;
         self.input.clear();
         self.input_cursor = 0;
+        self.input_scroll = 0;
         self.command_menu = None;
         // Leave the chat state (session + transcript) intact so re-entering the
         // same employee resumes the conversation instead of starting fresh.
@@ -2358,9 +2424,15 @@ impl App {
         &self.input
     }
 
-    /// Cursor position within the input, in characters (0..=len).
+    /// Cursor position within the input, in grapheme clusters (0..=len).
     pub fn input_cursor(&self) -> usize {
         self.input_cursor
+    }
+
+    /// Horizontal scroll offset for the input line, in display columns (how far
+    /// the input body has scrolled right to keep the cursor in view).
+    pub fn input_scroll(&self) -> usize {
+        self.input_scroll
     }
 
     pub fn transcript(&self) -> &[TranscriptLine] {

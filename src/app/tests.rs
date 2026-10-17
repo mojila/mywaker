@@ -855,3 +855,96 @@ fn renders_help_overlay_without_panicking() {
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| ui::render(frame, &app)).unwrap();
 }
+
+// --- grapheme-safe editing ---
+
+/// Backspace removes a whole grapheme cluster — a family emoji is many code
+/// points joined by ZWJ but is a single cluster and deletes as one.
+#[test]
+fn backspace_removes_whole_grapheme_cluster() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+
+    app.input = "a👨‍👩‍👧‍👦b".into();
+    app.cursor_end();
+    assert_eq!(app.input_cursor(), 3); // "a", family, "b"
+
+    app.input_delete_backward();
+    assert_eq!(app.input, "a👨‍👩‍👧‍👦");
+
+    app.input_delete_backward();
+    assert_eq!(app.input, "a");
+    assert_eq!(app.input_cursor(), 1);
+}
+
+/// The cursor moves by cluster, not by code point (🇺🇸 is two code points).
+#[test]
+fn cursor_navigates_by_grapheme_cluster() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+
+    app.input = "👍🇺🇸".into(); // 👍 (1 cluster) + 🇺🇸 (1 cluster)
+
+    app.cursor_end();
+    assert_eq!(app.input_cursor(), 2, "two clusters, not three code points");
+
+    app.cursor_left();
+    assert_eq!(app.input_cursor(), 1);
+    app.cursor_left();
+    assert_eq!(app.input_cursor(), 0);
+}
+
+#[test]
+fn forward_delete_removes_whole_grapheme_cluster() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+
+    app.input = "👍🇺🇸".into();
+    app.cursor_home();
+    app.input_delete_forward();
+    assert_eq!(app.input, "🇺🇸");
+}
+
+/// Inserting a combining mark merges it with the preceding cluster; the cursor
+/// follows the cluster rather than overrunning the grapheme count.
+#[test]
+fn combining_char_insert_tracks_merged_cluster() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+
+    app.input_insert('a');
+    app.input_insert('b');
+    assert_eq!(app.input_cursor(), 2);
+
+    app.cursor_left();
+    app.input_insert('\u{301}'); // merges with 'a' → "á"
+    assert_eq!(app.input, "a\u{301}b");
+    assert_eq!(
+        app.input_cursor(),
+        1,
+        "cursor sits at the merged cluster's end"
+    );
+
+    app.input_delete_backward();
+    assert_eq!(app.input, "b");
+    assert_eq!(app.input_cursor(), 0);
+}
+
+// --- input horizontal scroll ---
+
+#[test]
+fn input_scroll_follows_cursor_horizontally() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.last_size = (8, 24); // 4 display columns for the input body
+
+    for c in "abcdefgh".chars() {
+        app.input_insert(c);
+    }
+    assert_eq!(app.input_cursor(), 8);
+    // The cursor (column 8) is past the 4-column window → scrolled to keep it in.
+    assert_eq!(app.input_scroll, 8 + 1 - 4);
+
+    app.cursor_home();
+    assert_eq!(app.input_scroll, 0);
+}
