@@ -187,8 +187,11 @@ pub struct App {
     project_selected: usize,
     /// Models available through OpenCode's providers, for the model picker.
     models: Vec<ProviderModel>,
-    /// Selection index in the model picker list.
+    /// Selection index in the model picker list (indexed into
+    /// [`Self::filtered_models`]).
     model_selected: usize,
+    /// Search query filtering the model picker list.
+    model_filter: String,
 
     mode: Mode,
     chat_employee: Option<usize>,
@@ -248,6 +251,7 @@ impl App {
             project_selected: 0,
             models: Vec::new(),
             model_selected: 0,
+            model_filter: String::new(),
             mode: Mode::Roster,
             chat_employee: None,
             input: String::new(),
@@ -331,7 +335,9 @@ impl App {
             Message::ModelsLoaded(models) => {
                 self.push_log(format!("{} models available", models.len()));
                 self.models = models;
-                self.model_selected = self.model_selected.min(self.models.len().saturating_sub(1));
+                self.model_selected = self
+                    .model_selected
+                    .min(self.filtered_models().len().saturating_sub(1));
             }
             Message::JevAnswer { employee, answer } => {
                 self.push_to_chat(employee, TranscriptRole::Assistant, answer);
@@ -381,15 +387,25 @@ impl App {
                 _ => {}
             },
             Mode::Models => match key.code {
-                KeyCode::Esc => self.mode = Mode::Roster,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.model_selected =
-                        move_selection(self.model_selected, -1, self.models.len());
+                KeyCode::Esc => {
+                    self.model_filter.clear();
+                    self.mode = Mode::Roster;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.model_selected = move_selection(self.model_selected, 1, self.models.len());
+                KeyCode::Up => {
+                    self.model_selected =
+                        move_selection(self.model_selected, -1, self.filtered_models().len());
+                }
+                KeyCode::Down => {
+                    self.model_selected =
+                        move_selection(self.model_selected, 1, self.filtered_models().len());
                 }
                 KeyCode::Enter => self.assign_selected_model(),
+                KeyCode::Backspace => self.edit_model_filter(None),
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.model_filter.clear();
+                    self.model_selected = 0;
+                }
+                KeyCode::Char(c) => self.edit_model_filter(Some(c)),
                 _ => {}
             },
             Mode::Chat => self.handle_chat_key(key),
@@ -1880,6 +1896,7 @@ impl App {
             return;
         }
         self.model_selected = 0;
+        self.model_filter.clear();
         self.mode = Mode::Models;
         self.load_models();
     }
@@ -1905,10 +1922,54 @@ impl App {
         });
     }
 
+    /// Edit the model-picker search query: `Some(c)` appends a character,
+    /// `None` pops the last one. Resets the highlight to the first match.
+    fn edit_model_filter(&mut self, ch: Option<char>) {
+        match ch {
+            Some(c) => self.model_filter.push(c),
+            None => {
+                self.model_filter.pop();
+            }
+        }
+        self.model_selected = 0;
+    }
+
+    /// Indices into [`Self::models`] matching the picker's search query — a
+    /// trimmed, case-insensitive substring across the id, display name, provider
+    /// id, and vendor (the id's first path segment). An empty query returns
+    /// every model in original order.
+    pub fn filtered_models(&self) -> Vec<usize> {
+        let query = self.model_filter.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return (0..self.models.len()).collect();
+        }
+        self.models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, model)| {
+                let name = model.name.as_deref().unwrap_or_default();
+                let provider = model.provider_id.as_deref().unwrap_or_default();
+                let vendor = model.vendor();
+                let haystack = format!("{} {} {} {}", model.id, name, provider, vendor);
+                haystack
+                    .to_ascii_lowercase()
+                    .contains(&query)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    /// The model id currently highlighted, resolving the filtered picker index
+    /// back to the underlying catalog entry.
+    fn selected_model_id(&self) -> Option<String> {
+        let index = *self.filtered_models().get(self.model_selected)?;
+        self.models.get(index).map(|model| model.id.clone())
+    }
+
     /// Assign the highlighted model to the currently selected employee,
     /// persisting the roster and returning to the dashboard.
     fn assign_selected_model(&mut self) {
-        let Some(model) = self.models.get(self.model_selected).map(|m| m.id.clone()) else {
+        let Some(model) = self.selected_model_id() else {
             return;
         };
         let employee = self.selected;
@@ -2094,6 +2155,10 @@ impl App {
 
     pub fn model_selected(&self) -> usize {
         self.model_selected
+    }
+
+    pub fn model_filter(&self) -> &str {
+        &self.model_filter
     }
 
     pub fn chat_employee_name(&self) -> Option<&str> {

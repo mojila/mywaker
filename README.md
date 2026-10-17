@@ -132,7 +132,8 @@ assigned model 'openai/gpt-6-luna-pro' to 'writer'
 ```
 
 In the TUI, press `m` on the roster to open the picker, highlight a model, and
-press `Enter` to assign it to the selected employee.
+press `Enter` to assign it to the selected employee. Type to filter the list by
+id, name, provider, or vendor (`Ctrl-U` clears the query, `Esc` returns).
 
 ### Optional Jev answerer
 

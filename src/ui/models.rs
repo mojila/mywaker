@@ -1,6 +1,6 @@
 //! The model picker — browse the models exposed by OpenCode's providers and
 //! assign one to the selected employee (persisted to team.toml and applied to
-//! that employee's next session).
+//! that employee's next session). The list is filterable by typing a query.
 
 use ratatui::{
     Frame,
@@ -13,8 +13,12 @@ use ratatui::{
 use crate::app::App;
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let [header_area, list_area] =
-        Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
+    let [header_area, search_area, list_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
 
     let employee = app.team().employees().get(app.selected());
     let employee_name = employee.map(|e| e.name.as_str()).unwrap_or("employee");
@@ -33,10 +37,35 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     ]));
     frame.render_widget(header, header_area);
 
+    let matches = app.filtered_models().len();
+    let total = app.models().len();
+    let search = Paragraph::new(Line::from(vec![
+        Span::styled(" search ", Color::Cyan),
+        Span::styled(app.model_filter().to_string(), Color::Yellow),
+        Span::styled("▏", Color::DarkGray),
+        Span::styled(format!("  ({matches}/{total})"), Color::DarkGray),
+    ]));
+    frame.render_widget(search, search_area);
+
+    if total == 0 {
+        let empty = Paragraph::new(Line::from(vec![Span::styled(
+            "no models — make sure OpenCode has providers configured".to_string(),
+            Color::DarkGray,
+        )]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" models ".bold().cyan()),
+        );
+        frame.render_widget(empty, list_area);
+        return;
+    }
+
     let items: Vec<ListItem> = app
-        .models()
+        .filtered_models()
         .iter()
-        .map(|model| {
+        .map(|&index| {
+            let model = &app.models()[index];
             let active = assigned == Some(model.id.as_str());
             let name = model.name.clone().unwrap_or_default();
             let provider = model.provider_id.clone().unwrap_or_else(|| model.vendor());
@@ -63,7 +92,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     if items.is_empty() {
         let empty = Paragraph::new(Line::from(vec![Span::styled(
-            "no models — make sure OpenCode has providers configured".to_string(),
+            format!("no models match \"{}\"", app.model_filter()),
             Color::DarkGray,
         )]))
         .block(

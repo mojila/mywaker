@@ -672,3 +672,113 @@ fn abandoned_worker_still_aggregates_fanout() {
     assert!(outbox[0].contains("no deliverable")); // worker 0's ⚠
     assert!(outbox[0].contains("Draft copy."));
 }
+
+// --- model picker search ---
+
+/// Build a minimal [`ProviderModel`] for filtering tests.
+fn model(id: &str, name: &str, provider: &str) -> ProviderModel {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "name": name,
+        "providerID": provider,
+    }))
+    .unwrap()
+}
+
+/// The search query filters case-insensitively across id, name, provider id,
+/// and vendor (the id's first path segment); an empty query lists everything.
+#[test]
+fn model_picker_filter_matches_id_name_provider_vendor() {
+    let (mut app, _rx) = make_app();
+    app.models = vec![
+        model("openrouter/gpt-5-wrap", "GPT-5", "openrouter"),
+        model("meta/muse-spark-open", "Muse Spark Open", "openrouter"),
+        model("kenari/deepseek-v4", "DeepSeek V4", "kenari"),
+    ];
+
+    // Empty query → every model, in order.
+    assert_eq!(app.filtered_models(), vec![0, 1, 2]);
+
+    // Case-insensitive match on the id.
+    app.model_filter = "MUSE".into();
+    assert_eq!(app.filtered_models(), vec![1]);
+
+    // Provider id and vendor are searchable too.
+    app.model_filter = "kenari".into();
+    assert_eq!(app.filtered_models(), vec![2]);
+    app.model_filter = "meta".into();
+    assert_eq!(app.filtered_models(), vec![1]);
+
+    // Display name.
+    app.model_filter = "deepseek".into();
+    assert_eq!(app.filtered_models(), vec![2]);
+
+    // Whitespace is trimmed; no match yields an empty set.
+    app.model_filter = "  zzz  ".into();
+    assert!(app.filtered_models().is_empty());
+}
+
+/// Typing filters immediately and lands the highlight on the first match;
+/// assignment resolves through the filtered index back to the catalog entry.
+#[test]
+fn model_picker_search_resets_selection_and_resolves_assignment() {
+    let (mut app, _rx) = make_app();
+    app.models = vec![
+        model("kenari/deepseek-v4", "DeepSeek V4", "kenari"),
+        model("meta/muse-spark-open", "Muse Spark Open", "openrouter"),
+    ];
+    app.mode = Mode::Models;
+
+    for c in "muse".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert_eq!(app.model_filter, "muse");
+    assert_eq!(app.filtered_models(), vec![1]);
+    assert_eq!(app.model_selected, 0, "highlight resets to first match");
+
+    // The highlighted entry resolves to the filtered model, not index 0.
+    assert_eq!(
+        app.selected_model_id().as_deref(),
+        Some("meta/muse-spark-open")
+    );
+
+    // Backspace shrinks the query; the match set stays the same here.
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(app.model_filter, "mu");
+    assert_eq!(app.filtered_models(), vec![1]);
+
+    // Ctrl-U clears the query, restoring the full list.
+    app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert_eq!(app.model_filter, "");
+    assert_eq!(app.filtered_models(), vec![0, 1]);
+}
+
+/// Esc leaves the picker and clears the query.
+#[test]
+fn model_picker_esc_clears_filter_and_returns() {
+    let (mut app, _rx) = make_app();
+    app.mode = Mode::Models;
+    app.model_filter = "claude".into();
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_eq!(app.model_filter, "");
+    assert_eq!(app.mode, Mode::Roster);
+}
+
+/// A fresh model list clamps the selection to the (filtered) range.
+#[test]
+fn models_loaded_clamps_selection_to_filtered_range() {
+    let (mut app, _rx) = make_app();
+    app.model_selected = 10;
+    app.model_filter = "muse".into();
+
+    app.update(Message::ModelsLoaded(vec![model(
+        "meta/muse-spark-open",
+        "Muse Spark Open",
+        "openrouter",
+    )]));
+
+    assert_eq!(app.model_selected, 0);
+}
