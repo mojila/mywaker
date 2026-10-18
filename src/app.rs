@@ -3419,6 +3419,9 @@ fn spawn_form_answer(client: OpenCode, jev: Option<JevClient>, event: Event, tx:
                 .await;
             return;
         };
+        // A global form (`sessionID: "global"`) is location-scoped; the reply
+        // must name its location so the server consults the right store.
+        let directory = event.location.as_ref().map(|loc| loc.directory.clone());
 
         let mut answer = serde_json::Map::with_capacity(request.fields.len());
         let mut chosen: Vec<String> = Vec::with_capacity(request.fields.len());
@@ -3428,7 +3431,10 @@ fn spawn_form_answer(client: OpenCode, jev: Option<JevClient>, event: Event, tx:
             answer.insert(field.key.clone(), value);
         }
 
-        match client.reply_form(&session_id, &form_id, &answer).await {
+        match client
+            .reply_form(&session_id, &form_id, &answer, directory.as_deref())
+            .await
+        {
             Ok(()) => {
                 let _ = tx
                     .send(Message::Log(format!(

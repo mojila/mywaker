@@ -2474,16 +2474,29 @@ async fn form_created_is_answered_from_the_nested_payload() {
     /// Records each form reply the fake OpenCode service receives.
     #[derive(Clone, Default)]
     struct Recorder {
-        replies: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
+        replies: Arc<Mutex<Vec<RecordedReply>>>,
     }
+
+    /// `(session, form, body, x-opencode-directory)` per reply.
+    type RecordedReply = (String, String, serde_json::Value, Option<String>);
 
     async fn reply(
         State(recorder): State<Recorder>,
         Path((session, form)): Path<(String, String)>,
+        headers: axum::http::HeaderMap,
         Json(body): Json<serde_json::Value>,
-    ) -> Json<serde_json::Value> {
-        recorder.replies.lock().unwrap().push((session, form, body));
-        Json(serde_json::json!({}))
+    ) -> axum::http::StatusCode {
+        let directory = headers
+            .get("x-opencode-directory")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        recorder
+            .replies
+            .lock()
+            .unwrap()
+            .push((session, form, body, directory));
+        // The live endpoint settles the form with `204 No Content`.
+        axum::http::StatusCode::NO_CONTENT
     }
 
     let recorder = Recorder::default();
@@ -2539,9 +2552,104 @@ async fn form_created_is_answered_from_the_nested_payload() {
     assert_eq!(replies.len(), 1, "exactly one reply");
     assert_eq!(replies[0].0, "ses_1");
     assert_eq!(replies[0].1, "frm_123");
+    // A session-scoped form needs no location header.
+    assert_eq!(replies[0].3, None);
     let answer = &replies[0].2["answer"];
     // No Jev client → the deterministic defaults apply (boolean → true, the
     // first option for an option field).
     assert_eq!(answer["confirm"], serde_json::json!(true));
     assert_eq!(answer["choice"], serde_json::json!("a"));
+}
+
+/// A *global* `form.created` (`sessionID: "global"`) is answered with the
+/// `x-opencode-directory` header naming the event's location. OpenCode's global
+/// form store is location-scoped; without the header the server falls back to
+/// its own cwd and 404s (`FormNotFoundError`) — the live failure this guards.
+#[tokio::test]
+async fn global_form_is_answered_with_its_location_header() {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Path, State};
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    #[derive(Clone, Default)]
+    struct Recorder {
+        replies: Arc<Mutex<Vec<RecordedReply>>>,
+    }
+
+    /// `(session, form, x-opencode-directory)` per reply.
+    type RecordedReply = (String, String, Option<String>);
+
+    async fn reply(
+        State(recorder): State<Recorder>,
+        Path((session, form)): Path<(String, String)>,
+        headers: axum::http::HeaderMap,
+        Json(_body): Json<serde_json::Value>,
+    ) -> axum::http::StatusCode {
+        let directory = headers
+            .get("x-opencode-directory")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        recorder
+            .replies
+            .lock()
+            .unwrap()
+            .push((session, form, directory));
+        axum::http::StatusCode::NO_CONTENT
+    }
+
+    let recorder = Recorder::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route("/api/session/{session}/form/{form}/reply", post(reply))
+        .with_state(recorder.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = OpenCode::with_base(
+        reqwest::Url::parse(&format!("http://{addr}")).unwrap(),
+        "pw",
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(16);
+
+    // A live-shaped global form: `sessionID` is the literal "global" and the
+    // event carries the owning location.
+    let event: Event = serde_json::from_str(
+        r#"{"id":"evt_1","created":1792293021060,"type":"form.created",
+            "location":{"directory":"/Users/me/Projects/app"},
+            "data":{"form":{"id":"frm_9","sessionID":"global",
+                "title":"Proceed?",
+                "fields":[{"key":"confirm","title":"Proceed?","type":"boolean"}]}}}"#,
+    )
+    .unwrap();
+
+    spawn_form_answer(client, None, event, tx);
+
+    let mut log = String::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(Message::Log(line))) if line.starts_with("answered form") => {
+                log = line;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        log.contains("answered form"),
+        "no answer was logged: {log:?}"
+    );
+
+    let replies = recorder.replies.lock().unwrap();
+    assert_eq!(replies.len(), 1, "exactly one reply");
+    assert_eq!(replies[0].0, "global");
+    assert_eq!(replies[0].1, "frm_9");
+    // `/` percent-encodes to `%2F`, matching OpenCode's own `encodeURIComponent`.
+    assert_eq!(
+        replies[0].2.as_deref(),
+        Some("%2FUsers%2Fme%2FProjects%2Fapp")
+    );
 }

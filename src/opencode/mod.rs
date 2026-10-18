@@ -16,6 +16,10 @@ pub use models::{
 /// The fixed username OpenCode's local server expects in its `Basic` auth.
 const AUTH_USER: &str = "opencode";
 
+/// The session id OpenCode records a *global* form under. A global form isn't
+/// bound to a session; its store is keyed by the location that owns it.
+const GLOBAL_FORM_SESSION: &str = "global";
+
 /// Build the base64 `Authorization: Basic` credential for the local service.
 fn basic_auth(password: &str) -> String {
     use base64::Engine;
@@ -184,15 +188,44 @@ impl OpenCode {
     /// `answer` maps each field's `key` to its typed value (`Form.Answer`,
     /// i.e. `{ "<key>": <string|number|boolean|string[]> }`). After this the
     /// session resumes its turn.
+    ///
+    /// `directory` is the location the form belongs to (the `location.directory`
+    /// of the `form.created` event). It is consulted only for a *global* form
+    /// (`session_id == "global"`), whose store is location-scoped: OpenCode
+    /// resolves it from the `x-opencode-directory` header and otherwise falls
+    /// back to the service's own cwd, so a reply for a global form created in
+    /// another project 404s (`FormNotFoundError`) without it.
     pub async fn reply_form(
         &self,
         session_id: &str,
         form_id: &str,
         answer: &serde_json::Map<String, serde_json::Value>,
+        directory: Option<&str>,
     ) -> Result<()> {
         let body = serde_json::json!({ "answer": answer });
         let path = format!("/api/session/{session_id}/form/{form_id}/reply");
-        let _: serde_json::Value = self.post_json(&path, &body).await?;
+        let mut request = self
+            .http
+            .post(self.url(&path)?)
+            .header("authorization", &self.auth);
+        if session_id == GLOBAL_FORM_SESSION
+            && let Some(directory) = directory
+        {
+            request = request.header("x-opencode-directory", encode_directory(directory));
+        }
+        // A settled form answers `204 No Content`, so only the status is
+        // meaningful — decoding the (empty) body would fail.
+        let response = request
+            .json(&body)
+            .send()
+            .await
+            .wrap_err_with(|| format!("POST {path}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(http_status_error("POST", &path, status, &body));
+        }
         Ok(())
     }
 
@@ -256,6 +289,28 @@ impl OpenCode {
     fn url(&self, path: &str) -> Result<Url> {
         self.base.join(path).wrap_err("invalid request path")
     }
+}
+
+/// Percent-encode a directory the way OpenCode's own client does
+/// (`encodeURIComponent`): everything outside `A–Z a–z 0–9 - _ . ! ~ * ' ( )`
+/// is escaped, multi-byte UTF-8 one `%XX` per byte. The server reverses it with
+/// `decodeURIComponent` when it resolves a global form's location.
+fn encode_directory(directory: &str) -> String {
+    let mut out = String::with_capacity(directory.len());
+    for byte in directory.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            );
+        if unreserved {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Build the `POST /api/session` request body. The `model` field must be a
@@ -351,6 +406,21 @@ mod tests {
         let minimal = session_body("/x", None, None);
         assert!(minimal.get("model").is_none());
         assert!(minimal.get("agent").is_none());
+    }
+
+    /// The directory header mirrors OpenCode's own `encodeURIComponent`: path
+    /// separators and spaces escape, unreserved characters pass through.
+    #[test]
+    fn encode_directory_matches_encode_uri_component() {
+        assert_eq!(
+            encode_directory("/Users/me/Projects/app"),
+            "%2FUsers%2Fme%2FProjects%2Fapp"
+        );
+        assert_eq!(encode_directory("a b"), "a%20b");
+        // `! ~ * ' ( )` are unreserved for `encodeURIComponent` and pass through.
+        assert_eq!(encode_directory("a-b_c.d~e!f*g'h(i)"), "a-b_c.d~e!f*g'h(i)");
+        // A literal `%` must escape, since the server `decodeURIComponent`s.
+        assert_eq!(encode_directory("50%"), "50%25");
     }
 
     /// End-to-end check of discovery + auth + read-only endpoints. Does not
