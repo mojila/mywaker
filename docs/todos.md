@@ -47,6 +47,7 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 💻 `event.rs` — `select!` loop: crossterm `EventStream` + `mpsc::Receiver<Message>` (OpenCode) + tick interval
 - [x] 💻 `tui.rs` — terminal init/restore with manual panic hook (justified: manual `Terminal<CrosstermBackend>`, per skill exception)
 - [x] 💻 `team.rs` — `Employee`, starter roster, `EmployeeStatus`, `is_busy`
+- [x] 💻 `agent.rs` — write an employee's OpenCode agent definition (role prompt) so a new hire never hits `Agent not found`: `employee add` calls `agent::ensure` (writes only when absent), `employee agent <id>` (re)generates, `--force` overwrites
 - [x] 🧪 unit: config parsing (valid file + unknown-field + malformed-value errors) — `deny_unknown_fields` now enabled on `Config`/`Schedule`; adds `[[schedules]]`
 - [x] ✅ compiles, renders, `q`/`Esc` quits (verified via `TestBackend` render tests)
 
@@ -183,7 +184,8 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 | SSE event schema is undocumented/experimental | ✅ Resolved (shape) | `data: {json}\n\n` + `: heartbeat` confirmed; generic `Event` tolerates unknown fields | M1 |
 | Message-text streaming event names | ✅ Resolved | Extracted from the installed binary: `session.text.*`, `message.part.{delta,updated,removed}`, `session.reasoning.*`, `session.execution.*`, `session.step.*`; plus canonical-poll fallback | M5 |
 | `create_session` response `{"data":{…}}` envelope | ✅ Resolved | Verified live; `DataEnvelope<T>` added | M5 |
-| `POST /api/session` rejects bare-string `model` (`Expected Model.Ref | null`) | ✅ Resolved | `create_session` now sends `model` as `{ "id", "providerID" }`; provider persisted on assignment (`model_provider`) and backfilled for legacy rosters | M5.5 |
+| `POST /api/session` rejects bare-string `model` (`Expected Model.Ref \| null`) | ✅ Resolved | `create_session` now sends `model` as `{ "id", "providerID" }`; provider persisted on assignment (`model_provider`) and backfilled for legacy rosters | M5.5 |
+| Employee added with no OpenCode agent → `400 Agent not found` | ✅ Resolved | `employee add` writes the agent definition (`src/agent.rs`, global agents dir) before persisting the roster; `employee agent <id>` (re)generates it, and the runtime fallback still covers rosters that predate this | M2 |
 | `experimental/session/{id}/wait` signature drift | ✅ Resolved | Scheduled-task runner calls `wait` best-effort then verifies completion from `GET /api/session/{id}/message` (the drift fallback) | M6 |
 | Live model inference blocked by weekly budget | ✅ Resolved | Budget restored; live conversation loop can be verified against the service | M5 |
 | No Rust SDK (by design) | ✅ Resolved | Thin `opencode` module isolates the HTTP surface | M1 |

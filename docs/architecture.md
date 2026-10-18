@@ -32,6 +32,7 @@ mywaker/
     ├── config.rs             load ~/.config/mywaker/config.toml (tick_rate)
     ├── logging.rs            tracing → file
     ├── team.rs               Employee/roster model (maps to OpenCode agents)
+    ├── agent.rs              OpenCode agent definitions — write a starter on hire
     ├── workflow.rs           delegation protocol (parse `@id` directives, team preamble)
     ├── jev.rs                Jev (System One) client — answers `@jev` + `form.created`
     ├── role.rs               Role enum — workflow stage order/labels for the pipeline

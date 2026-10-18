@@ -73,6 +73,13 @@ enum EmployeeCmd {
     },
     /// Remove an employee.
     Rm { id: String },
+    /// (Re)generate an employee's OpenCode agent definition (role prompt).
+    Agent {
+        id: String,
+        /// Overwrite an existing definition (default only writes it when missing).
+        #[arg(long)]
+        force: bool,
+    },
     /// Update an employee's name/role/model.
     Set {
         id: String,
@@ -375,8 +382,9 @@ async fn resolve_model_provider(model: &str) -> Option<String> {
     Some(DEFAULT_PROVIDER.to_string())
 }
 
-/// Manage the employee roster: list / add / rm / set / skill / unskill.
+/// Manage the employee roster: list / add / rm / agent / set / skill / unskill.
 async fn run_employee(cmd: EmployeeCmd) -> Result<()> {
+    use mywaker::agent;
     use mywaker::team::{Employee, Team};
 
     match cmd {
@@ -401,9 +409,47 @@ async fn run_employee(cmd: EmployeeCmd) -> Result<()> {
                 employee.model = Some(model.to_string());
                 employee.model_provider = provider;
             }
-            team.add_employee(employee).map_err(|e| eyre!("{e}"))?;
+            team.add_employee(employee.clone())
+                .map_err(|e| eyre!("{e}"))?;
+
+            // Hiring an employee also defines its OpenCode agent — otherwise the
+            // session is rejected with `Agent not found` and the employee runs on
+            // the shared default prompt instead of its role. Write the definition
+            // *before* persisting the roster, so a write failure can't leave a
+            // saved employee with no agent.
+            let (agent_path, written) = agent::ensure(&employee)
+                .map_err(|err| eyre!("could not write the agent definition for '{id}': {err}"))?;
+
             team.save(&team_path()?)?;
             println!("added employee '{id}'");
+            if written {
+                println!("  wrote agent definition {}", agent_path.display());
+            } else {
+                println!(
+                    "  agent definition already present: {}",
+                    agent_path.display()
+                );
+            }
+        }
+        EmployeeCmd::Agent { id, force } => {
+            let team = Team::load_or_starter();
+            let employee = team
+                .employee(&id)
+                .ok_or_else(|| eyre!("no employee '{id}'"))?;
+            if force {
+                let path = agent::regenerate(employee)?;
+                println!("wrote agent definition {}", path.display());
+            } else {
+                let (path, written) = agent::ensure(employee)?;
+                if written {
+                    println!("wrote agent definition {}", path.display());
+                } else {
+                    println!(
+                        "agent definition already present: {} (use --force to overwrite)",
+                        path.display()
+                    );
+                }
+            }
         }
         EmployeeCmd::Rm { id } => {
             let mut team = Team::load_or_starter();

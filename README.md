@@ -101,6 +101,7 @@ the TUI and the CLI.
 mywaker employee list
 mywaker employee add qa -n Quinn -r Tester -m openai/gpt-6-luna-pro
 mywaker employee set qa --role "QA lead"
+mywaker employee agent qa                # (re)write the agent definition: qa.md
 mywaker employee skill qa playwright     # attach an installed skill
 mywaker employee unskill qa playwright   # detach a skill
 mywaker employee rm qa
@@ -114,9 +115,25 @@ mywaker skills add vercel-labs/agent-skills@react-best-practices -g  # install
 ### Agent definitions (roles)
 
 Each employee maps 1:1 to an OpenCode agent whose id matches the employee id.
-Define role-specific system prompts in the *target project's* OpenCode config so
-every employee runs with its own role instead of the shared default. Ready-to-copy
-definitions are in [`examples/`](examples/):
+Define role-specific system prompts so every employee runs with its own role
+instead of the shared default.
+
+Hiring an employee **writes the definition for you**: `mywaker employee add qa`
+also creates `~/.config/opencode/agents/qa.md` (if it doesn't already exist), so a
+new employee never hits `Agent not found`. The write goes to OpenCode's *global*
+agents dir — `$XDG_CONFIG_HOME/opencode/agents/`, else `~/.config/opencode/agents/`
+— which matches the global roster in `team.toml`. Canonical ids
+(`planner`/`researcher`/`writer`/`reviewer`/`engineer`) get the documented role
+prompt; any other role gets a generic identity prompt you can edit.
+
+```bash
+mywaker employee add qa -n Quinn -r Tester   # writes ~/.config/opencode/agents/qa.md
+mywaker employee agent qa                     # re-create it if it's missing
+mywaker employee agent qa --force             # overwrite a hand-edited definition
+```
+
+Ready-to-copy definitions are also checked in under [`examples/`](examples/) if you
+prefer to write your own:
 
 - [`examples/opencode.agents.jsonc`](examples/opencode.agents.jsonc) — the
   `planner` / `researcher` / `writer` / `reviewer` agents as an `opencode.jsonc`
@@ -125,8 +142,8 @@ definitions are in [`examples/`](examples/):
   markdown agent files. Copy them into `~/.config/opencode/agents/` (global,
   available in every project) or a project's `.opencode/agents/` (project-local).
 
-If an employee's agent id isn't defined anywhere, the employee still starts a
-session — it falls back to OpenCode's default agent (with a note in the log)
+If an employee's agent id still isn't defined anywhere, the employee starts a
+session anyway — it falls back to OpenCode's default agent (with a note in the log)
 rather than failing with `Agent not found`.
 
 ## Controls
