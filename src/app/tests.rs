@@ -1845,3 +1845,91 @@ fn mouse_motion_is_not_input() {
     app.handle_mouse(mouse_move(column, row));
     assert_eq!(app.selected(), 0, "motion must not move the selection");
 }
+
+/// A live-shaped `form.created` frame is answered end-to-end: the nested
+/// `data.form` is parsed, each field is resolved, and a reply is POSTed back to
+/// the session's form endpoint. Regression — the form used to be missed (the
+/// payload was read from the wrong level), so a session paused on a question
+/// hung forever.
+#[tokio::test]
+async fn form_created_is_answered_from_the_nested_payload() {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Path, State};
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    /// Records each form reply the fake OpenCode service receives.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        replies: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
+    }
+
+    async fn reply(
+        State(recorder): State<Recorder>,
+        Path((session, form)): Path<(String, String)>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        recorder.replies.lock().unwrap().push((session, form, body));
+        Json(serde_json::json!({}))
+    }
+
+    let recorder = Recorder::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route("/api/session/{session}/form/{form}/reply", post(reply))
+        .with_state(recorder.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = OpenCode::with_base(
+        reqwest::Url::parse(&format!("http://{addr}")).unwrap(),
+        "pw",
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(16);
+
+    // The exact frame OpenCode v2.0.32 emits: the form is nested under `data.form`
+    // and there is no top-level `sessionID`.
+    let event: Event = serde_json::from_str(
+        r#"{"id":"evt_1","created":1792293021060,"type":"form.created",
+            "location":{"directory":"/x"},
+            "data":{"form":{"id":"frm_123","sessionID":"ses_1",
+                "title":"How should I proceed?",
+                "fields":[
+                    {"key":"confirm","title":"Proceed?","type":"boolean"},
+                    {"key":"choice","title":"Pick one","type":"string",
+                     "options":[{"value":"a","label":"Alpha"},{"value":"b","label":"Beta"}]}
+                ]}}}"#,
+    )
+    .unwrap();
+
+    spawn_form_answer(client, None, event, tx);
+
+    // Wait for the "answered form" log — proof the reply round-tripped.
+    let mut log = String::new();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(Message::Log(line))) if line.starts_with("answered form") => {
+                log = line;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        log.contains("answered form"),
+        "no answer was logged: {log:?}"
+    );
+
+    let replies = recorder.replies.lock().unwrap();
+    assert_eq!(replies.len(), 1, "exactly one reply");
+    assert_eq!(replies[0].0, "ses_1");
+    assert_eq!(replies[0].1, "frm_123");
+    let answer = &replies[0].2["answer"];
+    // No Jev client → the deterministic defaults apply (boolean → true, the
+    // first option for an option field).
+    assert_eq!(answer["confirm"], serde_json::json!(true));
+    assert_eq!(answer["choice"], serde_json::json!("a"));
+}

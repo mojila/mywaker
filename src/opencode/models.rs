@@ -98,8 +98,8 @@ pub struct Event {
     pub location: Option<Location>,
     #[serde(default)]
     pub data: serde_json::Value,
-    /// V2 events carry their payload under `properties` (e.g. `form.created`)
-    /// rather than `data`; kept raw so both surfaces are tolerated.
+    /// Some event surfaces carry their payload under `properties` rather than
+    /// `data`; kept raw so both are tolerated.
     #[serde(default)]
     pub properties: serde_json::Value,
 }
@@ -110,10 +110,37 @@ impl Event {
         if let Some(id) = self.data.get("sessionID").and_then(|v| v.as_str()) {
             return Some(id);
         }
-        self.data
+        if let Some(id) = self
+            .data
             .get("part")
             .and_then(|part| part.get("sessionID"))
             .and_then(|v| v.as_str())
+        {
+            return Some(id);
+        }
+        // `form.created` carries no top-level session id: it lives inside the
+        // nested form (`data.form.sessionID`).
+        self.form_session_id()
+    }
+
+    /// The session id of `form.created`'s nested form, from whichever payload
+    /// container holds it.
+    fn form_session_id(&self) -> Option<&str> {
+        self.form_payload()
+            .and_then(|form| form.get("sessionID"))
+            .and_then(|v| v.as_str())
+    }
+
+    /// The raw form object carried by a `form.created` event, unwrapping the
+    /// payload container and the `form` key. `None` when the event carries no
+    /// form payload at all.
+    fn form_payload(&self) -> Option<&serde_json::Value> {
+        for payload in [&self.data, &self.properties] {
+            if let Some(form) = payload.get("form") {
+                return Some(form);
+            }
+        }
+        None
     }
 
     /// Incoming text delta, for `session.text.delta` / `message.part.delta`.
@@ -164,14 +191,25 @@ impl Event {
         self.event_type == "form.created"
     }
 
-    /// The form request this event carries, if any. The payload lives under
-    /// `properties` on the v2 surface and `data` otherwise; we accept whichever
-    /// is populated.
+    /// The form request this event carries, if any.
+    ///
+    /// OpenCode v2 nests the form under `form` in the event payload — observed
+    /// live as `data.form` (`{"data":{"form":{id, sessionID, title, fields}}}`),
+    /// with `properties.form` tolerated for other surfaces. Older/alternate
+    /// emissions put the form fields at the payload's top level; both shapes are
+    /// accepted so a pending form is never missed.
     pub fn form_request(&self) -> Option<FormRequest> {
-        let payload = if !self.properties.is_null() {
-            &self.properties
-        } else {
+        if !self.is_form() {
+            return None;
+        }
+        if let Some(form) = self.form_payload() {
+            return serde_json::from_value(form.clone()).ok();
+        }
+        // Legacy shape: the payload *is* the form.
+        let payload = if !self.data.is_null() {
             &self.data
+        } else {
+            &self.properties
         };
         if payload.is_null() {
             return None;
@@ -789,27 +827,68 @@ mod tests {
         assert!(req.fields[3].custom);
     }
 
+    /// Mirrors the live v2.0.32 `form.created` frame exactly: the form is nested
+    /// under `data.form`, and the event carries no top-level `sessionID`.
     #[test]
-    fn detects_form_event_and_reads_payload() {
-        let event: Event = serde_json::from_str(
+    fn detects_form_event_and_reads_nested_payload() {
+        let raw = r#"{"id":"evt_1","created":1792293021060,"type":"form.created",
+            "location":{"directory":"/x"},
+            "data":{"form":{"id":"frm_123","sessionID":"ses_1",
+                "title":"How should I proceed?",
+                "fields":[
+                    {"key":"confirm","title":"Proceed?","type":"boolean"},
+                    {"key":"choice","title":"Pick one","type":"string",
+                     "options":[{"value":"a","label":"Alpha"},{"value":"b","label":"Beta"}]}
+                ]}}}"#;
+        let event: Event = serde_json::from_str(raw).unwrap();
+        assert!(event.is_form());
+        // The session id must be recovered from the nested form, not the (absent)
+        // top-level `data.sessionID`.
+        assert_eq!(event.session_id(), Some("ses_1"));
+
+        let req = event.form_request().expect("form payload");
+        assert_eq!(req.form_id.as_deref(), Some("frm_123"));
+        assert_eq!(req.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(req.title, "How should I proceed?");
+        assert_eq!(req.fields.len(), 2);
+        assert_eq!(req.fields[0].field_type, "boolean");
+        assert_eq!(req.fields[1].options[1].value, "b");
+    }
+
+    /// A `form.created` whose fields sit at the payload's top level (the older
+    /// shape, under `properties` or `data`) still parses.
+    #[test]
+    fn form_request_tolerates_top_level_payload() {
+        let props: Event = serde_json::from_str(
             r#"{"id":"e1","type":"form.created","properties":{"id":"frm_1","sessionID":"ses_9","fields":[]}}"#,
         )
         .unwrap();
-        assert!(event.is_form());
-        assert!(
-            !Event {
-                id: "e".into(),
-                created: None,
-                event_type: "session.text.delta".into(),
-                location: None,
-                data: serde_json::Value::Null,
-                properties: serde_json::Value::Null,
-            }
-            .is_form()
-        );
-        let req = event.form_request().expect("form payload");
+        let req = props.form_request().expect("form payload");
         assert_eq!(req.form_id.as_deref(), Some("frm_1"));
         assert_eq!(req.session_id.as_deref(), Some("ses_9"));
+
+        let data: Event = serde_json::from_str(
+            r#"{"id":"e2","type":"form.created","data":{"id":"frm_2","sessionID":"ses_8","fields":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            data.form_request().unwrap().form_id.as_deref(),
+            Some("frm_2")
+        );
+    }
+
+    #[test]
+    fn non_form_events_carry_no_form_request() {
+        let event = Event {
+            id: "e".into(),
+            created: None,
+            event_type: "session.text.delta".into(),
+            location: None,
+            data: serde_json::json!({"sessionID": "ses_1", "delta": "hi"}),
+            properties: serde_json::Value::Null,
+        };
+        assert!(!event.is_form());
+        assert!(event.form_request().is_none());
     }
 
     #[test]
