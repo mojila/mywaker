@@ -65,6 +65,12 @@ impl JevClient {
         Self::new(api_key, endpoint, model).ok()
     }
 
+    /// The decision model id this client asks (`jev-1-13-free` unless
+    /// overridden) — shown on the pipeline's Jev node.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Resolve the (api key, endpoint, model) from config, with a
     /// `KENARI_API_KEY` env fallback for the key and Kenari's public defaults
     /// for endpoint/model. `None` when no key is available.

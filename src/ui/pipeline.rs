@@ -43,8 +43,11 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     render_tree(frame, app, area, top, bottom, employees);
 }
 
-/// Number of content rows inside a stage box (plus two border rows).
-const CONTENT_LINES: u16 = 3;
+/// Number of content rows inside a stage box (plus two border rows): the head
+/// (status glyph + name), the role, the live status, and the model. Every node
+/// — the planner, the leaves, and the shared Jev node — fills all of them, so
+/// the boxes line up.
+const CONTENT_LINES: u16 = 4;
 const STAGE_HEIGHT: u16 = CONTENT_LINES + 2;
 
 /// Maximum width of a single node box (the root and Jev node are centred to
@@ -186,6 +189,7 @@ fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, s
             Color::DarkGray,
         )),
         Line::from(Span::styled(employee.status.label(), accent)),
+        model_line(employee.model.as_deref(), width, Color::Cyan),
     ];
 
     render_node(frame, area, title, border, lines);
@@ -218,6 +222,9 @@ fn render_jev_stage(frame: &mut Frame, app: &App, area: Rect) {
                 Color::DarkGray
             },
         )),
+        // Jev's decision model, on the same row the employee boxes use for
+        // theirs, so every box in the tree is the same height.
+        model_line(app.jev_model(), width, Color::Cyan),
     ];
 
     render_node(frame, area, title, Style::default().fg(accent), lines);
@@ -260,6 +267,21 @@ fn node_head(glyph: Span<'static>, name: &str, inner_width: usize) -> Line<'stat
     ])
 }
 
+/// A node's model row: the model id in `accent`, or a dimmed `none` when
+/// nothing is assigned. Truncated to the box's inner width like every other
+/// row, so a long id can't push the box out of shape.
+fn model_line(model: Option<&str>, inner_width: usize, accent: Color) -> Line<'static> {
+    match model {
+        Some(model) => Line::from(Span::styled(truncate(model, inner_width), accent)),
+        None => Line::from(Span::styled(
+            "none",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )),
+    }
+}
+
 /// A downward connector (planner → jev → leaves).
 fn render_arrow_down(frame: &mut Frame, area: Rect) {
     let arrow = Paragraph::new(Line::from(Span::styled(
@@ -274,9 +296,28 @@ fn render_arrow_down(frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::jev::JevClient;
+    use crate::message::Message;
+    use crate::team::Team;
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn area() -> Rect {
         Rect::new(4, 1, 80, 30)
+    }
+
+    /// Draw one node on a throwaway terminal and return the buffer's symbols —
+    /// one place builds the box the content assertions read.
+    fn node_text(draw: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal.draw(draw).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     /// The nodes the renderer draws are the nodes hit-testing searches: one per
@@ -351,5 +392,72 @@ mod tests {
         assert_eq!(tree.nodes[0].employee, Some(0));
         assert_eq!(tree.nodes[1].employee, None);
         assert!(!tree.nodes[0].area.intersects(tree.nodes[1].area));
+    }
+
+    /// Every box is tall enough for all [`CONTENT_LINES`] content rows, which is
+    /// what keeps the planner, the Jev node, and the leaves level.
+    #[test]
+    fn stage_boxes_fit_their_content_rows() {
+        assert_eq!(STAGE_HEIGHT, CONTENT_LINES + 2);
+
+        let tree = tree(area(), 3, &[0, 1, 2]);
+        for node in &tree.nodes {
+            assert_eq!(node.area.height, STAGE_HEIGHT, "{:?}", node.area);
+        }
+    }
+
+    /// The model row carries the assigned id — truncated to the box's inner
+    /// width — and a dimmed `none` when nothing is assigned.
+    #[test]
+    fn model_row_truncates_to_the_inner_width_and_placeholders_none() {
+        let assigned = model_line(Some("deepseek-v4.1-flash-free"), 40, Color::Cyan);
+        assert_eq!(assigned.spans[0].content, "deepseek-v4.1-flash-free");
+
+        let clipped = model_line(Some("deepseek-v4.1-flash-free"), 10, Color::Cyan);
+        assert_eq!(clipped.spans[0].content, "deepseek-…");
+        assert!(clipped.spans[0].content.chars().count() <= 10);
+
+        let unassigned = model_line(None, 40, Color::Cyan);
+        assert_eq!(unassigned.spans[0].content, "none");
+    }
+
+    /// An employee stage prints its assigned model id inside the box.
+    #[test]
+    fn stage_renders_the_assigned_model() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+        let mut team = Team::starter();
+        team.set_model(1, "kenari/jev-1-13-free".to_string(), None);
+        let app = App::with_team(Config::default(), tx, team);
+
+        let employee = app.team().employees()[1].clone();
+        let text = node_text(|frame| {
+            let area = frame.area();
+            render_stage(frame, &app, &employee, area, false);
+        });
+
+        assert!(text.contains("kenari/jev-1-13-free"), "{text}");
+    }
+
+    /// The Jev node prints its decision model on its own row — the same row the
+    /// employee boxes use — and a `none` placeholder while Jev is off.
+    #[test]
+    fn jev_node_renders_its_decision_model() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+        let mut app = App::new(Config::default(), tx);
+
+        let off = node_text(|frame| {
+            let area = frame.area();
+            render_jev_stage(frame, &app, area);
+        });
+        assert!(off.contains("none"), "{off}");
+
+        app.set_jev(Some(
+            JevClient::new("key", "https://example.test", "jev-1-13-free").unwrap(),
+        ));
+        let on = node_text(|frame| {
+            let area = frame.area();
+            render_jev_stage(frame, &app, area);
+        });
+        assert!(on.contains("jev-1-13-free"), "{on}");
     }
 }

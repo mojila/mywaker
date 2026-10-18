@@ -2714,6 +2714,13 @@ impl App {
         self.jev.is_some()
     }
 
+    /// The decision model the attached Jev client asks (`None` while Jev is
+    /// off) — the pipeline diagram renders it on the Jev node next to the
+    /// on/off state.
+    pub fn jev_model(&self) -> Option<&str> {
+        self.jev.as_ref().map(JevClient::model)
+    }
+
     pub fn server_version(&self) -> Option<&str> {
         self.server_info.as_ref().map(|info| info.version.as_str())
     }
