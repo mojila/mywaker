@@ -54,6 +54,7 @@ mywaker/
         ├── pipeline.rs       team tree diagram — planner → jev → leaves
         ├── tasks.rs          per-employee board + persisted task queue
         ├── chat.rs           conversation transcript + streaming (modal)
+        ├── modal.rs          reopen prompt — the tasks paused at the last shutdown
         ├── models.rs         model picker popup
         ├── projects.rs       project picker popup
         └── status.rs         status glyph/colour/spinner shared by the panels
@@ -454,3 +455,40 @@ rate, process RSS, and exponentially-averaged process CPU%.
 - **Note** — the exact `tokens` payload shape from OpenCode is experimental; a
   `#[serde(default)]`-tolerant `TokenUsage` keeps a mismatch from breaking
   deserialization, and the readout degrades to `0`/`—` when the field is absent.
+
+---
+
+## 13. Shutdown → reopen lifecycle (pause on close, resume on reopen)
+
+Quitting and relaunching is one loop with a persisted pivot in the middle: the store.
+
+1. **Close** — `initiate_shutdown` runs `pause_active_tasks` **before** flushing the
+   store. Every non-terminal task (`Pending`, `Running`, `Retrying`) is paused with
+   `PauseReason::Shutdown`, and each task that had a session is interrupted *after* being
+   paused. Pause-before-interrupt is load-bearing: the interrupt's trailing
+   `TaskAttemptFinished` then meets the paused-task guard in `handle_task_attempt` and is
+   ignored, rather than flipping the task to a terminal state on the way out. Terminal
+   tasks are skipped, and a task the user had already paused keeps `PauseReason::User`.
+   Since the pause is written before the process exits, an unfinished task survives a
+   release build's `panic = "abort"`; a `SIGKILL` landing between the two writes is still a
+   loss, and is accepted.
+2. **Reopen** — `enable_persistence` loads the store and then prepares the reopen prompt:
+   the tasks carrying `PauseReason::Shutdown` — and only those — collected in `order_tasks`
+   order. Nothing shutdown-paused means no prompt, so an ordinary launch is unchanged.
+3. **Answer** — the prompt is modal. Render precedence is shutdown overlay → reopen prompt
+   → help (`src/ui/mod.rs`), and `handle_key` hands it the key before the help overlay and
+   the global quit bindings; mouse input is swallowed while it is up. `y`/`Enter` resumes
+   every collected task through the ordinary `resume_task` → `dispatch_task` path, `n`/`Esc`
+   keeps them held and logs how to continue one later, and `q`/`Ctrl-C` quits leaving them
+   held. Declining does not engage the engine gate, so new cron/watch fires still dispatch.
+
+**Task resume is not session-continuous.** Accepting the prompt — or pressing `s` on a
+paused task — re-runs the task in a **new** OpenCode session: `run_task_attempt` always
+mints one via `create_session_with_agent_fallback`, and `note_task_attempt` overwrites the
+task's stored `session_id` with it. The interrupted session is only ever *interrupted*: its
+transcript is never replayed, which is why the resume preamble says "start this task over
+from the beginning" and is applied only to a task that had an earlier attempt (AC4b).
+Interactive chat is the different case — re-entering an employee's chat continues that
+chat's `session_id`, which is why the two paths must not be described as the same thing.
+Should task resume ever continue a session, it is recorded as future work in
+[`todos.md`](todos.md).

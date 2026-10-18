@@ -1273,12 +1273,133 @@ fn a_paused_task_does_not_adopt_a_late_session() {
     assert_eq!(app.store.tasks[0].session_id, None);
 }
 
-/// AC4: resuming a paused task returns it to `running` and re-dispatches it.
-#[test]
-fn resuming_a_paused_task_returns_it_to_running() {
+/// A recording OpenCode double for the resume tests: the app dispatches real
+/// HTTP at it, and the test reads back the sessions that were started and the
+/// prompt text that was sent — so a resume is witnessed by the attempt it
+/// actually issued, not inferred from the task's state. Scoped to what one
+/// dispatch touches; the full client surface is covered by `tests/opencode_fake.rs`.
+mod recorder {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use axum::{
+        Json, Router,
+        extract::{Path, State},
+        routing::{get, post},
+    };
+    use reqwest::Url;
+    use serde_json::{Value, json};
+
+    use crate::opencode::OpenCode;
+
+    #[derive(Clone, Default)]
+    pub struct Recorder {
+        /// How many sessions the app has started (`POST /api/session`).
+        pub sessions: Arc<Mutex<usize>>,
+        /// The prompt text of every attempt, in order.
+        pub prompts: Arc<Mutex<Vec<String>>>,
+        /// Every `(session_id, prompt)` pair, so a test can tie an attempt back
+        /// to the task that issued it and prove no task adopted another's id.
+        pub attempts: Arc<Mutex<Vec<(String, String)>>>,
+        /// The session ids the app interrupted (`POST .../interrupt`).
+        pub interrupts: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn create_session(State(state): State<Recorder>) -> Json<Value> {
+        let mut count = state.sessions.lock().unwrap();
+        *count += 1;
+        // A distinct id per session, so a test can tell two attempts apart.
+        let id = format!("ses_{}", *count);
+        Json(json!({ "data": { "id": id, "title": "fresh" } }))
+    }
+
+    async fn prompt(
+        State(state): State<Recorder>,
+        Path(id): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let text = body
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        state.prompts.lock().unwrap().push(text.clone());
+        state.attempts.lock().unwrap().push((id, text));
+        Json(json!({}))
+    }
+
+    async fn interrupt(State(state): State<Recorder>, Path(id): Path<String>) -> Json<Value> {
+        state.interrupts.lock().unwrap().push(id);
+        Json(json!({}))
+    }
+
+    async fn messages() -> Json<Value> {
+        // A completed assistant reply, so an attempt reads back a deliverable and
+        // finishes instead of retrying (which would start another session).
+        Json(json!({
+            "data": [
+                { "id": "m1", "time": { "created": 1 }, "text": "go", "type": "user" },
+                { "id": "m2", "time": { "created": 2, "completed": 3 }, "type": "assistant",
+                  "content": [{ "id": "p1", "type": "text", "text": "the deliverable" }],
+                  "finish": "done" }
+            ],
+            "cursor": { "previous": null, "next": null }
+        }))
+    }
+
+    async fn ok() -> Json<Value> {
+        Json(json!({}))
+    }
+
+    /// Serve the double on an ephemeral port; return a client pointed at it plus
+    /// the shared state to assert against.
+    pub async fn start() -> (OpenCode, Recorder) {
+        let state = Recorder::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let router = Router::new()
+            .route("/api/session", post(create_session))
+            .route("/api/session/{id}/prompt", post(prompt))
+            .route("/api/session/{id}/message", get(messages))
+            .route("/api/session/{id}/interrupt", post(interrupt))
+            .route("/api/experimental/session/{id}/wait", post(ok))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let base = Url::parse(&format!("http://{addr}")).unwrap();
+        (OpenCode::with_base(base, "sekrit"), state)
+    }
+
+    /// Wait for the spawned attempt to send its prompt, then return it.
+    pub async fn first_prompt(state: &Recorder) -> String {
+        for _ in 0..400 {
+            if let Some(text) = state.prompts.lock().unwrap().first().cloned() {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the dispatched attempt never sent a prompt");
+    }
+}
+
+/// AC4: resuming a paused task returns it to `running` and issues a **fresh**
+/// attempt — a new session, prompted with the resume preamble ahead of the goal.
+/// The recording double lets the test read the attempted prompt itself, so it
+/// witnesses AC4's pass condition rather than inferring it from task state.
+#[tokio::test]
+async fn resuming_a_paused_task_returns_it_to_running() {
+    let (client, server) = recorder::start().await;
+
     let (mut app, _rx) = make_app();
+    app.client = Some(client);
+
     let mut task = Task::new("sweep the inbox", Some("researcher".into()));
     assert!(task.transition(TaskStatus::Running));
+    task.session_id = Some("ses_old".into());
+    let task_id = task.id;
     app.store.upsert_task(task);
 
     app.selected = app.team_index_by_id("researcher").expect("known employee");
@@ -1288,7 +1409,498 @@ fn resuming_a_paused_task_returns_it_to_running() {
     press(&mut app, KeyCode::Char('s')); // resume
     assert_eq!(app.store.tasks[0].status, TaskStatus::Running);
     assert!(!app.store.tasks[0].paused);
-    assert!(app.log.iter().any(|line| line.contains("▶ resumed task")));
+    assert!(
+        app.log.iter().any(|line| line.contains("▶ resumed task")),
+        "resume must be logged: {:?}",
+        app.log
+    );
+
+    // The fresh attempt reports its new session in; it *replaces* the
+    // interrupted one — the id changes, it doesn't merely still exist.
+    assert_eq!(app.store.tasks[0].session_id.as_deref(), Some("ses_old"));
+    app.update(Message::TaskAttemptStarted {
+        task_id,
+        session_id: "ses_fresh".into(),
+    });
+    let resumed_session = app.store.tasks[0].session_id.clone();
+    assert_eq!(resumed_session.as_deref(), Some("ses_fresh"));
+    assert_ne!(resumed_session.as_deref(), Some("ses_old"));
+
+    // Witness the attempt itself: exactly one fresh session, prompted with the
+    // resume preamble ahead of the goal.
+    let prompt = recorder::first_prompt(&server).await;
+    assert_eq!(
+        *server.sessions.lock().unwrap(),
+        1,
+        "resume must start exactly one fresh session"
+    );
+    assert_eq!(
+        prompt,
+        format!("{}\n\n{}", harness::resume_preamble(), "sweep the inbox"),
+        "the resumed attempt must carry the resume preamble"
+    );
+}
+
+/// The resume preamble describes *interrupted* work ("the previous attempt was
+/// paused and interrupted"), so a task paused before it ever ran — no attempts,
+/// no session — must resume with the bare goal rather than claim an attempt
+/// that never happened.
+#[tokio::test]
+async fn resuming_a_task_that_never_ran_omits_the_preamble() {
+    let (client, server) = recorder::start().await;
+
+    let (mut app, _rx) = make_app();
+    app.client = Some(client);
+
+    // Queued but never dispatched: zero attempts, no session.
+    let task = Task::new("sweep the inbox", Some("researcher".into()));
+    assert_eq!(task.attempts, 0);
+    assert!(task.session_id.is_none());
+    app.store.upsert_task(task);
+
+    app.selected = app.team_index_by_id("researcher").expect("known employee");
+    press(&mut app, KeyCode::Char('s')); // pause the queued task
+    assert_eq!(app.store.tasks[0].status, TaskStatus::Paused);
+    press(&mut app, KeyCode::Char('s')); // resume
+
+    let prompt = recorder::first_prompt(&server).await;
+    assert_eq!(
+        prompt, "sweep the inbox",
+        "a task with no prior attempt must not claim an interrupted attempt"
+    );
+}
+
+/// The reopen prompt's body carries the restart disclaimer: the tasks were
+/// paused when mywaker closed and will be **re-run from the beginning**, so the
+/// user isn't misled into thinking an interrupted session is continued.
+#[test]
+fn reopen_prompt_body_carries_the_restart_disclaimer() {
+    let (mut app, _rx) = make_app();
+    let mut task = Task::new("sweep the inbox", Some("researcher".into()));
+    assert!(task.transition(TaskStatus::Running));
+    assert!(task.pause_for(PauseReason::Shutdown));
+    app.store.upsert_task(task);
+    app.prepare_resume_prompt();
+    assert_eq!(app.resume_prompt().expect("prompt offered").count(), 1);
+
+    let text = screen(&app, 120, 40);
+    assert!(text.contains("resume paused tasks"), "modal title missing");
+    assert!(
+        text.contains("paused when mywaker closed"),
+        "modal count line missing"
+    );
+    assert!(
+        text.contains("re-run from the beginning"),
+        "restart disclaimer missing: {text}"
+    );
+}
+
+/// The reopen prompt covers only the tasks *mywaker* paused on the way out:
+/// answering it resumes those, while a task the user paused deliberately stays
+/// held. The prompt is modal, so `y` is what continues them.
+#[test]
+fn reopen_prompt_resumes_shutdown_pauses_but_not_deliberate_ones() {
+    let (mut app, _rx) = make_app();
+
+    let mut held_at_close = Task::new("sweep the inbox", Some("researcher".into()));
+    assert!(held_at_close.transition(TaskStatus::Running));
+    assert!(held_at_close.pause_for(PauseReason::Shutdown));
+    let mut held_by_user = Task::new("write the changelog", Some("writer".into()));
+    assert!(held_by_user.pause()); // PauseReason::User
+    app.store.upsert_task(held_at_close);
+    app.store.upsert_task(held_by_user);
+
+    app.prepare_resume_prompt();
+    assert_eq!(app.resume_prompt().expect("prompt offered").count(), 1);
+
+    press(&mut app, KeyCode::Char('y')); // resume all the prompt covers
+
+    assert!(app.resume_prompt().is_none(), "answering clears the prompt");
+    let resumed = &app.store.tasks[0];
+    assert_eq!(resumed.goal, "sweep the inbox");
+    assert_eq!(resumed.status, TaskStatus::Running);
+    let still_held = &app.store.tasks[1];
+    assert_eq!(still_held.goal, "write the changelog");
+    assert_eq!(still_held.status, TaskStatus::Paused);
+    assert!(still_held.paused);
+}
+
+/// Answering the reopen prompt with `n` keeps the tasks held and drops the
+/// prompt, so a later launch won't offer them again by accident.
+#[test]
+fn reopen_prompt_declining_keeps_the_tasks_held() {
+    let (mut app, _rx) = make_app();
+    let mut task = Task::new("sweep the inbox", Some("researcher".into()));
+    assert!(task.transition(TaskStatus::Running));
+    assert!(task.pause_for(PauseReason::Shutdown));
+    app.store.upsert_task(task);
+    app.prepare_resume_prompt();
+
+    press(&mut app, KeyCode::Char('n'));
+
+    assert!(app.resume_prompt().is_none(), "declining clears the prompt");
+    assert_eq!(app.store.tasks[0].status, TaskStatus::Paused);
+    assert!(app.store.tasks[0].paused);
+}
+
+/// AC7: accepting the reopen prompt re-runs **every** shutdown-paused task in
+/// `order_tasks` order, each in its own fresh session.
+///
+/// Each task is given a *distinct stale* session id first, so "the session
+/// changed" is asserted against that task's own pre-pause id instead of merely
+/// "an id exists", and the double's `(session, prompt)` record proves no task
+/// adopted another's id. The resume loop runs synchronously, so the
+/// `▶ resumed task` log lines witness the dispatch order; the attempts' sessions
+/// are minted concurrently, so the ids are matched to tasks, not to positions.
+#[tokio::test]
+async fn reopen_prompt_resumes_each_task_in_order_with_a_fresh_session() {
+    let (client, server) = recorder::start().await;
+
+    let (mut app, mut rx) = make_app();
+    app.client = Some(client);
+
+    // Two shutdown-paused tasks; distinct `created_at` fixes `order_tasks`
+    // (newest active first) to `[newer, older]`.
+    let mut older = Task::new("older goal", Some("researcher".into()));
+    assert!(older.transition(TaskStatus::Running));
+    older.created_at = 10;
+    older.session_id = Some("ses_stale_older".into());
+    assert!(older.pause_for(PauseReason::Shutdown));
+    let older_id = older.id;
+
+    let mut newer = Task::new("newer goal", Some("researcher".into()));
+    assert!(newer.transition(TaskStatus::Running));
+    newer.created_at = 20;
+    newer.session_id = Some("ses_stale_newer".into());
+    assert!(newer.pause_for(PauseReason::Shutdown));
+    let newer_id = newer.id;
+
+    app.store.upsert_task(older);
+    app.store.upsert_task(newer);
+
+    // The batch order is `order_tasks` order, asserted rather than assumed.
+    let expected_order: Vec<TaskId> = order_tasks(&app.store.tasks)
+        .into_iter()
+        .map(|index| app.store.tasks[index].id)
+        .collect();
+    assert_eq!(expected_order, vec![newer_id, older_id]);
+
+    app.prepare_resume_prompt();
+    assert_eq!(
+        app.resume_prompt().expect("prompt offered").tasks,
+        expected_order,
+        "the prompt must collect the batch in order_tasks order"
+    );
+
+    app.resume_shutdown_paused();
+    assert!(
+        app.resume_prompt().is_none(),
+        "answering consumes the prompt"
+    );
+
+    // (d) The dispatch sequence is the prompt's order, and the prompt's order is
+    // `order_tasks`. The synchronous resume loop logs each task as it goes.
+    let resumed: Vec<String> = app
+        .log
+        .iter()
+        .filter_map(|line| line.strip_prefix("▶ resumed task: "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        resumed,
+        vec!["newer goal", "older goal"],
+        "resume dispatch must follow order_tasks"
+    );
+
+    // (b) Drive the attempts' `TaskAttemptStarted` messages back in until each
+    // task has replaced *its own* stale id — `is_some()` alone would not prove
+    // that. Only the start message is applied: the fake session completes
+    // instantly, so applying its trailing finish would move the tasks to
+    // `Succeeded` and hide the resume state this test is about.
+    let stale = [(older_id, "ses_stale_older"), (newer_id, "ses_stale_newer")];
+    for _ in 0..400 {
+        while let Ok(message) = rx.try_recv() {
+            if matches!(message, Message::TaskAttemptStarted { .. }) {
+                app.update(message);
+            }
+        }
+        let replaced = stale.iter().all(|(id, old)| {
+            app.store
+                .tasks
+                .iter()
+                .find(|task| task.id == *id)
+                .is_some_and(|task| task.session_id.as_deref() != Some(*old))
+        });
+        if replaced {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // (a) Every task in the batch is running again, unpaused, reason cleared.
+    for id in [older_id, newer_id] {
+        let task = app
+            .store
+            .tasks
+            .iter()
+            .find(|task| task.id == id)
+            .expect("known task");
+        assert_eq!(
+            task.status,
+            TaskStatus::Running,
+            "{} must run again",
+            task.goal
+        );
+        assert!(!task.paused, "{} must be unpaused", task.goal);
+        assert_eq!(
+            task.pause_reason, None,
+            "{} must clear its pause reason",
+            task.goal
+        );
+    }
+
+    let session_of = |id: TaskId| -> String {
+        app.store
+            .tasks
+            .iter()
+            .find(|task| task.id == id)
+            .and_then(|task| task.session_id.clone())
+            .unwrap_or_else(|| panic!("task {id} never recorded a session"))
+    };
+    let older_session = session_of(older_id);
+    let newer_session = session_of(newer_id);
+
+    // (b) Each id changed from *that task's* stale id and never became the other
+    // task's stale id; (c) the two fresh ids are pairwise distinct.
+    assert_ne!(
+        older_session, "ses_stale_older",
+        "resume must not continue the interrupted session"
+    );
+    assert_ne!(
+        newer_session, "ses_stale_newer",
+        "resume must not continue the interrupted session"
+    );
+    assert_ne!(
+        older_session, "ses_stale_newer",
+        "no task may adopt another task's old id"
+    );
+    assert_ne!(
+        newer_session, "ses_stale_older",
+        "no task may adopt another task's old id"
+    );
+    assert_ne!(
+        older_session, newer_session,
+        "each resumed task must get its own fresh session, not share one"
+    );
+
+    // The double agrees: one session per task, and the session the app stored
+    // for a goal is exactly the one that goal's prompt was sent to.
+    assert_eq!(
+        *server.sessions.lock().unwrap(),
+        2,
+        "one fresh session per resumed task"
+    );
+    // `TaskAttemptStarted` is reported before the prompt is sent, so give both
+    // prompts time to reach the double before reading its attempt log.
+    for _ in 0..400 {
+        if server.attempts.lock().unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let attempts = server.attempts.lock().unwrap().clone();
+    assert_eq!(attempts.len(), 2, "both resumed attempts were prompted");
+    for (goal, session) in [("newer goal", newer_session), ("older goal", older_session)] {
+        let expected_prompt = format!("{}\n\n{}", harness::resume_preamble(), goal);
+        let (recorded, prompt) = attempts
+            .iter()
+            .find(|(_, prompt)| prompt == &expected_prompt)
+            .unwrap_or_else(|| panic!("the double saw no prompt for {goal:?}"));
+        assert_eq!(
+            recorded, &session,
+            "{goal:?} stored a session it did not start itself"
+        );
+        assert_eq!(
+            prompt, &expected_prompt,
+            "{goal:?} must be re-run with the resume preamble"
+        );
+    }
+}
+
+/// The close path holds the whole non-terminal queue with
+/// `PauseReason::Shutdown` so it is offered back on reopen — while a task the
+/// user paused deliberately keeps its own reason, and a finished task is left
+/// alone.
+///
+/// Drive it over a **mixed** queue in one go: `Running` (with a session),
+/// queued `Pending`, `Retrying`, terminal, and a deliberate user pause. The
+/// session-bearing task's `/interrupt` is recorded by the double, so
+/// pause-before-interrupt is witnessed rather than inferred from the code.
+#[tokio::test]
+async fn shutdown_holds_the_queue_but_respects_deliberate_pauses() {
+    let (client, server) = recorder::start().await;
+    let (mut app, _rx) = make_app();
+    app.client = Some(client);
+
+    let mut running = Task::new("running goal", Some("researcher".into()));
+    assert!(running.transition(TaskStatus::Running));
+    running.created_at = 10;
+    running.session_id = Some("ses_run".into());
+    let running_id = running.id;
+
+    let mut queued = Task::new("queued goal", Some("researcher".into()));
+    queued.created_at = 20;
+    let queued_id = queued.id;
+
+    let mut retrying = Task::new("retrying goal", Some("researcher".into()));
+    assert!(retrying.transition(TaskStatus::Running));
+    assert!(retrying.try_retry());
+    retrying.created_at = 30;
+    let retrying_id = retrying.id;
+
+    let mut terminal = Task::new("finished goal", Some("writer".into()));
+    terminal.created_at = 5;
+    terminal.succeed("done");
+
+    let mut by_user = Task::new("held goal", Some("planner".into()));
+    by_user.created_at = 40;
+    by_user.session_id = Some("ses_user".into());
+    assert!(by_user.pause_for(PauseReason::User));
+    let user_id = by_user.id;
+
+    for task in [running, queued, retrying, terminal, by_user] {
+        app.store.upsert_task(task);
+    }
+
+    app.initiate_shutdown();
+    assert!(app.is_shutting_down());
+
+    // The whole non-terminal queue is held, shutdown-paused.
+    for (id, goal) in [
+        (running_id, "running goal"),
+        (queued_id, "queued goal"),
+        (retrying_id, "retrying goal"),
+    ] {
+        let task = app
+            .store
+            .tasks
+            .iter()
+            .find(|task| task.id == id)
+            .expect("known task");
+        assert_eq!(task.goal, goal);
+        assert_eq!(task.status, TaskStatus::Paused, "{goal} must be held");
+        assert!(task.paused, "{goal} must be paused");
+        assert_eq!(
+            task.pause_reason,
+            Some(PauseReason::Shutdown),
+            "{goal} must be held by shutdown, not by the user"
+        );
+        assert!(task.paused_at_shutdown());
+    }
+
+    // Terminal work is untouched.
+    let done = app
+        .store
+        .tasks
+        .iter()
+        .find(|task| task.goal == "finished goal")
+        .expect("terminal task");
+    assert_eq!(done.status, TaskStatus::Succeeded);
+    assert!(!done.paused);
+    assert_eq!(done.pause_reason, None);
+    assert_eq!(done.result.as_deref(), Some("done"));
+
+    // A deliberate pause keeps its own reason and is never offered back.
+    let user_held = app
+        .store
+        .tasks
+        .iter()
+        .find(|task| task.id == user_id)
+        .expect("user-held task");
+    assert_eq!(user_held.status, TaskStatus::Paused);
+    assert!(user_held.paused);
+    assert_eq!(user_held.pause_reason, Some(PauseReason::User));
+    assert!(!user_held.paused_at_shutdown());
+
+    // Pause-before-interrupt, witnessed by the double: the one session a
+    // shutdown pause took over (`ses_run`) is interrupted, and only that one.
+    for _ in 0..400 {
+        if !server.interrupts.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        *server.interrupts.lock().unwrap(),
+        vec!["ses_run".to_string()],
+        "quit must interrupt the session it paused, and not one the user already held"
+    );
+    assert!(
+        app.log
+            .iter()
+            .any(|line| line.contains("paused 3 task(s) at shutdown")),
+        "the close path must report the held count: {:?}",
+        app.log
+    );
+
+    // The interrupt's trailing completion arrives *after* the pause: it must not
+    // flip the held task — the observable consequence of pause-before-interrupt.
+    app.update(Message::TaskAttemptFinished {
+        task_id: running_id,
+        succeeded: true,
+        result: "finished anyway".into(),
+    });
+    let still_held = app
+        .store
+        .tasks
+        .iter()
+        .find(|task| task.id == running_id)
+        .expect("known task");
+    assert_eq!(still_held.status, TaskStatus::Paused);
+    assert!(still_held.paused);
+    assert_eq!(still_held.pause_reason, Some(PauseReason::Shutdown));
+
+    // Only the shutdown-paused tasks are offered back, in `order_tasks` order.
+    let expected: Vec<TaskId> = order_tasks(&app.store.tasks)
+        .into_iter()
+        .map(|index| &app.store.tasks[index])
+        .filter(|task| task.paused_at_shutdown())
+        .map(|task| task.id)
+        .collect();
+    assert_eq!(expected, vec![retrying_id, queued_id, running_id]);
+
+    app.prepare_resume_prompt();
+    let prompt = app.resume_prompt().expect("prompt offered");
+    assert_eq!(
+        prompt.tasks,
+        vec![retrying_id, queued_id, running_id],
+        "only shutdown pauses are collected, in order_tasks order"
+    );
+    let goals: Vec<&str> = prompt
+        .tasks
+        .iter()
+        .map(|id| {
+            app.store
+                .tasks
+                .iter()
+                .find(|task| task.id == *id)
+                .expect("known task")
+                .goal
+                .as_str()
+        })
+        .collect();
+    assert_eq!(goals, vec!["retrying goal", "queued goal", "running goal"]);
+
+    // Second, small case: a launch holding only deliberate pauses offers nothing.
+    let (mut fresh, _rx) = make_app();
+    let mut only_user = Task::new("still held", Some("planner".into()));
+    assert!(only_user.pause_for(PauseReason::User));
+    fresh.store.upsert_task(only_user);
+    fresh.prepare_resume_prompt();
+    assert!(
+        fresh.resume_prompt().is_none(),
+        "a deliberate pause must never open the reopen prompt"
+    );
 }
 
 /// The pause keys are safe with nothing to act on: `s` invents no task and

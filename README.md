@@ -156,6 +156,7 @@ rather than failing with `Agent not found`.
 | `p` | Choose the working project |
 | `Space` | Pause / resume the autonomous-task engine (new cron/watch fires queue) |
 | `s` | Pause / resume the selected employee's task |
+| `y` / `n` (reopen prompt) | Resume all / keep paused the tasks mywaker held at the last close |
 | `?` | Open the keybindings help overlay |
 | `Esc` | Back / leave chat |
 | `q` / `Ctrl-C` | Quit |
@@ -253,6 +254,28 @@ streams the goal, and reports the deliverable in the log. A task that fails is
 retried up to three times; the retry preamble tells the employee what broke. Task
 history (and per-employee memory) persists to `store.json` under your config dir,
 so it survives restarts.
+
+### Pausing work
+
+Holding work is a first-class action, and mywaker holds it for you when you quit:
+
+- **`Space`** pauses the *engine*. A cron or watch fire while the engine is paused is
+  still recorded, but it lands as `pending` and starts no session; pressing `Space`
+  again dispatches everything that queued up, in queue order.
+- **`s`** pauses or resumes the selected employee's *current* task — pausing interrupts
+  the session that task was running in, resuming re-runs it.
+- **Quitting pauses every unfinished task** and interrupts the sessions they were running
+  in, so no headless work keeps going after the terminal is gone. The pause is written to
+  `store.json` on the way out, so it survives the restart.
+- **The next launch offers those tasks back** in one modal: `y` / `Enter` resumes them
+  all, `n` / `Esc` keeps them held (press `s` later to continue one). Only the tasks
+  mywaker held itself are offered — anything you paused on purpose stays held. Quit is
+  still immediate; there is no quit-time confirmation step.
+
+Resuming a task **re-runs it from the beginning in a new session**: the interrupted
+session's transcript is not replayed, which is why the modal says so instead of promising
+a continue where you left off. Chat is the different case — re-entering an employee's chat
+carries on that same session.
 
 ## Architecture
 

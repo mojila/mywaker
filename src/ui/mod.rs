@@ -3,6 +3,7 @@
 mod chat;
 pub(crate) mod hit;
 mod layout;
+mod modal;
 mod models;
 mod pipeline;
 mod projects;
@@ -53,6 +54,13 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if app.is_shutting_down() {
         render_shutdown(frame, app, frame.area());
+        return;
+    }
+
+    // The reopen prompt sits above the help overlay: answering it is the first
+    // thing to do, and it is modal until it is answered.
+    if app.resume_prompt().is_some() {
+        modal::render(frame, app, frame.area());
         return;
     }
 
@@ -287,19 +295,24 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     popup
 }
 
+/// One `<key>  <description>` pair as an overlay body line: the key in bold cyan,
+/// the description plain. Shared by the help overlay and the reopen prompt so
+/// every overlay spells its keys the same way.
+pub(crate) fn key_hint(key: &'static str, description: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            key,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  {description}")),
+    ])
+}
+
 /// The help overlay's body lines.
 fn help_lines() -> Vec<Line<'static>> {
-    let key = |k: &'static str, d: &'static str| {
-        Line::from(vec![
-            Span::styled(
-                k,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("  {d}")),
-        ])
-    };
+    let key = key_hint;
     let head = |t: &'static str| {
         Line::from(Span::styled(
             t,

@@ -143,6 +143,36 @@ The criteria for this milestone (**AC1–AC6**) are frozen in
 [`acceptance.md`](acceptance.md) — the reviewer verifies against that file, not
 against out-of-band context.
 
+## M6.6 — Pause on close, resume on reopen
+
+> Spec: [`acceptance.md`](acceptance.md) §1.1 plus AC4a / AC4b / AC7. Quitting holds
+> the whole queue and interrupts what it was running; the next launch offers back
+> only what mywaker paused itself, and resume **re-runs** each task in a new session.
+
+- [x] 💻 `PauseReason::{User,Shutdown}`, `Task::pause_for` (with `pause()` delegating as
+  `User`, so every existing caller keeps its meaning), the `Retrying → Paused` edge, and
+  `paused_at_shutdown()`; `resume()` clears the reason with the flag. The field is
+  `#[serde(default)]`, so a store written before it existed loads as `None`.
+- [x] 💻 Close path: `pause_active_tasks` pauses every non-terminal task in `order_tasks`
+  order and interrupts each session **after** its task is paused, so the existing
+  `handle_task_attempt` guard absorbs the trailing completion; called from
+  `initiate_shutdown` before the store is flushed, so the pause survives
+  `panic = "abort"`.
+- [x] 💻 Open path: `prepare_resume_prompt` collects only shutdown-paused tasks into one
+  `ResumePrompt` (unset on a normal launch); `resume_shutdown_paused` resumes them through
+  the ordinary `resume_task` → `dispatch_task` path; `dismiss_resume_prompt` keeps them
+  held and leaves the engine gate alone.
+- [x] 💻 Key routing: the prompt answers `y`/`Enter`, `n`/`Esc`, and `q`/`Ctrl-C`, and
+  swallows every other key (`handle_key`, ahead of the help overlay and the global quit
+  bindings); mouse input is swallowed while it is up. Quit itself stays immediate.
+- [x] 💻 Modal: `src/ui/modal.rs` — a centred bordered block drawn with the same
+  `centered`/`key_hint` helpers as the other overlays, precedence shutdown → reopen prompt
+  → help; the body says the tasks **re-run from the beginning**.
+- [x] 💻 Preamble correctness (AC4b): only a task that had a prior attempt is resumed with
+  `harness::resume_preamble`; a never-started task is re-run with its bare goal.
+- [x] 📄 Docs — `acceptance.md` (§1.1, §3, AC4a/AC4b/AC7, §6), this block,
+  `architecture.md` §13, `README.md` (behaviour + modal keys).
+
 ## M7 — Orchestration (multi-employee fan-out)
 
 - [x] 💻 Orchestrator: split one goal across `N` employees → parallel sessions (`tokio::spawn` + `JoinSet`)
@@ -209,3 +239,49 @@ against out-of-band context.
 | `form.created` payload shape | ✅ Resolved | Forms are nested under `data.form` on v2.0.32 (no top-level `sessionID`); `Event::form_request` unwraps `form` from `data`/`properties` and still accepts the older flat shape, so a paused session is answered instead of hanging | M7 |
 | Live model inference blocked by weekly budget | ✅ Resolved | Budget restored; live conversation loop can be verified against the service | M5 |
 | No Rust SDK (by design) | ✅ Resolved | Thin `opencode` module isolates the HTTP surface | M1 |
+
+---
+
+## Future work
+
+### Session-continuation policy
+
+> **Continuation is technically supported and well-defined, but the policy is
+> unexplored.** OpenCode's `POST /session/{id}/prompt` durably admits input to an existing
+> session and starts a new turn *even after an interrupt* (verified live, v2.0.32): the
+> interrupted turn persists as a partial assistant message (`finish:"error"`,
+> `error.type:"aborted"`, "Step interrupted") followed by an `idle` marker
+> `outcome:"interrupted"`, and a later prompt appends on top. Same-`session_id` resume is
+> therefore feasible — the open questions are product policy: whether to reopen vs start
+> fresh, how to treat the retained aborted turn (`completion_status`/`task_outcome`
+> currently grade it `Error`), and which `delivery`/`resume` knobs to use.
+
+**Finding — prompting an interrupted session is well-defined.** `session.prompt` is an
+*admission* call ("Durably admit one session input and schedule agent-loop execution unless
+`resume` is false") and `session.interrupt` returns "false for the idle no-op" with a
+`resume` knob, per the live OpenAPI of the running service (v2.0.32). Observed live on
+probe session `ses_eb304f82bffeTv0LOcpn4KYuKr` (free model, zero cost): prompt →
+interrupt → the cut-off turn retained as `assistant(finish:"error", error.type:"aborted")`
+followed by `idle(outcome:"interrupted")`; a second prompt on the same now-idle session ran
+a new turn (`user → assistant(finish:stop) → idle(succeeded)`) — **no error, no clean
+slate**. Client refs: `SessionMessage`'s `finish`/`outcome`/`error`
+(`src/opencode/models.rs:338-342`) and `is_incomplete()` (`:384`), `completion_status`
+(`src/app.rs:3167`), and `task_outcome` (`src/app.rs:3247`).
+
+**Open policy questions.** (1) Reopen the stored session or start fresh. (2) What to do
+with the retained aborted `finish:"error"` turn — steer past it, hide it, or accept it as
+context (mywaker grades it `Error` today). (3) Which admission knobs to use —
+`delivery: steer` vs `queue`, and the `resume` flag on prompt/interrupt.
+
+**Acceptance signal.** A resumed task either continues the same `session_id` with a defined
+treatment of the aborted turn, or the feature explicitly documents "start over" as the
+chosen policy. It is the latter today — see [`acceptance.md`](acceptance.md) §3 and AC4a —
+and the three places that would have to change are `run_task_attempt`'s
+`create_session_with_agent_fallback` (`src/app.rs:3212`), the `session_id` overwrite in
+`note_task_attempt` (`src/app.rs:2437`), and `harness::resume_preamble`
+(`src/harness.rs:80`).
+
+**Status: not supported today** — deliberate, and frozen as such by AC4a. Citations above
+are as of this entry; the finding as it was recorded cited `src/opencode/models.rs:300-352`,
+`src/app.rs:2995-3008` / `:3079-3092`, and `src/app.rs:3040` / `:2364` for the same three
+call sites, before this slice's edits shifted them.

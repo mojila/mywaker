@@ -78,7 +78,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::TaskStatus;
+    use crate::task::{PauseReason, TaskStatus};
 
     #[test]
     fn missing_file_loads_empty() {
@@ -144,6 +144,35 @@ mod tests {
         let legacy = serde_json::json!({ "tasks": [], "memory": {} });
         std::fs::write(&path, legacy.to_string()).unwrap();
         assert!(!Store::load(&path).unwrap().paused);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reopen prompt's input survives a restart: a task mywaker paused at
+    /// shutdown reloads still shutdown-paused (so it is offered back), while a
+    /// task the user paused deliberately reloads with its own reason.
+    #[test]
+    fn shutdown_pause_survives_a_round_trip() {
+        let dir = std::env::temp_dir().join(format!("mywaker-shutdown-{}", std::process::id()));
+        let path = dir.join("store.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut at_shutdown = Task::new("finish me", Some("writer".into()));
+        assert!(at_shutdown.transition(TaskStatus::Running));
+        assert!(at_shutdown.pause_for(PauseReason::Shutdown));
+        let mut by_user = Task::new("hold me", Some("planner".into()));
+        assert!(by_user.pause_for(PauseReason::User));
+
+        let mut store = Store::default();
+        store.upsert_task(at_shutdown);
+        store.upsert_task(by_user);
+        store.save(&path).unwrap();
+
+        let loaded = Store::load(&path).unwrap();
+        assert!(loaded.tasks[0].paused_at_shutdown());
+        assert_eq!(loaded.tasks[0].pause_reason, Some(PauseReason::Shutdown));
+        assert!(!loaded.tasks[1].paused_at_shutdown());
+        assert_eq!(loaded.tasks[1].pause_reason, Some(PauseReason::User));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

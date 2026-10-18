@@ -19,7 +19,7 @@ use crate::opencode::{
 };
 use crate::persistence::Store;
 use crate::projects::{self, Project};
-use crate::task::{Task, TaskId, TaskStatus};
+use crate::task::{PauseReason, Task, TaskId, TaskStatus};
 use crate::team::{EmployeeStatus, Team, move_selection};
 use crate::tui::Tui;
 use crate::ui;
@@ -238,6 +238,24 @@ fn chat_help_text() -> String {
     text
 }
 
+/// The reopen prompt: the tasks mywaker paused on the way out, offered back as
+/// one batch on the next launch, in the task panel's order (`order_tasks`).
+///
+/// Only tasks paused *at shutdown* are ever collected here — a task the user
+/// paused deliberately is not, so a deliberate pause can't leak into
+/// resume-all.
+#[derive(Debug, Clone)]
+pub struct ResumePrompt {
+    tasks: Vec<TaskId>,
+}
+
+impl ResumePrompt {
+    /// How many tasks the prompt covers.
+    pub fn count(&self) -> usize {
+        self.tasks.len()
+    }
+}
+
 pub struct App {
     config: Config,
     tx: Sender<Message>,
@@ -313,6 +331,9 @@ pub struct App {
     store_path: Option<PathBuf>,
     /// Whether the full-screen help overlay is showing.
     show_help: bool,
+    /// The reopen prompt: set at startup when mywaker itself paused tasks on the
+    /// way out. `None` — the normal case — means nothing is offered.
+    resume_prompt: Option<ResumePrompt>,
 }
 
 impl App {
@@ -362,6 +383,7 @@ impl App {
             store: Store::default(),
             store_path: None,
             show_help: false,
+            resume_prompt: None,
         }
     }
 
@@ -373,11 +395,15 @@ impl App {
 
     /// Enable task/memory persistence at the default store path, loading any
     /// previously saved tasks. Call once after [`Self::with_team`].
+    ///
+    /// Loading is also where the reopen prompt is prepared: if the last run
+    /// paused tasks on its way out, they are offered back now.
     pub fn enable_persistence(&mut self) {
         self.store_path = Store::default_path();
         if let Some(path) = &self.store_path {
             self.store = Store::load(path).unwrap_or_default();
         }
+        self.prepare_resume_prompt();
     }
 
     pub async fn run(&mut self, tui: &mut Tui, mut events: EventHandler) -> Result<()> {
@@ -417,13 +443,19 @@ impl App {
 
     /// Begin graceful shutdown: flush state, stop in-flight work, and let the run
     /// loop animate the "shutting down" overlay before relinquishing the terminal.
+    ///
+    /// The task queue is held *before* the store is flushed, so the pause is on
+    /// disk even though release builds abort on panic: a half-finished task is
+    /// then offered back on the next launch instead of being lost.
     fn initiate_shutdown(&mut self) {
         if self.shutting_down {
             return;
         }
         self.shutting_down = true;
         self.shutdown_frame = 0;
-        // Stop the current generation (best effort) and force a final store write.
+        // Hold the task queue (interrupting the sessions it was running in), stop
+        // the current chat generation (best effort), then force a final write.
+        self.pause_active_tasks();
         self.interrupt_current();
         self.persist_store();
     }
@@ -509,6 +541,14 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // The reopen prompt is drawn above everything, so it takes the key
+        // before the help overlay's dismiss and the global `q`/`Ctrl-C` quit
+        // bindings.
+        if self.resume_prompt.is_some() {
+            self.handle_resume_prompt_key(key);
+            return;
+        }
+
         // The help overlay swallows the next key (dismiss) before anything else.
         if self.show_help {
             self.show_help = false;
@@ -587,6 +627,34 @@ impl App {
         }
     }
 
+    /// Handle a key while the reopen prompt is showing: resume the held tasks,
+    /// keep them held, or quit leaving them held.
+    ///
+    /// Every other key is swallowed, so a stray press can't act on the screen
+    /// underneath a modal the user hasn't answered yet.
+    fn handle_resume_prompt_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.resume_shutdown_paused();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.dismiss_resume_prompt();
+            }
+            // Quitting from the prompt leaves the tasks exactly as they are —
+            // still shutdown-paused, so the prompt comes back next launch.
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.dismiss_resume_prompt();
+                self.initiate_shutdown();
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.dismiss_resume_prompt();
+                self.initiate_shutdown();
+            }
+            _ => {}
+        }
+    }
+
     /// Handle a mouse event: a click moves the selection to whatever it landed on
     /// (a roster node, a picker row), and a wheel notch steps the active screen the
     /// way its arrow keys do. Activation stays on Enter — a stray click never
@@ -601,6 +669,11 @@ impl App {
                 | MouseEventKind::ScrollUp
                 | MouseEventKind::ScrollDown
         ) {
+            return;
+        }
+        // The reopen prompt swallows input until it is answered, so a click
+        // can't move a selection underneath it.
+        if self.resume_prompt.is_some() {
             return;
         }
         // The shutdown overlay swallows everything; the help overlay is modal, so
@@ -2536,7 +2609,11 @@ impl App {
         self.persist_store();
         self.push_log(format!("▶ resumed task: {summary}"));
         let task = self.store.tasks[position].clone();
-        self.dispatch_task(&task, Some(harness::resume_preamble()));
+        // The "start over" preamble only makes sense when there was an earlier
+        // attempt to start over *from*: a task that never reached a session is
+        // re-run with its bare goal.
+        let preamble = task.session_id.is_some().then(harness::resume_preamble);
+        self.dispatch_task(&task, preamble);
     }
 
     /// Interrupt an autonomous task's session, best-effort.
@@ -2553,6 +2630,95 @@ impl App {
                     .await;
             }
         });
+    }
+
+    // --- the shutdown / reopen path ---
+
+    /// Hold every task that is still active and interrupt the sessions they were
+    /// running in, so nothing keeps working once the terminal is gone.
+    ///
+    /// The ordering is the point: each task is paused *before* its session is
+    /// interrupted, so the interrupt's trailing `TaskAttemptFinished` meets the
+    /// paused-task guard in [`Self::handle_task_attempt`] and is ignored rather
+    /// than flipping the task back to a terminal state.
+    ///
+    /// Terminal tasks are skipped — [`Task::pause_for`] refuses them — and a task
+    /// the user had already paused keeps its own reason, so a deliberate pause is
+    /// never offered back on reopen.
+    fn pause_active_tasks(&mut self) {
+        let mut sessions = Vec::new();
+        let mut held = 0usize;
+
+        for position in order_tasks(&self.store.tasks) {
+            let task = &mut self.store.tasks[position];
+            if !task.pause_for(PauseReason::Shutdown) {
+                continue;
+            }
+            held += 1;
+            if let Some(session_id) = task.session_id.clone() {
+                sessions.push(session_id);
+            }
+            if let Some(employee_id) = task.assigned_to.clone() {
+                self.team
+                    .set_status_by_id(&employee_id, EmployeeStatus::Idle);
+            }
+        }
+
+        for session_id in sessions {
+            self.interrupt_task_session(&session_id);
+        }
+
+        if held > 0 {
+            self.push_log(format!("⏸ paused {held} task(s) at shutdown"));
+        }
+    }
+
+    /// Collect the tasks mywaker itself paused on the way out into the reopen
+    /// prompt, in the task panel's own order (`order_tasks`).
+    ///
+    /// Runs once, right after the store is loaded. A normal launch — nothing
+    /// shutdown-paused — leaves the prompt unset, so nothing is shown; a task the
+    /// user paused deliberately is not collected.
+    fn prepare_resume_prompt(&mut self) {
+        let tasks: Vec<TaskId> = order_tasks(&self.store.tasks)
+            .into_iter()
+            .map(|index| &self.store.tasks[index])
+            .filter(|task| task.paused_at_shutdown())
+            .map(|task| task.id)
+            .collect();
+
+        self.resume_prompt = (!tasks.is_empty()).then_some(ResumePrompt { tasks });
+    }
+
+    /// Resume every task the prompt covers, in the prompt's own order, through
+    /// the ordinary per-task resume path (`resume_task` → `dispatch_task`).
+    ///
+    /// Each task therefore starts a **fresh** OpenCode session: resume re-runs the
+    /// task, it does not continue the interrupted session.
+    fn resume_shutdown_paused(&mut self) {
+        let Some(prompt) = self.resume_prompt.take() else {
+            return;
+        };
+        for task_id in prompt.tasks {
+            let Some(position) = self.store.tasks.iter().position(|task| task.id == task_id) else {
+                continue;
+            };
+            self.resume_task(position);
+        }
+    }
+
+    /// Keep the shutdown-paused tasks held: drop the prompt and say how to
+    /// continue one later. Declining does not touch the engine gate — new cron
+    /// and watch fires still dispatch.
+    fn dismiss_resume_prompt(&mut self) {
+        let Some(prompt) = self.resume_prompt.take() else {
+            return;
+        };
+        let count = prompt.tasks.len();
+        let plural = if count == 1 { "" } else { "s" };
+        self.push_log(format!(
+            "⏸ kept {count} task{plural} paused (press s to resume)"
+        ));
     }
 
     /// Persist the store to its configured path (a no-op when persistence is
@@ -2955,6 +3121,12 @@ impl App {
     /// `pending` instead of dispatching.
     pub fn is_paused(&self) -> bool {
         self.store.paused
+    }
+
+    /// The reopen prompt, when the last run paused tasks on its way out. The
+    /// renderer draws the modal from this and the prompter is the only writer.
+    pub fn resume_prompt(&self) -> Option<&ResumePrompt> {
+        self.resume_prompt.as_ref()
     }
 }
 
