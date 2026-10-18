@@ -20,6 +20,12 @@ pub struct Store {
     /// Per-employee memory, keyed by employee id (arbitrary JSON).
     #[serde(default)]
     pub memory: serde_json::Map<String, serde_json::Value>,
+    /// The engine gate: while set, an autonomous fire (cron or watch) is queued
+    /// as a `pending` task instead of dispatched. Persisted so a paused engine
+    /// is still paused after a restart (AC5). Defaults to `false` for a store
+    /// written before the field existed.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 impl Store {
@@ -82,6 +88,7 @@ mod tests {
         let store = Store::load(&path).unwrap();
         assert!(store.tasks.is_empty());
         assert!(store.memory.is_empty());
+        assert!(!store.paused);
     }
 
     #[test]
@@ -112,6 +119,31 @@ mod tests {
             loaded.memory.get("planner"),
             Some(&serde_json::json!({"note": "likes briefs"}))
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The engine pause gate round-trips: a store saved paused reloads paused
+    /// (AC5), and a store predating the field loads not-paused.
+    #[test]
+    fn engine_pause_survives_a_round_trip() {
+        let dir = std::env::temp_dir().join(format!("mywaker-paused-{}", std::process::id()));
+        let path = dir.join("store.json");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = Store {
+            paused: true,
+            ..Store::default()
+        };
+        store.save(&path).unwrap();
+
+        let loaded = Store::load(&path).unwrap();
+        assert!(loaded.paused, "a paused engine must reload paused");
+
+        // A legacy payload without the field defaults to not-paused.
+        let legacy = serde_json::json!({ "tasks": [], "memory": {} });
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        assert!(!Store::load(&path).unwrap().paused);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

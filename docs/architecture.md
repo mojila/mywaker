@@ -1,7 +1,7 @@
 # mywaker — Architecture
 
-Detailed technical design. Companion to [`PLAN.md`](../PLAN.md) and the checklist in
-[`todos.md`](todos.md).
+Detailed technical design. Companion to [`PLAN.md`](../PLAN.md), the checklist in
+[`todos.md`](todos.md), and the frozen criteria in [`acceptance.md`](acceptance.md).
 
 ---
 
@@ -13,6 +13,7 @@ mywaker/
 ├── .gitignore
 ├── PLAN.md
 ├── docs/
+│   ├── acceptance.md          frozen acceptance criteria — pause / continue (M6.5)
 │   ├── architecture.md        (this file)
 │   └── todos.md
 ├── .opencode/                  (created in M4 — OpenCode agent defs, the "employees")

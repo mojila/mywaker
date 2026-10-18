@@ -124,6 +124,25 @@ Legend: 🧩 design · 🔧 install · 💻 code · 🧪 test · 📄 docs · �
 - [x] 🧪 unit: retry cap; persistence round-trip
 - [ ] ✅ scheduled task fires autonomously, survives restart via persistence — history round-trips; live fire needs a running service
 
+## M6.5 — Pause & resume
+
+> Frozen spec: [`acceptance.md`](acceptance.md). Pause holds new autonomous work —
+> a cron or watch fire while paused lands as `pending` in the task queue and starts
+> no session. The scheduler and watcher are unchanged; the app queues instead.
+> Interactive chat and delegation hand-offs are out of scope.
+
+- [x] 💻 `TaskStatus::Paused` + `Task::pause`/`resume` (legal only from `Pending`/`Running`); a `paused` flag on the task and an engine gate on the store, both `#[serde(default)]` so `store.json` round-trips (AC5)
+- [x] 💻 Engine gate: `handle_autonomous_task` records a paused fire as `pending`, starts no session, and logs `⏸ queued (paused)` (AC1); `Space` toggles it and `resume_pending` dispatches queued work in `order_tasks` order (AC2)
+- [x] 💻 Per-task control: `s` pauses/resumes the selected employee's current task — `pause_task` interrupts the session, `resume_task` re-dispatches with `harness::resume_preamble` (AC3/AC4)
+- [x] 💻 Race guard: `Message::TaskAttemptStarted` records the attempt's session (and interrupts it if the task was paused first), and `Message::TaskAttemptFinished` is a no-op for a paused task (AC3)
+- [x] 💻 Indicators: `Space`/`s` in the hint bar, help overlay, and README; the queue heading shows `⏸ paused` and a paused task renders `paused`
+
+### Acceptance
+
+The criteria for this milestone (**AC1–AC6**) are frozen in
+[`acceptance.md`](acceptance.md) — the reviewer verifies against that file, not
+against out-of-band context.
+
 ## M7 — Orchestration (multi-employee fan-out)
 
 - [x] 💻 Orchestrator: split one goal across `N` employees → parallel sessions (`tokio::spawn` + `JoinSet`)

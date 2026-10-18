@@ -58,6 +58,13 @@ pub enum Message {
         succeeded: bool,
         result: String,
     },
+    /// One delivery attempt for a scheduled task started, reporting the session
+    /// it runs in so a pause can interrupt it (and so a pause that landed before
+    /// the session existed can still be honoured).
+    TaskAttemptStarted {
+        task_id: crate::task::TaskId,
+        session_id: String,
+    },
     /// A free-form line for the status log.
     Log(String),
     /// Quit the application.

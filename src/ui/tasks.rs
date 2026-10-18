@@ -37,14 +37,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     // The persisted scheduled-task queue, active work first. The heading only
-    // appears when there is something queued, so an idle store stays quiet.
-    if !tasks.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " queue",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
+    // appears when there is something queued — or when the engine is paused, so
+    // the held state stays visible even over an empty queue.
+    if !tasks.is_empty() || app.is_paused() {
+        lines.push(queue_heading(app.is_paused()));
         for &index in &app::order_tasks(tasks) {
             lines.push(queued_task_line(&tasks[index]));
         }
@@ -60,6 +56,26 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The queue heading: `queue`, plus a ⏸ marker when the engine gate is set so
+/// the paused state is legible at a glance.
+fn queue_heading(paused: bool) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        " queue",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if paused {
+        spans.push(Span::styled(
+            " · ⏸ paused",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// One line of the persisted-task queue: the status label (colored) plus a

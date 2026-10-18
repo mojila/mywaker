@@ -74,6 +74,15 @@ pub fn retry_preamble(attempt: u8) -> String {
     )
 }
 
+/// Preamble prepended when re-issuing a task the user paused: the earlier
+/// attempt was interrupted, so the model should treat it as unfinished and
+/// start over rather than assume the transcript is a complete result.
+pub fn resume_preamble() -> String {
+    "The previous attempt was paused and interrupted; please start this task over from the \
+     beginning."
+        .to_string()
+}
+
 /// Deterministic note standing in for a deliverable that never arrived, so a
 /// fan-out still aggregates instead of waiting forever for a worker that will
 /// never respond. `reason` is omitted when the hand-off produced nothing at all
@@ -127,6 +136,11 @@ mod tests {
         let preamble = retry_preamble(2);
         assert!(preamble.contains("attempt 2"));
         assert!(preamble.contains(&MAX_ATTEMPTS.to_string()));
+
+        // The resume preamble reads as a pause, not a retry.
+        let resume = resume_preamble();
+        assert!(resume.contains("paused"));
+        assert!(!resume.contains("failed"));
 
         // A reason is spelled out in parentheses; no reason leaves the note as a
         // bare statement — both name the worker whose deliverable is missing.

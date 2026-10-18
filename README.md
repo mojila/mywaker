@@ -154,6 +154,8 @@ rather than failing with `Agent not found`.
 | `Enter` | Chat with the selected employee |
 | `m` | Pick a model for the selected employee |
 | `p` | Choose the working project |
+| `Space` | Pause / resume the autonomous-task engine (new cron/watch fires queue) |
+| `s` | Pause / resume the selected employee's task |
 | `?` | Open the keybindings help overlay |
 | `Esc` | Back / leave chat |
 | `q` / `Ctrl-C` | Quit |

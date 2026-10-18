@@ -4,7 +4,8 @@
 //! state machine, and enough provenance (timestamps, session id, final result)
 //! to be persisted and inspected. The `TaskStatus` transitions are validated so
 //! a task can't leap from `Pending` straight to `Succeeded`, and retries are
-//! bounded by [`MAX_ATTEMPTS`].
+//! bounded by [`MAX_ATTEMPTS`]. A task may also be *paused* by the user — held
+//! out of dispatch by [`Task::pause`]/[`Task::resume`] until they continue it.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,6 +48,7 @@ impl Default for TaskId {
 pub enum TaskStatus {
     Pending,
     Running,
+    Paused,
     Retrying,
     Succeeded,
     Failed,
@@ -58,6 +60,7 @@ impl TaskStatus {
         match self {
             TaskStatus::Pending => "pending",
             TaskStatus::Running => "running",
+            TaskStatus::Paused => "paused",
             TaskStatus::Retrying => "retrying",
             TaskStatus::Succeeded => "succeeded",
             TaskStatus::Failed => "failed",
@@ -74,6 +77,11 @@ pub struct Task {
     /// The employee id this task is assigned to (`None` = orchestrator-level).
     pub assigned_to: Option<String>,
     pub status: TaskStatus,
+    /// The user paused this task: it is held out of dispatch until resumed.
+    /// Kept in lockstep with [`TaskStatus::Paused`] by [`Task::pause`] and
+    /// [`Task::resume`], which are the only writers.
+    #[serde(default)]
+    pub paused: bool,
     pub attempts: u8,
     /// The OpenCode session id running this task, once created.
     pub session_id: Option<String>,
@@ -93,6 +101,7 @@ impl Task {
             goal: goal.into(),
             assigned_to,
             status: TaskStatus::Pending,
+            paused: false,
             attempts: 0,
             session_id: None,
             result: None,
@@ -103,14 +112,22 @@ impl Task {
 
     /// Advance the task to `next`, returning `false` (and leaving state
     /// untouched) when the transition is not legal from the current state.
+    ///
+    /// Pausing is its own pair of edges (`Pending`/`Running` ⇄ `Paused`) rather
+    /// than a plain status write, so a terminal task can never be paused and a
+    /// paused task can never be sent straight to `Succeeded`/`Failed` without
+    /// going back through `Running`.
     pub fn transition(&mut self, next: TaskStatus) -> bool {
         let legal = matches!(
             (self.status, next),
             (TaskStatus::Pending, TaskStatus::Running)
+                | (TaskStatus::Pending, TaskStatus::Paused)
                 | (TaskStatus::Pending, TaskStatus::Failed)
+                | (TaskStatus::Running, TaskStatus::Paused)
                 | (TaskStatus::Running, TaskStatus::Succeeded)
                 | (TaskStatus::Running, TaskStatus::Failed)
                 | (TaskStatus::Running, TaskStatus::Retrying)
+                | (TaskStatus::Paused, TaskStatus::Running)
                 | (TaskStatus::Retrying, TaskStatus::Running)
                 | (TaskStatus::Retrying, TaskStatus::Succeeded)
                 | (TaskStatus::Retrying, TaskStatus::Failed)
@@ -119,6 +136,27 @@ impl Task {
             self.status = next;
         }
         legal
+    }
+
+    /// Pause the task: hold it out of dispatch until [`Task::resume`]. Legal
+    /// only while the task is queued or running, so a finished task can't be
+    /// paused. The flag and the status move together.
+    pub fn pause(&mut self) -> bool {
+        if !self.transition(TaskStatus::Paused) {
+            return false;
+        }
+        self.paused = true;
+        true
+    }
+
+    /// Resume a paused task, returning it to `Running` so the caller can start a
+    /// fresh attempt. `false` (and no change) when the task isn't paused.
+    pub fn resume(&mut self) -> bool {
+        if !self.paused || !self.transition(TaskStatus::Running) {
+            return false;
+        }
+        self.paused = false;
+        true
     }
 
     /// Try to retry the task: bump the attempt counter and mark `Retrying`,
@@ -252,5 +290,57 @@ mod tests {
         assert_eq!(loaded.status, TaskStatus::Succeeded);
         assert_eq!(loaded.attempts, 2);
         assert_eq!(loaded.result.as_deref(), Some("done"));
+    }
+
+    /// Pausing moves the status and the dispatch flag together; resuming does
+    /// the reverse. Only a queued or running task can be paused.
+    #[test]
+    fn pause_and_resume_move_status_and_flag_together() {
+        let mut task = Task::new("x", None);
+
+        // A queued task can be held before it ever starts.
+        assert!(task.pause());
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert!(task.paused);
+
+        // Resuming returns it to `Running` and clears the flag.
+        assert!(task.resume());
+        assert_eq!(task.status, TaskStatus::Running);
+        assert!(!task.paused);
+
+        // A running task can be paused.
+        assert!(task.pause());
+        assert_eq!(task.status, TaskStatus::Paused);
+
+        // A finished task can never be paused.
+        let mut done = Task::new("x", None);
+        done.succeed("ok");
+        assert!(!done.pause());
+        assert_eq!(done.status, TaskStatus::Succeeded);
+        assert!(!done.paused);
+
+        // Resuming a task that isn't paused is a no-op.
+        let mut fresh = Task::new("x", None);
+        assert!(!fresh.resume());
+        assert_eq!(fresh.status, TaskStatus::Pending);
+    }
+
+    /// `paused` survives a round-trip so a paused task reloads paused, and a
+    /// store written before the field existed still loads (serde default).
+    #[test]
+    fn paused_flag_round_trips_and_defaults_for_legacy_json() {
+        let mut task = Task::new("hold me", Some("writer".into()));
+        assert!(task.pause());
+
+        let text = serde_json::to_string(&task).unwrap();
+        let loaded: Task = serde_json::from_str(&text).unwrap();
+        assert_eq!(loaded.status, TaskStatus::Paused);
+        assert!(loaded.paused);
+
+        // A payload predating the field (no `paused` key) defaults to not-paused.
+        let mut legacy = serde_json::to_value(&task).unwrap();
+        legacy.as_object_mut().unwrap().remove("paused");
+        let legacy: Task = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.paused);
     }
 }

@@ -231,6 +231,13 @@ impl Team {
         }
     }
 
+    /// Set one employee's last task by id (no-op if the id is unknown).
+    pub fn set_last_task_by_id(&mut self, id: &str, task: Option<String>) {
+        if let Some(employee) = self.employee_mut(id) {
+            employee.last_task = task;
+        }
+    }
+
     // --- roster management (CRUD) ---
 
     /// Add an employee, rejecting duplicate ids.

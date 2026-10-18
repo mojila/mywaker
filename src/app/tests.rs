@@ -5,6 +5,11 @@ fn make_app() -> (App, tokio::sync::mpsc::Receiver<Message>) {
     (App::new(Config::default(), tx), rx)
 }
 
+/// Deliver one plain key press through the app's own key path.
+fn press(app: &mut App, code: KeyCode) {
+    app.update(Message::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+}
+
 #[test]
 fn task_summary_takes_first_line_and_truncates() {
     assert_eq!(task_summary("draft the intro"), "draft the intro");
@@ -1129,6 +1134,195 @@ fn renders_task_queue_without_panicking() {
     assert!(text.contains("running"), "queued task status missing");
     assert!(text.contains("sweep the inbox"), "queued goal missing");
     assert!(text.contains("pending"), "pending task status missing");
+}
+
+/// AC1: while the engine is paused, an autonomous fire is recorded as queued
+/// work — `pending`, no session — and the log says so.
+#[test]
+fn paused_engine_queues_a_fire_without_dispatching() {
+    let (mut app, _rx) = make_app();
+    press(&mut app, KeyCode::Char(' ')); // pause the engine
+    assert!(app.is_paused());
+
+    app.update(Message::WatchedTask {
+        employee: "researcher".into(),
+        goal: "Review the change to src/app.rs".into(),
+    });
+
+    let task = app.store.tasks.last().expect("the fire was recorded");
+    assert_eq!(task.status, TaskStatus::Pending);
+    assert_eq!(task.session_id, None);
+    assert!(
+        app.log
+            .iter()
+            .any(|line| line.contains("⏸ queued (paused)")),
+        "queue log line missing: {:?}",
+        app.log
+    );
+}
+
+/// AC2: resuming the engine dispatches what queued up — every queued task runs,
+/// and the dispatch set is the queue panel's own ordering.
+#[test]
+fn resuming_the_engine_dispatches_queued_tasks_in_queue_order() {
+    let (mut app, _rx) = make_app();
+    press(&mut app, KeyCode::Char(' ')); // pause
+
+    app.update(Message::WatchedTask {
+        employee: "researcher".into(),
+        goal: "first".into(),
+    });
+    app.update(Message::WatchedTask {
+        employee: "writer".into(),
+        goal: "second".into(),
+    });
+    assert!(app.tasks().iter().all(|t| t.status == TaskStatus::Pending));
+    assert_eq!(app.resumable_tasks().len(), 2);
+
+    press(&mut app, KeyCode::Char(' ')); // resume
+    assert!(!app.is_paused());
+    assert!(app.tasks().iter().all(|t| t.status == TaskStatus::Running));
+}
+
+/// The dispatch set is `order_tasks` restricted to queued work the user hasn't
+/// individually paused — so a resume can't go out of order or wake a held task.
+#[test]
+fn resumable_tasks_follow_order_tasks_and_skip_held_work() {
+    let (mut app, _rx) = make_app();
+
+    let mut older = Task::new("older", Some("researcher".into()));
+    older.created_at = 10;
+    let mut newer = Task::new("newer", Some("writer".into()));
+    newer.created_at = 20;
+    let mut held = Task::new("held", Some("planner".into()));
+    held.created_at = 30;
+    assert!(held.pause());
+    let mut done = Task::new("done", Some("reviewer".into()));
+    done.succeed("ok");
+
+    for task in [older, newer, held, done] {
+        app.store.upsert_task(task);
+    }
+
+    let goals: Vec<&str> = app
+        .resumable_tasks()
+        .iter()
+        .map(|&index| app.store.tasks[index].goal.as_str())
+        .collect();
+    // Newest active first; the individually paused and the terminal task drop out.
+    assert_eq!(goals, vec!["newer", "older"]);
+}
+
+/// AC3: pausing a running task holds it, and the interrupted session's trailing
+/// attempt-finish does not flip it back.
+#[test]
+fn pausing_a_running_task_survives_a_late_attempt_finish() {
+    let (mut app, _rx) = make_app();
+    let mut task = Task::new("sweep the inbox", Some("researcher".into()));
+    assert!(task.transition(TaskStatus::Running));
+    task.session_id = Some("ses_task".into());
+    let task_id = task.id;
+    app.store.upsert_task(task);
+
+    app.selected = app.team_index_by_id("researcher").expect("known employee");
+    press(&mut app, KeyCode::Char('s'));
+
+    assert_eq!(app.store.tasks[0].status, TaskStatus::Paused);
+    assert!(app.store.tasks[0].paused);
+
+    // The interrupt's trailing completion must be ignored.
+    app.update(Message::TaskAttemptFinished {
+        task_id,
+        succeeded: true,
+        result: "done anyway".into(),
+    });
+
+    let held = &app.store.tasks[0];
+    assert_eq!(
+        held.status,
+        TaskStatus::Paused,
+        "a late finish must not flip a paused task"
+    );
+    assert!(held.result.is_none());
+    assert!(
+        app.log
+            .iter()
+            .any(|line| line.contains("ignored late attempt")),
+        "the race guard is silent: {:?}",
+        app.log
+    );
+}
+
+/// A task paused before its attempt reports in: the arriving session is
+/// interrupted, not adopted, and the task stays paused.
+#[test]
+fn a_paused_task_does_not_adopt_a_late_session() {
+    let (mut app, _rx) = make_app();
+    let mut task = Task::new("sweep the inbox", Some("researcher".into()));
+    assert!(task.transition(TaskStatus::Running));
+    let task_id = task.id;
+    app.store.upsert_task(task);
+
+    app.pause_task(0);
+    app.update(Message::TaskAttemptStarted {
+        task_id,
+        session_id: "ses_late".into(),
+    });
+
+    assert_eq!(app.store.tasks[0].status, TaskStatus::Paused);
+    assert_eq!(app.store.tasks[0].session_id, None);
+}
+
+/// AC4: resuming a paused task returns it to `running` and re-dispatches it.
+#[test]
+fn resuming_a_paused_task_returns_it_to_running() {
+    let (mut app, _rx) = make_app();
+    let mut task = Task::new("sweep the inbox", Some("researcher".into()));
+    assert!(task.transition(TaskStatus::Running));
+    app.store.upsert_task(task);
+
+    app.selected = app.team_index_by_id("researcher").expect("known employee");
+    press(&mut app, KeyCode::Char('s')); // pause
+    assert_eq!(app.store.tasks[0].status, TaskStatus::Paused);
+
+    press(&mut app, KeyCode::Char('s')); // resume
+    assert_eq!(app.store.tasks[0].status, TaskStatus::Running);
+    assert!(!app.store.tasks[0].paused);
+    assert!(app.log.iter().any(|line| line.contains("▶ resumed task")));
+}
+
+/// The pause keys are safe with nothing to act on: `s` invents no task and
+/// `Space` still flips the gate.
+#[test]
+fn pause_keys_are_inert_without_a_task() {
+    let (mut app, _rx) = make_app();
+
+    press(&mut app, KeyCode::Char('s'));
+    assert!(app.tasks().is_empty());
+    assert!(app.log.iter().any(|line| line.contains("no task to pause")));
+
+    press(&mut app, KeyCode::Char(' '));
+    assert!(app.is_paused());
+    press(&mut app, KeyCode::Char(' '));
+    assert!(!app.is_paused());
+}
+
+/// The queue panel shows a paused engine, and a paused task reads `paused`.
+#[test]
+fn renders_paused_engine_and_task() {
+    let (mut app, _rx) = make_app();
+    app.store.paused = true;
+
+    let text = screen(&app, 120, 40);
+    assert!(text.contains("⏸ paused"), "engine pause indicator missing");
+
+    app.store.paused = false;
+    let mut held = Task::new("hold me", Some("researcher".into()));
+    assert!(held.pause());
+    app.store.upsert_task(held);
+
+    let text = screen(&app, 120, 40);
+    assert!(text.contains("paused"), "paused task status missing");
 }
 
 /// A prompt typed while the employee is mid-turn is queued (not dropped) and

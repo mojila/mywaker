@@ -65,6 +65,7 @@ pub fn task_color(status: TaskStatus) -> Color {
     match status {
         TaskStatus::Pending => Color::DarkGray,
         TaskStatus::Running => Color::Cyan,
+        TaskStatus::Paused => Color::Yellow,
         TaskStatus::Retrying => Color::Yellow,
         TaskStatus::Succeeded => Color::Green,
         TaskStatus::Failed => Color::Red,
@@ -117,6 +118,7 @@ mod tests {
     fn task_colors_track_task_status() {
         assert_eq!(task_color(TaskStatus::Pending), Color::DarkGray);
         assert_eq!(task_color(TaskStatus::Running), Color::Cyan);
+        assert_eq!(task_color(TaskStatus::Paused), Color::Yellow);
         assert_eq!(task_color(TaskStatus::Retrying), Color::Yellow);
         assert_eq!(task_color(TaskStatus::Succeeded), Color::Green);
         assert_eq!(task_color(TaskStatus::Failed), Color::Red);

@@ -497,6 +497,12 @@ impl App {
             } => {
                 self.handle_task_attempt(task_id, succeeded, result);
             }
+            Message::TaskAttemptStarted {
+                task_id,
+                session_id,
+            } => {
+                self.note_task_attempt(task_id, session_id);
+            }
             Message::Log(line) => self.push_log(line),
             Message::Quit => self.initiate_shutdown(),
         }
@@ -538,6 +544,8 @@ impl App {
                 KeyCode::Enter => self.start_chat(self.selected),
                 KeyCode::Char('p') | KeyCode::Char('P') => self.open_projects(),
                 KeyCode::Char('m') | KeyCode::Char('M') => self.open_models(),
+                KeyCode::Char(' ') => self.toggle_engine_pause(),
+                KeyCode::Char('s') => self.toggle_task_pause(),
                 _ => {}
             },
             Mode::Projects => match key.code {
@@ -2258,6 +2266,10 @@ impl App {
     /// An autonomous trigger (a cron schedule or a file watch) fired: record a
     /// task and dispatch its first attempt. `label` prefixes the log line so the
     /// trigger source stays visible.
+    ///
+    /// While the engine is paused (AC1) the fire is still recorded, but it lands
+    /// as `pending` and starts no session — the scheduler and watcher are
+    /// untouched and simply keep firing into a queue.
     fn handle_autonomous_task(&mut self, label: &str, employee_id: String, goal: String) {
         let Some(index) = self.team_index_by_id(&employee_id) else {
             self.push_log(format!(
@@ -2266,23 +2278,32 @@ impl App {
             return;
         };
 
+        let summary = task_summary(&goal);
         let mut task = Task::new(goal.clone(), Some(employee_id.clone()));
+
+        if self.store.paused {
+            self.store.upsert_task(task);
+            self.persist_store();
+            self.push_log(format!(
+                "{label} for {employee_id}: {summary} — ⏸ queued (paused)"
+            ));
+            return;
+        }
+
         task.transition(TaskStatus::Running);
         self.store.upsert_task(task.clone());
         self.persist_store();
 
         self.team.set_status(index, EmployeeStatus::Thinking);
-        self.team.set_last_task(index, Some(task_summary(&goal)));
-        self.push_log(format!(
-            "{label} for {employee_id}: {}",
-            task_summary(&goal)
-        ));
+        self.team.set_last_task(index, Some(summary.clone()));
+        self.push_log(format!("{label} for {employee_id}: {summary}"));
 
-        self.dispatch_task(&task);
+        self.dispatch_task(&task, None);
     }
 
-    /// Spawn one delivery attempt for `task` in the background.
-    fn dispatch_task(&mut self, task: &Task) {
+    /// Spawn one delivery attempt for `task` in the background. `preamble`, when
+    /// set, is prepended to the goal (a retry or a resume note).
+    fn dispatch_task(&mut self, task: &Task, preamble: Option<String>) {
         let Some(client) = self.client.clone() else {
             self.push_log("scheduled task: not connected to OpenCode".to_string());
             return;
@@ -2299,7 +2320,6 @@ impl App {
         let agent = employee.agent_id().to_owned();
         let model = employee.model_ref();
         let goal = task.goal.clone();
-        let attempts = task.attempts;
         let task_id = task.id;
         let tx = self.tx.clone();
 
@@ -2310,7 +2330,9 @@ impl App {
                 Some(agent.as_str()),
                 model.as_ref(),
                 &goal,
-                attempts,
+                preamble.as_deref(),
+                task_id,
+                tx.clone(),
             )
             .await;
             let (succeeded, result) = match outcome {
@@ -2327,12 +2349,40 @@ impl App {
         });
     }
 
+    /// Record the session an in-flight task attempt is running in, so a pause
+    /// can interrupt it (AC3). A task already paused when its attempt reports in
+    /// is interrupted instead of adopted — the pause fired before the session
+    /// existed and must not be undone.
+    fn note_task_attempt(&mut self, task_id: TaskId, session_id: String) {
+        let Some(position) = self.store.tasks.iter().position(|t| t.id == task_id) else {
+            return;
+        };
+        if self.store.tasks[position].paused {
+            self.interrupt_task_session(&session_id);
+            return;
+        }
+        self.store.tasks[position].session_id = Some(session_id);
+        self.persist_store();
+    }
+
     /// Handle the outcome of one scheduled-task attempt: succeed, retry (bounded),
     /// or fail — persisting the task and updating the roster status each time.
+    ///
+    /// A task the user paused mid-flight is left alone: the interrupted
+    /// session's trailing completion must not flip it back to a terminal state
+    /// (the AC3 race guard).
     fn handle_task_attempt(&mut self, task_id: TaskId, succeeded: bool, result: String) {
         let Some(position) = self.store.tasks.iter().position(|t| t.id == task_id) else {
             return;
         };
+
+        if self.store.tasks[position].paused {
+            self.push_log(format!(
+                "⏸ ignored late attempt for paused task: {}",
+                task_summary(&self.store.tasks[position].goal)
+            ));
+            return;
+        }
 
         let assigned = self.store.tasks[position].assigned_to.clone();
         let summary = task_summary(&self.store.tasks[position].goal);
@@ -2359,8 +2409,150 @@ impl App {
 
         if retry {
             let task = self.store.tasks[position].clone();
-            self.dispatch_task(&task);
+            let preamble = Some(harness::retry_preamble(task.attempts));
+            self.dispatch_task(&task, preamble);
         }
+    }
+
+    // --- pause & resume (the engine gate and per-task control) ---
+
+    /// Toggle the engine gate (`Space`): while paused, autonomous fires queue as
+    /// `pending` instead of starting a session. Resuming dispatches whatever
+    /// queued up (AC2).
+    fn toggle_engine_pause(&mut self) {
+        self.store.paused = !self.store.paused;
+        if self.store.paused {
+            self.push_log("⏸ engine paused — new fires will queue".to_string());
+        } else {
+            self.push_log("▶ engine resumed".to_string());
+            self.resume_pending();
+        }
+        self.persist_store();
+    }
+
+    /// Dispatch the tasks the engine held while paused, in the queue panel's own
+    /// order (`order_tasks` — active work first, newest-first; AC2). Individually
+    /// paused tasks are left for the user to resume.
+    fn resume_pending(&mut self) {
+        for position in self.resumable_tasks() {
+            let mut task = self.store.tasks[position].clone();
+            if !task.transition(TaskStatus::Running) {
+                continue;
+            }
+            self.store.upsert_task(task.clone());
+            if let Some(employee_id) = &task.assigned_to {
+                self.team
+                    .set_status_by_id(employee_id, EmployeeStatus::Thinking);
+                self.team
+                    .set_last_task_by_id(employee_id, Some(task_summary(&task.goal)));
+            }
+            self.push_log(format!(
+                "▶ dispatching queued task: {}",
+                task_summary(&task.goal)
+            ));
+            self.dispatch_task(&task, None);
+        }
+        self.persist_store();
+    }
+
+    /// The indices [`Self::resume_pending`] should dispatch: queued tasks that
+    /// the user hasn't individually paused, in `order_tasks` order.
+    fn resumable_tasks(&self) -> Vec<usize> {
+        order_tasks(&self.store.tasks)
+            .into_iter()
+            .filter(|&index| {
+                let task = &self.store.tasks[index];
+                task.status == TaskStatus::Pending && !task.paused
+            })
+            .collect()
+    }
+
+    /// Toggle pause on the selected employee's current task (`s`): pause a
+    /// queued or running one, or resume a paused one (AC3/AC4).
+    fn toggle_task_pause(&mut self) {
+        let Some(employee) = self.team.employees().get(self.selected) else {
+            return;
+        };
+        let employee_id = employee.id.clone();
+        let Some(position) = self.current_task_for(&employee_id) else {
+            self.push_log(format!("no task to pause for {employee_id}"));
+            return;
+        };
+        if self.store.tasks[position].paused {
+            self.resume_task(position);
+        } else {
+            self.pause_task(position);
+        }
+    }
+
+    /// The newest active task assigned to `employee_id` — the one `s` toggles.
+    fn current_task_for(&self, employee_id: &str) -> Option<usize> {
+        self.store
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| {
+                task.assigned_to.as_deref() == Some(employee_id)
+                    && matches!(
+                        task.status,
+                        TaskStatus::Pending | TaskStatus::Running | TaskStatus::Paused
+                    )
+            })
+            .max_by_key(|(_, task)| task.created_at)
+            .map(|(index, _)| index)
+    }
+
+    /// Pause one task: interrupt its session (when one exists) and hold it. Its
+    /// employee goes idle — the task is no longer working.
+    fn pause_task(&mut self, position: usize) {
+        let summary = task_summary(&self.store.tasks[position].goal);
+        if !self.store.tasks[position].pause() {
+            return;
+        }
+        if let Some(session_id) = self.store.tasks[position].session_id.clone() {
+            self.interrupt_task_session(&session_id);
+        }
+        if let Some(employee_id) = self.store.tasks[position].assigned_to.clone() {
+            self.team
+                .set_status_by_id(&employee_id, EmployeeStatus::Idle);
+        }
+        self.push_log(format!("⏸ paused task: {summary}"));
+        self.persist_store();
+    }
+
+    /// Resume one task: back to `running` and dispatched again with the resume
+    /// preamble (AC4).
+    fn resume_task(&mut self, position: usize) {
+        let summary = task_summary(&self.store.tasks[position].goal);
+        if !self.store.tasks[position].resume() {
+            return;
+        }
+        if let Some(employee_id) = self.store.tasks[position].assigned_to.clone() {
+            self.team
+                .set_status_by_id(&employee_id, EmployeeStatus::Thinking);
+            self.team
+                .set_last_task_by_id(&employee_id, Some(summary.clone()));
+        }
+        self.persist_store();
+        self.push_log(format!("▶ resumed task: {summary}"));
+        let task = self.store.tasks[position].clone();
+        self.dispatch_task(&task, Some(harness::resume_preamble()));
+    }
+
+    /// Interrupt an autonomous task's session, best-effort.
+    fn interrupt_task_session(&mut self, session_id: &str) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let session_id = session_id.to_string();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = client.interrupt(&session_id).await {
+                let _ = tx
+                    .send(Message::Log(format!("interrupt failed: {err}")))
+                    .await;
+            }
+        });
     }
 
     /// Persist the store to its configured path (a no-op when persistence is
@@ -2758,6 +2950,12 @@ impl App {
     pub fn tasks(&self) -> &[Task] {
         &self.store.tasks
     }
+
+    /// Whether the engine gate is set — autonomous fires are queuing as
+    /// `pending` instead of dispatching.
+    pub fn is_paused(&self) -> bool {
+        self.store.paused
+    }
 }
 
 /// A short, single-line summary of a task — the goal an employee is handed —
@@ -2778,7 +2976,7 @@ pub(crate) fn task_summary(text: &str) -> String {
 }
 
 /// A display ordering for the tasks panel: active work first (Pending, Running,
-/// Retrying), then terminal tasks (Succeeded, Failed), each group sorted
+/// Paused, Retrying), then terminal tasks (Succeeded, Failed), each group sorted
 /// newest-first by `created_at`. Returns indices into `tasks` so callers keep
 /// borrowing the original slice.
 pub(crate) fn order_tasks(tasks: &[Task]) -> Vec<usize> {
@@ -2820,16 +3018,23 @@ fn last_assistant_output(messages: &[SessionMessage]) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// Run one scheduled-task attempt: create a session, prompt (with a retry
-/// preamble on later attempts), wait for completion, and read the outcome back
+/// Run one scheduled-task attempt: create a session, prompt (with a retry or
+/// resume preamble when given), wait for completion, and read the outcome back
 /// from the transcript. `Ok` carries the deliverable; `Err` the failure reason.
+///
+/// The session id is reported back as a [`Message::TaskAttemptStarted`] before
+/// the prompt is sent, so the app can interrupt the attempt if the task is
+/// paused while it runs.
+#[allow(clippy::too_many_arguments)]
 async fn run_task_attempt(
     client: &OpenCode,
     directory: &str,
     agent: Option<&str>,
     model: Option<&ModelRef>,
     goal: &str,
-    attempts: u8,
+    preamble: Option<&str>,
+    task_id: TaskId,
+    tx: Sender<Message>,
 ) -> Result<String, String> {
     let (session, _used_agent) = client
         .create_session_with_agent_fallback(directory, agent, model)
@@ -2837,10 +3042,16 @@ async fn run_task_attempt(
         .map_err(|err| format!("session failed: {err:#}"))?;
     let session_id = session.id;
 
-    let prompt = if attempts > 0 {
-        format!("{}\n\n{}", harness::retry_preamble(attempts), goal)
-    } else {
-        goal.to_string()
+    let _ = tx
+        .send(Message::TaskAttemptStarted {
+            task_id,
+            session_id: session_id.clone(),
+        })
+        .await;
+
+    let prompt = match preamble {
+        Some(preamble) => format!("{preamble}\n\n{goal}"),
+        None => goal.to_string(),
     };
 
     client
