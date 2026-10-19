@@ -17,11 +17,21 @@ use mywaker::opencode::OpenCode;
 use reqwest::Url;
 use serde_json::{Value, json};
 
+/// One prompt as the server received it: the text, the `delivery` knob, and the
+/// admission `id` (if any).
+#[derive(Clone, Debug, Default)]
+struct ReceivedPrompt {
+    text: String,
+    delivery: Option<String>,
+    admission_id: Option<String>,
+}
+
 /// Shared fake-server state: the prompts and requested session agents it has
 /// received, in order.
 #[derive(Clone, Default)]
 struct FakeState {
     prompts: Arc<Mutex<Vec<String>>>,
+    received: Arc<Mutex<Vec<ReceivedPrompt>>>,
     session_agents: Arc<Mutex<Vec<Option<String>>>>,
 }
 
@@ -69,7 +79,16 @@ async fn prompt(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let received = ReceivedPrompt {
+        text: text.clone(),
+        delivery: body
+            .get("delivery")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        admission_id: body.get("id").and_then(Value::as_str).map(str::to_owned),
+    };
     state.prompts.lock().unwrap().push(text);
+    state.received.lock().unwrap().push(received);
     Json(json!({}))
 }
 
@@ -203,4 +222,56 @@ async fn defined_agent_binds_directly() {
 
     let agents = state.session_agents.lock().unwrap();
     assert_eq!(agents.as_slice(), [Some("researcher".to_string())]);
+}
+
+/// A plain `prompt` is the explicit-steer path: it sends `delivery: "steer"` and
+/// no admission id, which is what a user typing in a chat means.
+#[tokio::test]
+async fn prompt_steers_by_default() {
+    let (client, state) = start_server().await;
+    client.create_session("/work", None, None).await.unwrap();
+
+    client.prompt("ses_test", "do it now").await.unwrap();
+
+    let received = state.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].text, "do it now");
+    assert_eq!(received[0].delivery.as_deref(), Some("steer"));
+    assert_eq!(received[0].admission_id, None, "no id unless one is given");
+}
+
+/// `prompt_with` sends the delivery knob and the admission id it is given, so a
+/// queued hand-off waits its turn and a resend is deduplicated by the service.
+#[tokio::test]
+async fn prompt_with_sends_delivery_and_admission_id() {
+    let (client, state) = start_server().await;
+    client.create_session("/work", None, None).await.unwrap();
+
+    let options = mywaker::opencode::PromptOptions::new(
+        mywaker::opencode::Delivery::Queue,
+        "mywaker:delegation:writer:1:0",
+    );
+    client
+        .prompt_with("ses_test", "queued work", &options)
+        .await
+        .unwrap();
+
+    let received = state.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].text, "queued work");
+    assert_eq!(received[0].delivery.as_deref(), Some("queue"));
+    assert_eq!(
+        received[0].admission_id.as_deref(),
+        Some("mywaker:delegation:writer:1:0")
+    );
+
+    // The same id again is the same admission: the client sends it unchanged, which
+    // is what lets the service deduplicate a retry.
+    client
+        .prompt_with("ses_test", "queued work", &options)
+        .await
+        .unwrap();
+    let received = state.received.lock().unwrap().clone();
+    assert_eq!(received.len(), 2);
+    assert_eq!(received[0].admission_id, received[1].admission_id);
 }

@@ -16,6 +16,55 @@ pub use models::{
 /// The fixed username OpenCode's local server expects in its `Basic` auth.
 const AUTH_USER: &str = "opencode";
 
+/// How a prompt is admitted to a session that may already be busy.
+///
+/// OpenCode's admission call takes a `delivery` knob. `Steer` interrupts the
+/// running turn and takes over; `Queue` admits the input behind it and lets the
+/// current turn finish. The distinction is what keeps background traffic from
+/// cutting off work in flight — see [`crate::harness::delivery_for`], which is the
+/// one place the policy is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Delivery {
+    /// Interrupt the running turn and deliver now. A user typing in a chat means
+    /// this.
+    #[default]
+    Steer,
+    /// Wait for the current turn to finish, then run. Background hand-offs use
+    /// this.
+    Queue,
+}
+
+impl Delivery {
+    /// The wire spelling OpenCode expects.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::Steer => "steer",
+            Delivery::Queue => "queue",
+        }
+    }
+}
+
+/// How to admit one prompt: the delivery policy plus the id that makes a
+/// redelivery idempotent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptOptions {
+    pub delivery: Delivery,
+    /// Client-side admission id. Sending the same id twice admits the input once,
+    /// so a retry after a timeout cannot start a second turn.
+    pub admission_id: Option<String>,
+}
+
+impl PromptOptions {
+    /// Options for one delivery, with an admission id derived from the delivery's
+    /// identity.
+    pub fn new(delivery: Delivery, admission_id: impl Into<String>) -> Self {
+        Self {
+            delivery,
+            admission_id: Some(admission_id.into()),
+        }
+    }
+}
+
 /// The session id OpenCode records a *global* form under. A global form isn't
 /// bound to a session; its store is keyed by the location that owns it.
 const GLOBAL_FORM_SESSION: &str = "global";
@@ -162,8 +211,44 @@ impl OpenCode {
     }
 
     /// Send a prompt to a session.
+    ///
+    /// This is the explicit-steer wrapper around [`Self::prompt_with`]: a prompt
+    /// sent this way interrupts whatever the session is doing and takes over, which
+    /// is what a user typing into a chat means. Background traffic (delegation,
+    /// reports, fan-out briefs, retries) uses [`Delivery::Queue`] instead, so it
+    /// waits its turn rather than cutting off work in flight.
     pub async fn prompt(&self, session_id: &str, text: &str) -> Result<()> {
-        let body = serde_json::json!({ "text": text });
+        self.prompt_with(
+            session_id,
+            text,
+            &PromptOptions {
+                delivery: Delivery::Steer,
+                ..PromptOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Send a prompt with explicit options: how it should be delivered, and the
+    /// admission id that makes a redelivery idempotent.
+    ///
+    /// `options.delivery` maps to OpenCode's admission knob. `Steer` interrupts
+    /// the running turn; `Queue` admits the input behind it. `admission_id` is sent
+    /// as the client-side id so a retry of the *same* logical delivery is
+    /// deduplicated by the service instead of starting a second turn.
+    pub async fn prompt_with(
+        &self,
+        session_id: &str,
+        text: &str,
+        options: &PromptOptions,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({
+            "text": text,
+            "delivery": options.delivery.as_str(),
+        });
+        if let Some(id) = options.admission_id.as_deref() {
+            body["id"] = serde_json::Value::String(id.to_string());
+        }
         let path = format!("/api/session/{session_id}/prompt");
         let _: serde_json::Value = self.post_json(&path, &body).await?;
         Ok(())

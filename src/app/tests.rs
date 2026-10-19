@@ -50,6 +50,15 @@ fn open_chat(app: &mut App, employee: usize) {
     app.chats.entry(employee).or_default().session_id = Some("ses_1".into());
 }
 
+/// The queued instructions in an outbox, joined for a substring assertion.
+fn outbox_text(outbox: &[Outgoing]) -> String {
+    outbox
+        .iter()
+        .map(Outgoing::text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Draw the whole app at `width`×`height` on a throwaway terminal and return the
 /// buffer's symbols — one place builds the screen the render tests read.
 fn screen(app: &App, width: u16, height: u16) -> String {
@@ -262,6 +271,251 @@ fn trace_progress_is_pure_and_clamped() {
     assert!(trace.is_expired(112));
 }
 
+// --- bubbling under its guards ---
+
+/// The depth cap must not deliver. A worker at `MAX_CHAIN_DEPTH` that answers
+/// `@user` has produced a *partial* result; handing it to the user is exactly the
+/// failure the one-mouth rule exists to prevent, so it is logged and dropped —
+/// never delivered.
+#[test]
+fn a_report_at_the_depth_cap_is_never_delivered_to_the_user() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+    app.origin_of.insert(writer, writer);
+    app.depth_of.insert(writer, harness::MAX_CHAIN_DEPTH);
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"draft it","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"text","text":"@user the partial draft"}],"finish":"done"}
+    ]))
+    .unwrap();
+    app.handle_transcript(writer, messages);
+
+    // The partial answer did not reach the user's chat…
+    assert!(
+        !app.chats[&writer].transcript.iter().any(|line| {
+            line.role == TranscriptRole::Assistant && line.text == "the partial draft"
+        }),
+        "a capped report was delivered as the answer"
+    );
+    // …the guard said so…
+    assert!(
+        app.log
+            .iter()
+            .any(|line| line.contains("depth limit reached reporting")),
+        "the drop must be logged: {:?}",
+        app.log
+    );
+    // …and it became an abandon note, not a delivery.
+    assert!(
+        app.chats[&writer]
+            .transcript
+            .iter()
+            .any(|line| line.role == TranscriptRole::Error && line.text.contains("no deliverable")),
+        "{:?}",
+        app.chats[&writer].transcript
+    );
+    // The root was not asked to synthesize a partial result.
+    assert!(
+        !app.chats.contains_key(&root) || app.chats[&root].outbox.is_empty(),
+        "the capped report still reached the orchestrator"
+    );
+}
+
+/// The run-wide delegation budget bounds bubbling too: a report spends it, and at
+/// the limit the report is dropped rather than delivered.
+#[test]
+fn a_report_spends_the_delegation_budget() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    let root = employee(&app, "orchestrator");
+    open_chat(&mut app, writer);
+    app.origin_of.insert(writer, writer);
+
+    let report = || -> Vec<SessionMessage> {
+        serde_json::from_value(serde_json::json!([
+            {"id":"m1","time":{"created":1},"text":"draft it","type":"user"},
+            {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+             "content":[{"type":"text","text":"@user the draft"}],"finish":"done"}
+        ]))
+        .unwrap()
+    };
+
+    app.handle_transcript(writer, report());
+    assert_eq!(app.delegation_count, 1, "a report counts as a hand-off");
+    assert!(
+        !app.chats[&root].outbox.is_empty(),
+        "the report reached the orchestrator"
+    );
+
+    // At the limit, a further report is refused. The budget is checked in
+    // `dispatch_delegations`, before the directive is routed, so this also proves
+    // the report path sits behind that guard rather than beside it.
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    let root = employee(&app, "orchestrator");
+    open_chat(&mut app, writer);
+    app.origin_of.insert(writer, writer);
+    app.delegation_count = harness::DELEGATION_TOTAL_LIMIT;
+    app.handle_transcript(writer, report());
+
+    assert!(
+        !app.chats[&writer]
+            .transcript
+            .iter()
+            .any(|line| { line.role == TranscriptRole::Assistant && line.text == "the draft" }),
+        "a report past the budget was delivered"
+    );
+    assert!(
+        app.log
+            .iter()
+            .any(|line| line.contains("delegation limit reached")),
+        "{:?}",
+        app.log
+    );
+    assert!(
+        !app.chats.contains_key(&root) || app.chats[&root].outbox.is_empty(),
+        "a report past the budget still reached the orchestrator"
+    );
+}
+
+/// §8.2: the root's finished turn reaches the main screen. A worker's plain
+/// answer does not — it owes a report upward.
+#[test]
+fn the_orchestrators_plain_answer_is_logged() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    open_chat(&mut app, root);
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"ship it","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"text","text":"Shipped the release."}],"finish":"done"}
+    ]))
+    .unwrap();
+    app.handle_transcript(root, messages);
+
+    assert!(
+        app.log
+            .iter()
+            .any(|line| line.contains("Shipped the release.")),
+        "the root's answer is not on the main screen: {:?}",
+        app.log
+    );
+}
+
+/// A worker's plain answer is not logged as the deliverable: it has not reported
+/// yet, so surfacing it would put a partial result on the main screen.
+#[test]
+fn a_workers_plain_answer_is_not_logged_as_the_deliverable() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"draft it","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"text","text":"A draft, mid-way."}],"finish":"done"}
+    ]))
+    .unwrap();
+    app.handle_transcript(writer, messages);
+
+    assert!(
+        !app.log
+            .iter()
+            .any(|line| line.contains("A draft, mid-way.")),
+        "a worker's partial answer reached the main screen: {:?}",
+        app.log
+    );
+}
+
+/// The root's turn that *delegates* is not logged as a finished answer: it has
+/// handed work on, so the goal is not done.
+#[test]
+fn a_delegating_orchestrator_turn_is_not_logged_as_finished() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, root);
+    app.chats.entry(writer).or_default().session_id = Some("ses_w".into());
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"ship it","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"text","text":"@writer draft the release notes"}],"finish":"done"}
+    ]))
+    .unwrap();
+    app.handle_transcript(root, messages);
+
+    assert!(
+        !app.log
+            .iter()
+            .any(|line| line.contains("draft the release notes")),
+        "a delegating turn was logged as a finished answer: {:?}",
+        app.log
+    );
+}
+
+/// `fan_out`'s aggregator is never the source. A roofless roster whose source is
+/// the reviewer falls through to the planner rather than aggregating through the
+/// employee that issued the round.
+#[test]
+fn fan_out_never_aggregates_through_its_source() {
+    // A roster with no orchestrator, so the fallbacks are the only candidates.
+    // `App::with_team` re-roots every roster, so the root is taken back out
+    // directly (the accessor the roster commands refuse is not involved).
+    let mut team = Team::default();
+    for (id, name, role) in [
+        ("reviewer", "Cleo", "Reviewer"),
+        ("planner", "Dex", "Planner"),
+        ("writer", "Bruno", "Writer"),
+    ] {
+        team.add_employee(crate::team::Employee::new(id, name, role))
+            .expect("unique ids");
+    }
+    let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(8);
+    let mut app = App::with_team(Config::default(), tx, team);
+    // `with_team` roots the roster as an invariant and the roster commands refuse
+    // to remove the root, so the flat roster this test needs is rebuilt from the
+    // remaining employees.
+    let flat: Vec<crate::team::Employee> = app
+        .team()
+        .employees()
+        .iter()
+        .filter(|employee| employee.id != crate::team::ORCHESTRATOR_ID)
+        .cloned()
+        .collect();
+    let mut rebuilt = Team::default();
+    for employee in flat {
+        rebuilt.add_employee(employee).expect("unique ids");
+    }
+    *app.team_mut_for_test() = rebuilt;
+    assert!(app.orchestrator_index().is_none(), "the roster is flat");
+
+    let reviewer = app.team_index_by_id("reviewer").expect("reviewer");
+    open_chat(&mut app, reviewer);
+    app.fan_out(reviewer, "review the release".to_string());
+
+    let (_, fanout) = app.fanouts.iter().next().expect("a round");
+    assert_ne!(
+        fanout.aggregator, reviewer,
+        "the round aggregated through its own source"
+    );
+    assert!(
+        !fanout.workers.contains(&fanout.aggregator),
+        "the aggregator is also a worker"
+    );
+    // The planner is the first fallback that is not the source.
+    assert_eq!(
+        app.team.name_at(fanout.aggregator).as_deref(),
+        Some("Dex"),
+        "the fallback order is reviewer → planner"
+    );
+}
+
 /// A `@jev` directive routes the question to the decision model and posts the
 /// verdict back into the asking employee's chat (deterministic "yes" when no
 /// Jev client is attached).
@@ -349,7 +603,7 @@ fn a_workers_final_answer_bubbles_up_to_the_orchestrator() {
         "a worker's @user was delivered to the user"
     );
     // …the orchestrator did, attributed to the writer.
-    let queued = app.chats[&orchestrator].outbox.join("\n");
+    let queued = outbox_text(&app.chats[&orchestrator].outbox);
     assert!(queued.contains("Report from Bruno"), "{queued}");
     assert!(queued.contains("the draft is ready"), "{queued}");
     assert!(
@@ -420,7 +674,7 @@ fn parallel_directive_fans_out_to_workers() {
 
     // The goal reached the workers…
     for worker in &expected {
-        let queued = app.chats[worker].outbox.join("\n");
+        let queued = outbox_text(&app.chats[worker].outbox);
         assert!(
             queued.contains("build the launch plan"),
             "worker {worker} never received the goal: {queued:?}"
@@ -468,8 +722,8 @@ fn fan_out_aggregates_once_all_workers_finish() {
 
     let outbox = &app.chats[&orchestrator].outbox;
     assert_eq!(outbox.len(), 1);
-    assert!(outbox[0].contains("Market research findings"));
-    assert!(outbox[0].contains("Draft copy for the launch"));
+    assert!(outbox[0].text().contains("Market research findings"));
+    assert!(outbox[0].text().contains("Draft copy for the launch"));
 }
 
 /// Workers are briefed as a parallel round, not handed the bare goal: the brief
@@ -487,7 +741,7 @@ fn fan_out_briefs_each_worker_not_to_hand_off() {
         .collect();
     assert!(workers.len() >= 2, "the fixture needs more than one worker");
     for worker in workers {
-        let queued = app.chats[&worker].outbox.join("\n");
+        let queued = outbox_text(&app.chats[&worker].outbox);
         assert!(
             queued.contains("Parallel round"),
             "worker {worker}: {queued}"
@@ -543,11 +797,11 @@ fn worker_final_directive_contributes_instead_of_delivering() {
     app.handle_transcript(reviewer, assistant("v", "Both parts check out."));
     let outbox = &app.chats[&orchestrator].outbox;
     assert_eq!(outbox.len(), 1);
-    assert!(outbox[0].contains("Market research findings"));
+    assert!(outbox[0].text().contains("Market research findings"));
     assert!(
-        outbox[0].contains("**Wake your team.**"),
+        outbox[0].text().contains("**Wake your team.**"),
         "the directive-only contribution was lost: {}",
-        outbox[0]
+        outbox[0].text()
     );
 }
 
@@ -1041,8 +1295,188 @@ fn the_indicator_disappears_when_the_turn_ends() {
     );
 }
 
-/// `[ui] thinking = "hidden"` draws no indicator; `"full"` shows the whole
-/// deliberation rather than just the tail.
+/// The delivery policy reaches the wire: a user prompt steers, a background
+/// hand-off queues. This is the end-to-end claim the `harness::delivery_for`
+/// table makes, verified against the request the client actually sends.
+#[tokio::test]
+async fn user_prompts_steer_and_hand_offs_queue() {
+    let (client, server) = recorder::start().await;
+
+    let (mut app, _rx) = make_app();
+    app.client = Some(client);
+
+    // A user prompt to the writer.
+    let writer = employee(&app, "writer");
+    app.chats.entry(writer).or_default().session_id = Some("ses_w".into());
+    open_chat(&mut app, writer);
+    app.input = "draft the intro".into();
+    app.send_prompt();
+    recorder::wait_for_prompts(&server, 1).await;
+
+    // A delegated hand-off to the same employee. The source does not matter for
+    // the policy — only the kind does — so the root is not looked up here.
+    app.send_to_employee(
+        writer,
+        "polish the intro".to_string(),
+        harness::PromptKind::Delegation,
+    );
+    recorder::wait_for_prompts(&server, 2).await;
+
+    let deliveries = server.deliveries.lock().unwrap().clone();
+    let ids = server.admission_ids.lock().unwrap().clone();
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(
+        deliveries[0].as_deref(),
+        Some("steer"),
+        "the user's own prompt must take over"
+    );
+    assert_eq!(
+        deliveries[1].as_deref(),
+        Some("queue"),
+        "a hand-off must wait for the turn in flight"
+    );
+
+    // Both carry an admission id, and they differ: different deliveries.
+    assert!(ids[0].is_some(), "{ids:?}");
+    assert!(ids[1].is_some(), "{ids:?}");
+    assert_ne!(ids[0], ids[1], "two deliveries shared one admission id");
+    assert!(
+        ids[1].as_deref().unwrap_or("").contains("delegation"),
+        "{ids:?}"
+    );
+}
+
+/// A queued delivery that has not started executing is never treated as silent:
+/// the retry clock starts at `session.execution.started`, so a prompt waiting
+/// behind the previous turn is not "retried" into a duplicate admission.
+#[tokio::test]
+async fn a_queued_delivery_is_not_silent_before_its_execution_starts() {
+    let (mut app, _rx) = make_app();
+    // A client is needed for the outbox to flush and the delivery to be tracked;
+    // the test only reads the model, so the endpoint is never reached.
+    app.client = Some(crate::opencode::OpenCode::with_base(
+        "http://127.0.0.1:1".parse().expect("a literal URL parses"),
+        "sekrit",
+    ));
+    let writer = employee(&app, "writer");
+    app.chats.entry(writer).or_default().session_id = Some("ses_w".into());
+    app.send_to_employee(
+        writer,
+        "queued work".to_string(),
+        harness::PromptKind::Delegation,
+    );
+
+    // Admitted, and then a very long time passes with no execution.
+    let chat = app
+        .chats
+        .get_mut(&writer)
+        .expect("the hand-off was tracked");
+    let pending = chat.pending.as_mut().expect("a pending delivery");
+    assert!(!pending.armed, "a fresh delivery is admitted, not armed");
+    pending.since = Instant::now() - harness::HANDOFF_TIMEOUT - std::time::Duration::from_secs(5);
+
+    app.tick_reliability();
+    let chat = &app.chats[&writer];
+    assert_eq!(
+        chat.pending.as_ref().map(|p| p.attempts),
+        Some(0),
+        "a waiting delivery was retried"
+    );
+    assert!(
+        !chat.transcript.iter().any(|line| line.text.contains("🔁")),
+        "a waiting delivery was called silent"
+    );
+
+    // Once its execution starts, the clock runs — and then silence is real.
+    app.handle_stream_event(&event(
+        "session.execution.started",
+        serde_json::json!({"sessionID":"ses_w"}),
+    ));
+    let chat = app.chats.get_mut(&writer).expect("chat");
+    let pending = chat.pending.as_mut().expect("still pending");
+    assert!(pending.armed, "execution start arms the clock");
+    pending.since = Instant::now() - harness::HANDOFF_TIMEOUT - std::time::Duration::from_secs(5);
+
+    app.tick_reliability();
+    assert_eq!(
+        app.chats[&writer].pending.as_ref().map(|p| p.attempts),
+        Some(1),
+        "a genuinely silent started turn is retried"
+    );
+}
+
+#[test]
+fn new_clears_the_bootstrap_so_the_fresh_session_is_briefed() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.chats.get_mut(&0).unwrap().bootstrapped = true;
+
+    app.input = "/new".into();
+    app.send_prompt();
+
+    assert!(
+        !app.chats[&0].bootstrapped,
+        "the fresh session would never receive team_context"
+    );
+
+    // And the next prompt carries the preamble again.
+    let prompt = app.bootstrap_prompt(0, "next task".to_string());
+    assert!(prompt.contains("You are"), "{prompt}");
+    assert!(prompt.contains("@orchestrator"), "{prompt}");
+    assert!(prompt.ends_with("next task"), "{prompt}");
+}
+
+/// A slash command typed in the main prompt bar is handled locally, exactly as it
+/// is in a chat — it must never be sent to the orchestrator as a goal.
+#[test]
+fn slash_commands_in_the_main_prompt_are_not_sent_as_goals() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+
+    press(&mut app, KeyCode::Char('i'));
+    for c in "/help".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    // No goal was queued or dispatched…
+    assert!(
+        !app.chats.contains_key(&root) || app.chats[&root].queue_running.is_empty(),
+        "a slash command was sent as a goal"
+    );
+    // …and the command ran: its table is on the main screen's log, where the user
+    // typed it.
+    assert!(
+        app.log.iter().any(|line| line.contains("/parallel")),
+        "the command's output is not visible from the roster: {:?}",
+        app.log
+    );
+    // A command is not a goal, so it does not enter the goal history.
+    assert!(app.prompt_history.is_empty(), "{:?}", app.prompt_history);
+}
+
+/// An unknown command-shaped input is still a goal: only the real commands are
+/// intercepted, so a goal that happens to start with `/` is not silently eaten.
+#[test]
+fn an_unknown_slash_input_is_still_a_goal() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+
+    press(&mut app, KeyCode::Char('i'));
+    for c in "/summarize the repo".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(
+        app.chats[&root]
+            .transcript
+            .iter()
+            .any(|line| line.role == TranscriptRole::User && line.text == "/summarize the repo"),
+        "an unrecognised `/` goal was dropped"
+    );
+}
+
 #[test]
 fn the_thinking_mode_controls_how_much_is_shown() {
     let mut chat_thinking = Thinking::default();
@@ -1628,6 +2062,9 @@ fn stale_pending(instruction: &str, attempts: u8) -> PendingDelivery {
         instruction: instruction.into(),
         attempts,
         since: Instant::now() - harness::HANDOFF_TIMEOUT - std::time::Duration::from_secs(1),
+        // Armed: the delivery started executing and then went silent, which is
+        // what "stale" means here.
+        armed: true,
     }
 }
 
@@ -1712,8 +2149,8 @@ fn abandoned_worker_still_aggregates_fanout() {
     assert!(fanout.aggregated);
     let outbox = &app.chats[&orchestrator].outbox;
     assert_eq!(outbox.len(), 1);
-    assert!(outbox[0].contains("no deliverable")); // the researcher's ⚠
-    assert!(outbox[0].contains("Draft copy."));
+    assert!(outbox[0].text().contains("no deliverable")); // the researcher's ⚠
+    assert!(outbox[0].text().contains("Draft copy."));
 }
 
 // --- model picker search ---
@@ -1902,8 +2339,20 @@ fn slash_help_prints_the_command_table() {
 
     app.send_prompt();
 
-    let last = app.chats[&0].transcript.last().expect("a help line");
-    assert_eq!(last.text, chat_help_text());
+    // `/help` is written one transcript line per command, so a long table cannot
+    // be clipped by a single wrapped block.
+    let help = chat_help_text();
+    let expected: Vec<&str> = help.lines().collect();
+    let printed: Vec<&str> = app.chats[&0]
+        .transcript
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect();
+    assert_eq!(
+        printed[printed.len() - expected.len()..],
+        expected[..],
+        "the whole table, line for line"
+    );
 }
 
 // --- grapheme-safe editing ---
@@ -2276,6 +2725,11 @@ mod recorder {
         pub sessions: Arc<Mutex<usize>>,
         /// The prompt text of every attempt, in order.
         pub prompts: Arc<Mutex<Vec<String>>>,
+        /// The `delivery` knob of every attempt, in order (`None` when the client
+        /// sent no knob at all).
+        pub deliveries: Arc<Mutex<Vec<Option<String>>>>,
+        /// The admission id of every attempt, in order.
+        pub admission_ids: Arc<Mutex<Vec<Option<String>>>>,
         /// Every `(session_id, prompt)` pair, so a test can tie an attempt back
         /// to the task that issued it and prove no task adopted another's id.
         pub attempts: Arc<Mutex<Vec<(String, String)>>>,
@@ -2302,6 +2756,16 @@ mod recorder {
             .unwrap_or("")
             .to_string();
         state.prompts.lock().unwrap().push(text.clone());
+        state.deliveries.lock().unwrap().push(
+            body.get("delivery")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        );
+        state
+            .admission_ids
+            .lock()
+            .unwrap()
+            .push(body.get("id").and_then(Value::as_str).map(str::to_owned));
         state.attempts.lock().unwrap().push((id, text));
         Json(json!({}))
     }
@@ -2361,6 +2825,21 @@ mod recorder {
         }
         panic!("the dispatched attempt never sent a prompt");
     }
+
+    /// Wait until at least `count` prompts have arrived, so a test can read the
+    /// delivery knobs alongside the text.
+    pub async fn wait_for_prompts(state: &Recorder, count: usize) {
+        for _ in 0..400 {
+            if state.prompts.lock().unwrap().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "only {} prompts arrived, wanted {count}",
+            state.prompts.lock().unwrap().len()
+        );
+    }
 }
 
 /// AC4: resuming a paused task returns it to `running` and issues a **fresh**
@@ -2412,10 +2891,13 @@ async fn resuming_a_paused_task_returns_it_to_running() {
         1,
         "resume must start exactly one fresh session"
     );
-    assert_eq!(
-        prompt,
-        format!("{}\n\n{}", harness::resume_preamble(), "sweep the inbox"),
-        "the resumed attempt must carry the resume preamble"
+    assert!(
+        prompt.contains(&harness::resume_preamble()),
+        "the resumed attempt must carry the resume preamble: {prompt}"
+    );
+    assert!(
+        prompt.ends_with("sweep the inbox"),
+        "the goal must follow the preamble: {prompt}"
     );
 }
 
@@ -2442,9 +2924,16 @@ async fn resuming_a_task_that_never_ran_omits_the_preamble() {
     press(&mut app, KeyCode::Char('s')); // resume
 
     let prompt = recorder::first_prompt(&server).await;
-    assert_eq!(
-        prompt, "sweep the inbox",
-        "a task with no prior attempt must not claim an interrupted attempt"
+    // A scheduled job is briefed as an isolated job: team context, the "finish it
+    // yourself" instruction, then the goal — with **no** retry/resume preamble,
+    // because the task never ran.
+    assert!(
+        prompt.ends_with("sweep the inbox"),
+        "the goal must be last: {prompt}"
+    );
+    assert!(
+        !prompt.contains("previous attempt"),
+        "a task with no prior attempt must not claim an interrupted attempt: {prompt}"
     );
 }
 
@@ -2689,18 +3178,17 @@ async fn reopen_prompt_resumes_each_task_in_order_with_a_fresh_session() {
     let attempts = server.attempts.lock().unwrap().clone();
     assert_eq!(attempts.len(), 2, "both resumed attempts were prompted");
     for (goal, session) in [("newer goal", newer_session), ("older goal", older_session)] {
-        let expected_prompt = format!("{}\n\n{}", harness::resume_preamble(), goal);
         let (recorded, prompt) = attempts
             .iter()
-            .find(|(_, prompt)| prompt == &expected_prompt)
+            .find(|(_, prompt)| prompt.ends_with(goal))
             .unwrap_or_else(|| panic!("the double saw no prompt for {goal:?}"));
         assert_eq!(
             recorded, &session,
             "{goal:?} stored a session it did not start itself"
         );
-        assert_eq!(
-            prompt, &expected_prompt,
-            "{goal:?} must be re-run with the resume preamble"
+        assert!(
+            prompt.contains(&harness::resume_preamble()),
+            "{goal:?} must be re-run with the resume preamble: {prompt}"
         );
     }
 }
@@ -3306,8 +3794,50 @@ fn clicking_a_grid_card_selects_that_employee() {
     );
 }
 
+/// The orchestrator has no grid card: it is the strip above the grid. Its stage
+/// label therefore appears exactly once on screen — in the strip — and never as a
+/// card title, and no card in the grid belongs to it.
+#[test]
+fn the_orchestrator_has_no_grid_card() {
+    let (mut app, _rx) = make_app();
+    app.last_size = (120, 40);
+    let root = employee(&app, "orchestrator");
+
+    // No drawn card is the root, at any offset.
+    for offset in 0..=app.roster_max_scroll() {
+        app.roster_scroll = offset;
+        let cards = ui::grid_cells(&app, (120, 40));
+        assert!(
+            cards.iter().all(|(employee, _)| *employee != root),
+            "the orchestrator was drawn as a card at offset {offset}"
+        );
+    }
+    app.roster_scroll = 0;
+
+    // Its stage label is not a card title anywhere on screen, and the root is not
+    // clickable as an employee.
+    let frame = screen(&app, 120, 40);
+    assert!(
+        !frame.contains(" ORCHESTRATOR "),
+        "the root is drawn as a card: {frame}"
+    );
+    for (employee, rect) in ui::grid_cells(&app, (120, 40)) {
+        assert_eq!(
+            ui::hit_target_at(&app, (120, 40), rect.x + 1, rect.y + 1),
+            Some(ui::Target::Employee(employee)),
+            "card {rect:?} resolves to its own employee"
+        );
+    }
+
+    // The root *is* on screen — as the strip, by name.
+    assert!(
+        frame.contains("Otto"),
+        "the root's strip is missing: {frame}"
+    );
+}
+
 /// G6: every drawn card resolves to its own employee at any scroll offset, and
-/// the title row, the Jev header, and the gaps between cards resolve to nothing.
+/// the title row, the strip/bus, and the gaps between cards resolve to nothing.
 #[test]
 fn grid_hit_testing_matches_the_drawn_cards_at_any_offset() {
     let (mut app, _rx) = make_app();

@@ -26,7 +26,6 @@ use crate::ui;
 use crate::usage::{ProcessMetrics, Usage};
 use crate::workflow::{
     self, Delegation, is_final, is_jev, is_parallel, parse_delegations, strip_directives,
-    team_context,
 };
 
 /// Maximum number of retained status-log lines.
@@ -44,6 +43,31 @@ pub enum Mode {
     Chat,
     Projects,
     Models,
+}
+
+/// One prompt waiting for its employee's session to be free.
+///
+/// The kind travels with the text so the delivery policy (and the idempotent
+/// admission id) is decided where the work is queued, not guessed at flush time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Outgoing {
+    kind: harness::PromptKind,
+    text: String,
+}
+
+impl Outgoing {
+    fn new(kind: harness::PromptKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+        }
+    }
+
+    /// The instruction text, for the transcript and the tests.
+    #[cfg(test)]
+    fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 /// A rendered conversation line.
@@ -104,7 +128,7 @@ struct Chat {
     /// re-loaded transcript never re-dispatches the same hand-off.
     handled_message_ids: HashSet<String>,
     /// Delegation instructions queued until this employee's session is ready.
-    outbox: Vec<String>,
+    outbox: Vec<Outgoing>,
     /// The delegated hand-off currently in flight for this employee, tracked so
     /// a silent worker can be retried or abandoned on a deadline.
     pending: Option<PendingDelivery>,
@@ -1523,15 +1547,28 @@ impl App {
         if text.is_empty() {
             return;
         }
-        let Some(employee) = self.orchestrator_index() else {
-            self.push_log("no orchestrator on the roster — cannot route the goal".to_string());
-            return;
-        };
 
         self.input.clear();
         self.input_cursor = 0;
         self.input_scroll = 0;
         self.prompt_hist_index = None;
+
+        // Slash commands are handled locally, exactly as they are in a chat: a
+        // `/help` typed in the main prompt is the same request as a `/help` typed
+        // in a conversation, and must never be sent to the orchestrator as a goal.
+        //
+        // This runs before the roster check below: `/help` and `/skills` do not
+        // need an employee to act on, so they must still work on a roster that has
+        // no root.
+        if self.dispatch_chat_command(&text) {
+            return;
+        }
+
+        let Some(employee) = self.orchestrator_index() else {
+            self.push_log("no orchestrator on the roster — cannot route the goal".to_string());
+            return;
+        };
+
         if self.prompt_history.last() != Some(&text) {
             self.prompt_history.push(text.clone());
         }
@@ -1623,6 +1660,10 @@ impl App {
             chat.scroll = 0;
             // Prompts queued against the old conversation don't carry over.
             chat.queue_running.clear();
+            // The new session has never been briefed: the preamble (roster +
+            // the `@orchestrator` reporting rule) must go out again, or the
+            // employee loses the protocol the moment the user types `/new`.
+            chat.bootstrapped = false;
         }
         self.begin_session(employee);
     }
@@ -1899,20 +1940,48 @@ impl App {
         // The first prompt to an employee carries the team roster + delegation
         // protocol; later prompts go through verbatim.
         let prompt = self.bootstrap_prompt(employee, text);
-        self.spawn_prompt(employee, session_id, prompt);
+        self.spawn_prompt(
+            employee,
+            session_id,
+            prompt,
+            harness::PromptKind::UserPrompt,
+            0,
+        );
     }
 
     /// Spawn one prompt delivery to a live session. A transport error comes back
     /// as [`Message::DeliveryFailed`], so the caller's retry and queue logic sees
     /// it as the turn ending badly rather than by silence.
-    fn spawn_prompt(&self, employee: usize, session_id: String, prompt: String) {
+    /// Spawn one prompt delivery to a live session, under the delivery policy for
+    /// `kind`.
+    ///
+    /// The options carry both the steer/queue decision (from
+    /// [`harness::delivery_for`]) and the admission id, so a resend of the same
+    /// logical delivery is deduplicated rather than admitted twice.
+    fn spawn_prompt(
+        &self,
+        employee: usize,
+        session_id: String,
+        prompt: String,
+        kind: harness::PromptKind,
+        attempt: u8,
+    ) {
         let Some(client) = self.client.clone() else {
             return;
         };
+        let id = self
+            .team
+            .employees()
+            .get(employee)
+            .map(|e| e.agent_id().to_string())
+            .unwrap_or_else(|| employee.to_string());
+        let depth = self.chain_depth(employee);
+        let options = harness::prompt_options(kind, &id, depth, attempt);
+
         let tx = self.tx.clone();
         let target = employee;
         tokio::spawn(async move {
-            if let Err(err) = client.prompt(&session_id, &prompt).await {
+            if let Err(err) = client.prompt_with(&session_id, &prompt, &options).await {
                 let _ = tx
                     .send(Message::DeliveryFailed {
                         target,
@@ -1939,23 +2008,20 @@ impl App {
 
         // `/new` and `/clear` — start a fresh session for this employee.
         if rest == "new" || rest == "clear" {
-            self.push_transcript_line(TranscriptRole::Info, format!("⚡ {text}"));
+            self.push_command_line(format!("⚡ {text}"));
             self.reset_chat();
             return true;
         }
 
         // `/skills` — list installed skill names into the transcript.
         if rest == "skills" {
-            self.push_transcript_line(TranscriptRole::Info, format!("⚡ {text}"));
+            self.push_command_line(format!("⚡ {text}"));
             let names = crate::skills::installed();
             if names.is_empty() {
-                self.push_transcript_line(
-                    TranscriptRole::Info,
-                    "no skills installed for this project".to_string(),
-                );
+                self.push_command_line("no skills installed for this project".to_string());
             } else {
                 for name in names {
-                    self.push_transcript_line(TranscriptRole::Info, format!("  • {name}"));
+                    self.push_command_line(format!("  • {name}"));
                 }
             }
             return true;
@@ -1964,14 +2030,14 @@ impl App {
         // `/skill add <source>[@skill]` — install then attach to this employee.
         if let Some(source) = rest.strip_prefix("skill add ").map(str::trim) {
             if source.is_empty() {
-                self.push_transcript_error("usage: /skill add <source>[@skill]".to_string());
+                self.push_command_error("usage: /skill add <source>[@skill]".to_string());
                 return true;
             }
-            let Some(employee) = self.chat_employee else {
-                self.push_transcript_error("no employee selected".to_string());
+            let Some(employee) = self.command_employee() else {
+                self.push_command_error("no employee selected".to_string());
                 return true;
             };
-            self.push_transcript_line(TranscriptRole::Info, format!("⚡ /skill add {source}"));
+            self.push_command_line(format!("⚡ /skill add {source}"));
             self.spawn_skill_install(employee, source.to_string());
             return true;
         }
@@ -1979,7 +2045,7 @@ impl App {
         // `/skill <name>` — attach an already-installed skill to this employee.
         if let Some(name) = rest.strip_prefix("skill ").map(str::trim) {
             if name.is_empty() {
-                self.push_transcript_error("usage: /skill <name>".to_string());
+                self.push_command_error("usage: /skill <name>".to_string());
                 return true;
             }
             self.attach_skill(name.to_string());
@@ -1989,14 +2055,14 @@ impl App {
         // `/parallel <goal>` — fan the goal out to the whole team and aggregate.
         if let Some(goal) = rest.strip_prefix("parallel ").map(str::trim) {
             if goal.is_empty() {
-                self.push_transcript_error("usage: /parallel <goal>".to_string());
+                self.push_command_error("usage: /parallel <goal>".to_string());
                 return true;
             }
-            let Some(employee) = self.chat_employee else {
-                self.push_transcript_error("no employee selected".to_string());
+            let Some(employee) = self.command_employee() else {
+                self.push_command_error("no employee selected".to_string());
                 return true;
             };
-            self.push_transcript_line(TranscriptRole::Info, format!("⚡ /parallel {goal}"));
+            self.push_command_line(format!("⚡ /parallel {goal}"));
             self.fan_out(employee, goal.to_string());
             return true;
         }
@@ -2004,11 +2070,52 @@ impl App {
         // `/help` — show the chat-local commands, straight from the table the
         // completion menu reads.
         if rest == "help" {
-            self.push_transcript_line(TranscriptRole::Info, chat_help_text());
+            for line in chat_help_text().lines() {
+                self.push_command_line(line.to_string());
+            }
             return true;
         }
 
         false
+    }
+
+    /// The employee a slash command acts on: the chat being viewed, else the
+    /// orchestrator — the main prompt bar speaks for the root, so a command typed
+    /// there (`/new`, `/skill add …`, `/parallel …`) means the root, not nobody.
+    fn command_employee(&self) -> Option<usize> {
+        self.chat_employee.or_else(|| self.orchestrator_index())
+    }
+
+    /// Report a command's output.
+    ///
+    /// It goes into the acting employee's transcript, and — when that chat is not
+    /// the one on screen — into the main log as well, because a command typed in
+    /// the roster prompt must answer *where the user is looking*. Without this,
+    /// `/help` from the main screen would write into a transcript the user cannot
+    /// see.
+    fn push_command_line(&mut self, text: String) {
+        match self.chat_employee {
+            Some(employee) => self.push_to_chat(employee, TranscriptRole::Info, text),
+            None => {
+                if let Some(orchestrator) = self.orchestrator_index() {
+                    self.push_to_chat(orchestrator, TranscriptRole::Info, text.clone());
+                }
+                self.push_log(text);
+            }
+        }
+    }
+
+    /// [`Self::push_command_line`] for a failure, in the error colour.
+    fn push_command_error(&mut self, text: String) {
+        match self.chat_employee {
+            Some(employee) => self.push_to_chat(employee, TranscriptRole::Error, text),
+            None => {
+                if let Some(orchestrator) = self.orchestrator_index() {
+                    self.push_to_chat(orchestrator, TranscriptRole::Error, text.clone());
+                }
+                self.push_log(text);
+            }
+        }
     }
 
     /// Kick off a background install of `source`, reporting installed skill
@@ -2192,10 +2299,31 @@ impl App {
         self.team.set_status(employee, final_status);
 
         // Hand off any directives in the freshly completed assistant reply.
+        let before = self.delegation_count;
         self.dispatch_delegations(employee, &messages);
+        let handed_off = self.delegation_count != before;
 
         // Record the employee's deliverable into any active parallel fan-out.
+        let owed_before = self.fanouts_awaiting(employee);
         self.note_fanout_result(employee, &messages);
+        let contributed = !owed_before.is_empty();
+
+        // §8.2: the root's finished turn reaches the main screen. A worker that
+        // simply answers is not the deliverable (it owes a report upward), but the
+        // orchestrator answering in plain text *is* — so it is surfaced in the log,
+        // which is what the user reads from the roster. A turn that handed work on,
+        // or that contributed to a round, has not finished the goal yet and stays
+        // out of the log.
+        if !handed_off
+            && !contributed
+            && self.orchestrator_index() == Some(employee)
+            && let Some(text) = last_assistant_output(&messages)
+        {
+            let summary = task_summary(&text);
+            if !summary.is_empty() {
+                self.push_log(format!("◆ {}", summary));
+            }
+        }
 
         // The turn is over — send the next prompt the user queued while we were
         // busy, if any.
@@ -2236,7 +2364,17 @@ impl App {
                     chat.thinking.push(delta);
                 }
             }
-            "session.execution.started" => self.team.set_status(employee, EmployeeStatus::Working),
+            "session.execution.started" => {
+                self.team.set_status(employee, EmployeeStatus::Working);
+                // The turn actually started, so the silence clock starts now: a
+                // queued delivery that sat behind the previous turn is not
+                // "silent", it was waiting.
+                if let Some(chat) = self.chats.get_mut(&employee)
+                    && let Some(pending) = chat.pending.as_mut()
+                {
+                    pending.arm();
+                }
+            }
             "session.text.delta" | "message.part.delta" => {
                 if let Some(delta) = event.text_delta()
                     && let Some(chat) = self.chats.get_mut(&employee)
@@ -2324,19 +2462,26 @@ impl App {
             chat.bootstrapped = true;
         }
         let name = self.team.name_at(employee).unwrap_or_default();
-        let context = team_context(&self.team, &name);
+        let is_root = self.orchestrator_index() == Some(employee);
+        let context = workflow::team_context_for(&self.team, &name, is_root);
         format!("{context}\n\n{text}")
     }
 
-    /// Relay `instruction` to `employee`. If their session must be created
-    /// first, the instruction is queued and flushed when the session is ready.
-    fn send_to_employee(&mut self, employee: usize, instruction: String) {
+    /// Relay `instruction` to `employee` as `kind`. If their session must be
+    /// created first, the instruction is queued and flushed when the session is
+    /// ready.
+    fn send_to_employee(
+        &mut self,
+        employee: usize,
+        instruction: String,
+        kind: harness::PromptKind,
+    ) {
         self.push_to_chat(employee, TranscriptRole::Info, format!("📩 {instruction}"));
         self.chats
             .entry(employee)
             .or_default()
             .outbox
-            .push(instruction);
+            .push(Outgoing::new(kind, instruction));
         if self.session_ready(employee) {
             self.flush_outbox(employee);
         } else {
@@ -2392,7 +2537,11 @@ impl App {
             (outbox, session_id)
         };
 
-        for instruction in outbox {
+        for outgoing in outbox {
+            let Outgoing {
+                kind,
+                text: instruction,
+            } = outgoing;
             self.team
                 .set_last_task(employee, Some(task_summary(&instruction)));
             // Preserve any retry budget accrued on a prior send, then prepend a
@@ -2413,14 +2562,13 @@ impl App {
             // Track the hand-off so a silent worker can be retried/abandoned. The
             // stored instruction stays preamble-free (the original goal).
             if let Some(chat) = self.chats.get_mut(&employee) {
-                chat.pending = Some(PendingDelivery {
-                    instruction,
-                    attempts,
-                    since: Instant::now(),
-                });
+                chat.pending = Some(PendingDelivery::new(instruction));
+                if let Some(pending) = chat.pending.as_mut() {
+                    pending.attempts = attempts;
+                }
             }
             let session_id = session_id.clone();
-            self.spawn_prompt(employee, session_id, prompt);
+            self.spawn_prompt(employee, session_id, prompt, kind, attempts);
         }
     }
 
@@ -2510,7 +2658,7 @@ impl App {
         }
         self.inherit_chain(source, target);
         self.trace(source, target, TraceKind::Out);
-        self.send_to_employee(target, delegation.message);
+        self.send_to_employee(target, delegation.message, harness::PromptKind::Delegation);
     }
 
     /// A `@user` directive: the orchestrator delivers to the user, a worker's
@@ -2521,10 +2669,21 @@ impl App {
     /// author named — the orchestrator can then synthesize, ask for a missing
     /// piece, or deliver. This is what keeps a partial answer from reaching the
     /// user mid-chain.
+    ///
+    /// **Budget.** A report is already counted by
+    /// [`Self::dispatch_delegations`], which increments `delegation_count` before
+    /// calling [`Self::dispatch_delegation`] — so bubbling spends the same
+    /// [`harness::DELEGATION_TOTAL_LIMIT`] as any other hand-off and is not
+    /// counted twice here. What *is* checked here is
+    /// [`harness::MAX_CHAIN_DEPTH`], because a report is the one hop that climbs
+    /// back up: neither guard falls back to delivering, since the one-mouth
+    /// invariant matters most at the limits, where a worker's partial answer would
+    /// be most misleading.
     fn deliver_or_report(&mut self, source: usize, message: String) {
         let Some(orchestrator) = self.orchestrator_index() else {
-            // No root (an empty roster): fall back to the old direct delivery so
-            // a result is never silently dropped.
+            // No root (a roster with every employee removed): there is nobody to
+            // report to, so the old direct delivery is the only option that does
+            // not silently drop the result.
             self.deliver_to_origin(source, message);
             return;
         };
@@ -2537,20 +2696,35 @@ impl App {
             .team
             .name_at(source)
             .unwrap_or_else(|| source.to_string());
-        self.push_log(format!("↥ {name} reported to the orchestrator"));
-        // The report is a hand-off like any other: it joins the same chain (so a
-        // later delivery still lands in the right chat) and is bounded by the
-        // chain-depth guard.
+
         if self.chain_depth(source) >= harness::MAX_CHAIN_DEPTH {
             self.push_log(format!(
                 "delegation chain depth limit reached reporting from '{name}'"
             ));
-            self.deliver_to_origin(source, message);
+            self.note_dropped_report(source, &name, "chain depth limit reached");
             return;
         }
+
+        self.push_log(format!("↥ {name} reported to the orchestrator")); // The report joins the same chain (so a later delivery still lands in the
+        // right chat).
         self.inherit_chain(source, orchestrator);
         self.trace(source, orchestrator, TraceKind::Report);
-        self.send_to_employee(orchestrator, format!("Report from {name}:\n\n{message}"));
+        self.send_to_employee(
+            orchestrator,
+            format!("Report from {name}:\n\n{message}"),
+            harness::PromptKind::Report,
+        );
+    }
+
+    /// Record a report that the guards refused to relay.
+    ///
+    /// It becomes an abandon note in the worker's own chat and — when a fan-out is
+    /// waiting on that worker — its contribution, so the round can still finish.
+    /// What it must never become is the user's answer.
+    fn note_dropped_report(&mut self, source: usize, name: &str, reason: &str) {
+        let note = harness::abandon_note(name, Some(reason));
+        self.push_to_chat(source, TranscriptRole::Error, note.clone());
+        self.force_worker_contribution(source, note);
     }
 
     /// Put `message` in the chat the chain started from, as the final answer.
@@ -2603,13 +2777,17 @@ impl App {
         let team = self.team.employees().to_vec();
 
         // The root aggregates; a roster without one falls back to the old
-        // reviewer → planner → source chain.
+        // reviewer → planner → source chain. The fallbacks must differ from the
+        // source too: aggregating *through the source* would make the round's
+        // synthesizer one of its own workers (and, for a reviewer source, put the
+        // review in the hands of the employee being reviewed).
         let aggregator = self
             .orchestrator_index()
+            .filter(|&index| index != source)
             .or_else(|| {
                 ["reviewer", "planner"]
                     .iter()
-                    .find_map(|id| self.team_index_by_id(id))
+                    .find_map(|id| self.team_index_by_id(id).filter(|&index| index != source))
             })
             .unwrap_or(source);
 
@@ -2660,7 +2838,11 @@ impl App {
             // contributes its own part instead of handing off or answering as if
             // it owned the final deliverable.
             self.trace(source, worker, TraceKind::Fanout);
-            self.send_to_employee(worker, workflow::fanout_brief(&goal));
+            self.send_to_employee(
+                worker,
+                workflow::fanout_brief(&goal),
+                harness::PromptKind::FanoutBrief,
+            );
         }
     }
 
@@ -2751,7 +2933,7 @@ impl App {
         {
             self.trace(worker, aggregator, TraceKind::Report);
         }
-        self.send_to_employee(aggregator, prompt);
+        self.send_to_employee(aggregator, prompt, harness::PromptKind::Delegation);
     }
 
     // --- reliability (timeouts, retry, per-chain isolation) ---
@@ -2835,7 +3017,7 @@ impl App {
             TranscriptRole::Info,
             format!("🔁 retrying ({reason})"),
         );
-        self.send_to_employee(employee, instruction);
+        self.send_to_employee(employee, instruction, harness::PromptKind::Retry);
     }
 
     /// Give up on `employee`'s hand-off and record a deterministic `⚠` deliverable
@@ -2974,6 +3156,9 @@ impl App {
         let employee = &self.team.employees()[index];
         let agent = employee.agent_id().to_owned();
         let model = employee.model_ref();
+        // A scheduled job runs outside any chain, so it is briefed as an isolated
+        // job — see `run_task_attempt`.
+        let context = workflow::team_context_for(&self.team, &employee.name, false);
         let goal = task.goal.clone();
         let task_id = task.id;
         let tx = self.tx.clone();
@@ -2988,6 +3173,7 @@ impl App {
                 preamble.as_deref(),
                 task_id,
                 tx.clone(),
+                &context,
             )
             .await;
             let (succeeded, result) = match outcome {
@@ -3769,6 +3955,13 @@ impl App {
         &self.traces
     }
 
+    /// Mutable access to the roster, for tests that need a roster the app's own
+    /// commands refuse to build (a flat one with no orchestrator, say).
+    #[cfg(test)]
+    pub fn team_mut_for_test(&mut self) -> &mut Team {
+        &mut self.team
+    }
+
     /// Record a hand-off trace directly.
     ///
     /// The render tests need a packet on the wires without standing up a whole
@@ -4152,6 +4345,16 @@ fn last_assistant_output(messages: &[SessionMessage]) -> Option<String> {
 /// the prompt is sent, so the app can interrupt the attempt if the task is
 /// paused while it runs.
 #[allow(clippy::too_many_arguments)]
+/// Run one scheduled/watch task attempt: a fresh session, the goal, and the
+/// transcript read back as an outcome.
+///
+/// **A scheduled task is an isolated job, not a delegation chain.** It runs in its
+/// own session with no `origin_of`/`depth_of` entry, so there is no chain for a
+/// report to travel: a `@user` in its reply has nowhere to bubble to. It is
+/// therefore briefed with the roster and the reporting rule (so a worker does not
+/// try to hand off into a chain that does not exist) *and* told to finish the job
+/// itself. The deliverable is the task's result, which the harness records against
+/// the task — not a chat delivery.
 async fn run_task_attempt(
     client: &OpenCode,
     directory: &str,
@@ -4161,6 +4364,7 @@ async fn run_task_attempt(
     preamble: Option<&str>,
     task_id: TaskId,
     tx: Sender<Message>,
+    context: &str,
 ) -> Result<String, String> {
     let (session, _used_agent) = client
         .create_session_with_agent_fallback(directory, agent, model)
@@ -4175,13 +4379,16 @@ async fn run_task_attempt(
         })
         .await;
 
-    let prompt = match preamble {
-        Some(preamble) => format!("{preamble}\n\n{goal}"),
-        None => goal.to_string(),
-    };
+    let brief = task_brief(context, goal, preamble);
+    let options = harness::prompt_options(
+        harness::PromptKind::AutonomousTask,
+        agent.unwrap_or_default(),
+        0,
+        0,
+    );
 
     client
-        .prompt(&session_id, &prompt)
+        .prompt_with(&session_id, &brief, &options)
         .await
         .map_err(|err| format!("prompt failed: {err}"))?;
 
@@ -4195,6 +4402,30 @@ async fn run_task_attempt(
         .map_err(|err| format!("transcript failed: {err}"))?;
 
     task_outcome(&messages)
+}
+
+/// The prompt for one autonomous attempt: the team context (so the employee knows
+/// the roster and the reporting rule), the retry/resume preamble when there is
+/// one, and the goal — plus the instruction that makes the isolation explicit.
+fn task_brief(context: &str, goal: &str, preamble: Option<&str>) -> String {
+    let mut brief = String::new();
+    if !context.is_empty() {
+        brief.push_str(context);
+        brief.push_str("\n\n");
+    }
+    brief.push_str(
+        "This is a scheduled job running in its own session, not part of a delegation \
+         chain: no one is waiting on a report, so finish the work yourself and reply with \
+         the result. Do not hand this job off and do not use `@user` — your reply *is* the \
+         deliverable.",
+    );
+    brief.push_str("\n\n");
+    if let Some(preamble) = preamble {
+        brief.push_str(preamble);
+        brief.push_str("\n\n");
+    }
+    brief.push_str(goal);
+    brief
 }
 
 /// Interpret a completed transcript as ‹success → deliverable› or ‹failure → reason›.

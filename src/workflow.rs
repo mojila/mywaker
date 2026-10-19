@@ -83,14 +83,28 @@ pub fn is_parallel(target: &str) -> bool {
     matches!(target, "parallel" | "fanout" | "all" | "team")
 }
 
-/// Strip line-leading delegation directives (`@…`) from a reply so the remaining
-/// text is the worker's actual deliverable, ready for aggregation.
+/// Strip line-leading delegation directives (`@…`) and activity markers from a
+/// reply, so the remaining text is the worker's actual deliverable, ready for
+/// aggregation.
+///
+/// The markers (`[step]`, `[thinking]`) are transcript decorations rather than
+/// content. They must be filtered here as well as not emitted by
+/// `SessionMessage::display_text`, because a reply can legitimately *contain* a
+/// line that looks like one — and a marker left behind would make a
+/// directive-only reply look like it had a payload, losing the directive's actual
+/// text.
 pub fn strip_directives(text: &str) -> String {
     text.lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('@'))
+        .filter(|line| !line.is_empty() && !line.starts_with('@') && !is_marker_line(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// True for a transcript marker line — `[step]`, `[thinking]` — which is
+/// presentation, never content.
+fn is_marker_line(line: &str) -> bool {
+    matches!(line, "[step]" | "[thinking]")
 }
 
 /// The brief handed to each worker in a parallel round.
@@ -136,9 +150,22 @@ pub fn contribution(text: &str) -> Option<String> {
 /// the right teammate, and (c) how to delegate to them.
 ///
 /// The roster is drawn as the delegation tree, with the orchestrator at the root.
-/// A worker is told to report *upward* to `@orchestrator` rather than answer the
-/// user, because the orchestrator owns the synthesis and `@user` is its alone.
+///
+/// **Role-aware.** A worker is told to report *upward* to `@orchestrator` rather
+/// than answer the user, because the orchestrator owns the synthesis. The
+/// orchestrator itself is told the opposite — `@user` is its alone — so the two
+/// prompts agree instead of contradicting each other. The `is_root` flag comes
+/// from the employee being briefed, not from a guess at its name.
 pub fn team_context(team: &Team, name: &str) -> String {
+    team_context_for(team, name, false)
+}
+
+/// [`team_context`] for an employee that may be the root.
+///
+/// `is_root` is the caller's answer to "is the employee being briefed the
+/// orchestrator?", which is what lets one function serve both halves of the tree
+/// without either being told a rule that belongs to the other.
+pub fn team_context_for(team: &Team, name: &str, is_root: bool) -> String {
     let roster = team
         .employees()
         .iter()
@@ -153,12 +180,19 @@ pub fn team_context(team: &Team, name: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
+    let reporting = if is_root {
+        "You are the orchestrator: the root of the tree. Every teammate reports to you, \
+and `@user` is yours alone — you are the one who delivers to the user. Synthesize what \
+comes back, then deliver it with `@user <final deliverable>`."
+    } else {
+        "The orchestrator is the root. You report to `@orchestrator`; `@user` is the \
+orchestrator's alone, so a finished result goes to the orchestrator, not to the user."
+    };
+
     format!(
         "You are {name}, one employee on a team of AI employees. The team is a tree:\n\
 {roster}\n\n\
-The orchestrator is the root. You report to `@orchestrator`; `@user` is the \
-orchestrator's alone, so a finished result goes to the orchestrator, not to the \
-user.\n\n\
+{reporting}\n\n\
 Stick to YOUR OWN role and delegate anything outside it. In particular:\n\
   - The planner only produces plans, roadmaps, and task breakdowns — it never \
 writes the implementation, code, or final prose; it delegates those to the \
@@ -168,10 +202,15 @@ teammate whose role covers them (e.g. the software engineer / writer).\n\
   - The reviewer checks, critiques, and verifies others' work.\n\n\
 When a sub-task is better done by a teammate, delegate it by ending your reply \
 with one or more lines of the form:\n\n  @<id> <instruction>\n\nFor example:\n  \
-@researcher gather the sources\n  @writer implement the feature\n\nWhen your \
-work is finished, report it upward with `@orchestrator <result>`. To have the \
-whole team work a goal in parallel (each from their own role), end your reply \
-with `@parallel <goal>`."
+@researcher gather the sources\n  @writer implement the feature\n\n{closing}",
+        closing = if is_root {
+            "To have the whole team work a goal in parallel (each from their own role), \
+end your reply with `@parallel <goal>`."
+        } else {
+            "When your work is finished, report it upward with `@orchestrator <result>`. \
+To have the whole team work a goal in parallel (each from their own role), end your \
+reply with `@parallel <goal>`."
+        }
     )
 }
 
@@ -279,9 +318,22 @@ mod tests {
             contribution("@user **Wake your team.**").as_deref(),
             Some("**Wake your team.**")
         );
+        // A directive behind a marker line still contributes its payload: the
+        // marker is presentation, so stripping it must not leave the reply looking
+        // like it had a body.
+        assert_eq!(
+            contribution("[step]\n@user answer").as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            contribution("[thinking]\n[step]\n@user answer").as_deref(),
+            Some("answer")
+        );
         // A bare non-final directive carries no deliverable.
         assert_eq!(contribution("@writer"), None);
         assert_eq!(contribution(""), None);
+        // Markers alone are not a deliverable either.
+        assert_eq!(contribution("[step]\n[thinking]"), None);
     }
 
     #[test]
@@ -315,6 +367,46 @@ mod tests {
             "a worker must not be told it can deliver: {ctx}"
         );
         assert!(ctx.contains("@orchestrator <result>"), "{ctx}");
+    }
+
+    /// The root is briefed as the root: `@user` is *its* alone. The worker wording
+    /// would contradict its own prompt, which says exactly that.
+    #[test]
+    fn team_context_for_the_root_owns_delivery() {
+        let team = Team::starter();
+        let ctx = team_context_for(&team, "Otto", true);
+
+        assert!(
+            ctx.contains("`@user` is yours alone"),
+            "the root must be told delivery is its job: {ctx}"
+        );
+        assert!(
+            !ctx.contains("You report to `@orchestrator`"),
+            "the root cannot report to itself: {ctx}"
+        );
+        // It still sees the same tree and the same delegation protocol.
+        assert!(ctx.contains("◆ @orchestrator"), "{ctx}");
+        assert!(ctx.contains("@<id> <instruction>"), "{ctx}");
+    }
+
+    /// A marker line is presentation, not content: a reply whose only payload sits
+    /// behind a `[step]` marker still contributes that payload, rather than being
+    /// reduced to the marker.
+    #[test]
+    fn a_directive_after_a_marker_still_contributes_its_payload() {
+        assert_eq!(
+            contribution("[step]\n@user answer").as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            contribution("[thinking]\n@user answer").as_deref(),
+            Some("answer")
+        );
+        // A real body alongside a marker keeps the body and drops the marker.
+        assert_eq!(
+            contribution("[step]\nthe actual answer\n@user x").as_deref(),
+            Some("the actual answer")
+        );
     }
 
     #[test]

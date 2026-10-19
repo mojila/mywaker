@@ -134,8 +134,19 @@ the orchestrator.
   report (instead of ending the chain); the orchestrator's own `@user` delivers to the
   user. `fan_out`'s aggregator becomes the orchestrator (fallback reviewer/planner);
   the orchestrator is excluded from the worker set. Existing `MAX_CHAIN_DEPTH` /
-  `DELEGATION_TOTAL_LIMIT` remain the cycle guards. When the orchestrator finishes with
-  plain text, the result is logged to the main screen.
+  `DELEGATION_TOTAL_LIMIT` remain the cycle guards — and a report **spends** the
+  same budget rather than bypassing it, because it is a hand-off like any other. At
+  either limit the report is logged and dropped (becoming an abandon note for any
+  round waiting on it), never delivered: the one-mouth invariant holds hardest at
+  the limits, where a worker's partial answer would be most misleading. When the
+  orchestrator finishes with plain text, the result is logged to the main screen —
+  unless that turn delegated or contributed to a round, since then the goal is not
+  done yet.
+- Scheduled and watched tasks are **isolated jobs, not chains**: they run in their
+  own session with no `origin_of`/`depth_of` entry, so a `@user` in their reply has
+  nowhere to bubble. They are briefed with the roster and the reporting rule *and*
+  told to finish the job themselves (`task_brief`), and their deliverable is the
+  task's result — not a chat delivery.
 - Selection: `card_order()` (= roster minus orchestrator) drives the grid;
   `workflow_order()` still lists everyone for the tasks panel. `selected` defaults to
   the orchestrator; `↑` from the first card row reaches it, `Enter`/`m`/`s` work on it.
@@ -182,7 +193,10 @@ the orchestrator.
 
 - **Focus:** `i`/click focuses the prompt; every existing single-letter shortcut stays
   unchanged when unfocused. **Drawing:** strip + bus + risers (one column per card).
-  **Routing:** bubble worker results to the orchestrator.
+  **Routing:** bubble worker results to the orchestrator. **Delivery:** only a user
+  prompt steers; every background hand-off queues (`harness::delivery_for`), and a
+  delivery's silence clock starts at `session.execution.started`, so a queued prompt
+  is never mistaken for a silent one and re-admitted.
 - Index shift (orchestrator at 0) makes `app/tests` positional assertions noisy;
   risers cost one column per card; bubbling adds an orchestrator turn per `@user`
   (bounded by the existing caps). `mode: all` frontmatter is intentionally unchanged

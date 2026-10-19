@@ -374,30 +374,24 @@ impl SessionMessage {
 
     /// Human-readable text: user body, else joined assistant text parts.
     ///
-    /// `reasoning` parts are skipped: a deliberation is not the answer, and the
-    /// chat shows it separately (see [`Self::reasoning_text`]). Including it here
-    /// would put a model's scratchpad into the deliverable that a fan-out
-    /// aggregates or a `@user` hands back.
+    /// Only `text` parts are content. `reasoning` is a deliberation, not the
+    /// answer (see [`Self::reasoning_text`]), and `tool`/`step` are activity
+    /// markers that the transcript renders separately — emitting `[step]` /
+    /// `[thinking]` lines here would put non-content into the deliverable, where
+    /// it survives [`crate::workflow::strip_directives`] and becomes the answer.
     pub fn display_text(&self) -> String {
         if let Some(text) = &self.text
             && !text.is_empty()
         {
             return text.clone();
         }
-        let mut parts: Vec<String> = Vec::new();
-        for part in &self.content {
-            match part.part_type.as_str() {
-                "text" => {
-                    if let Some(text) = part.text.as_deref() {
-                        parts.push(text.to_string());
-                    }
-                }
-                "tool" => parts.push(part_tool_label(part)),
-                "step" => parts.push("[step]".to_string()),
-                _ => {}
-            }
-        }
-        parts.join("\n")
+        self.content
+            .iter()
+            .filter(|part| part.part_type == "text")
+            .filter_map(|part| part.text.as_deref())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The message's reasoning, joined — the `thinking` parts only.
@@ -447,17 +441,6 @@ pub struct CacheUsage {
     pub read: u64,
     #[serde(default)]
     pub write: u64,
-}
-
-/// Best-effort label for a tool part, e.g. `[tool: read]`.
-fn part_tool_label(part: &Part) -> String {
-    if let Some(name) = part.extra.get("tool").and_then(|v| v.as_str())
-        && !name.is_empty()
-    {
-        format!("[tool: {name}]")
-    } else {
-        "[tool]".to_string()
-    }
 }
 
 /// One option offered by a [`FormField`] (`{ value, label, description }`).

@@ -202,8 +202,9 @@ fn generic_prompt(employee: &Employee) -> String {
     format!(
         "You are **{}** (`{}`), the team's {}.\n\n\
          Work within your own role and leave work that belongs to a teammate to them: \
-         hand it off with a line-leading `@<id> <instruction>` directive. Deliver your \
-         finished result back to the user with `@user <summary>`.",
+         hand it off with a line-leading `@<id> <instruction>` directive. When your part \
+         is finished, report it upward with `@orchestrator <result>` — the orchestrator \
+         synthesizes and `@user` is its alone.",
         employee.name, employee.id, role
     )
 }
@@ -235,16 +236,18 @@ const PLANNER: &str =
 Never write implementation, code, or final prose yourself — delegate those to the
 teammate whose role covers them (the software engineer / writer) using line-leading
 `@<id> <instruction>` directives. When the plan is complete, hand off with `@writer`
-(or the relevant teammate) instructions, and deliver a final answer to the user with
-`@user <summary>`.";
+(or the relevant teammate) instructions, and report the plan upward to the orchestrator
+with `@orchestrator <summary>`. The orchestrator synthesizes and delivers; `@user` is not
+yours to use.";
 
 const RESEARCHER: &str =
     "You are the **researcher**. Investigate, gather, and summarize facts, data, and
 references.
 
 Drafting and implementation belong to the other teammates — hand those off with
-line-leading `@<id> <instruction>` directives. Return findings to the user with
-`@user <summary>`.";
+line-leading `@<id> <instruction>` directives. Return your findings upward to the
+orchestrator with `@orchestrator <summary>`; it owns the synthesis and `@user` is its
+alone.";
 
 const ENGINEER: &str =
     "You are the **engineer**. Implement the requested change in code, tests, and
@@ -252,7 +255,8 @@ configuration, and explain what you changed.
 
 Research and planning belong to the other teammates — hand those off with
 line-leading `@<id> <instruction>` directives. When the change is done and verified,
-deliver it to the user with `@user <summary>`.";
+report it upward to the orchestrator with `@orchestrator <summary>`. The orchestrator
+synthesizes and delivers; `@user` is not yours to use.";
 
 const WRITER: &str =
     "You are the **writer**. Produce clear, accurate prose, documentation, and copy from
@@ -260,15 +264,17 @@ the source material and direction you are given.
 
 Defer to teammates for research (`@researcher`) and planning (`@planner`) when you
 lack the material you need, using line-leading `@<id> <instruction>` directives.
-Deliver the finished piece to the user with `@user <text>`.";
+Report the finished piece upward to the orchestrator with `@orchestrator <text>`. The
+orchestrator synthesizes and delivers; `@user` is not yours to use.";
 
 const REVIEWER: &str =
     "You are the **reviewer**. Inspect deliverables for correctness, quality, and
 consistency, and report problems precisely.
 
 When something is wrong, hand it back with line-leading `@<id> <instruction>`
-directives rather than silently rewriting it. When it passes, approve and return it
-to the user with `@user <note>`.";
+directives rather than silently rewriting it. When it passes, approve and report that
+upward to the orchestrator with `@orchestrator <note>`. The orchestrator synthesizes and
+delivers; `@user` is not yours to use.";
 
 /// The canonical id of the asset-creator mandate — the one string both [`prompt`]
 /// and [`description`] key on.
@@ -370,18 +376,54 @@ mod tests {
         }
     }
 
-    /// The checked-in copy and the generated definition cannot drift: a generated
-    /// `orchestrator` file is byte-identical to `examples/agents/orchestrator.md`.
-    /// The orchestrator is the one employee every roster has, so its prompt is the
-    /// one most likely to be hand-edited out of step with the const.
+    /// Every checked-in example matches the const it documents: a generated
+    /// definition is byte-identical to its file under `examples/agents/`.
+    ///
+    /// This is what keeps the examples from drifting. The orchestrator is the one
+    /// employee every roster has, and the workers' prompts are the ones a role
+    /// change is most likely to leave behind — the reporting rule in particular, so
+    /// a stale example would tell a worker to `@user` when the code no longer
+    /// relays it that way.
     #[test]
-    fn orchestrator_definition_matches_the_checked_in_example() {
-        let employee = Employee::new("orchestrator", "Otto", "Orchestrator");
-        assert_eq!(
-            definition(&employee),
-            include_str!("../examples/agents/orchestrator.md"),
-            "regenerate examples/agents/orchestrator.md from the ORCHESTRATOR const"
-        );
+    fn every_definition_matches_its_checked_in_example() {
+        for (id, name, role, example) in [
+            ("orchestrator", "Otto", "Orchestrator", ORCHESTRATOR_EXAMPLE),
+            ("planner", "Dex", "Planner", PLANNER_EXAMPLE),
+            ("researcher", "Aria", "Research lead", RESEARCHER_EXAMPLE),
+            ("writer", "Bruno", "Writer", WRITER_EXAMPLE),
+            ("reviewer", "Cleo", "Reviewer", REVIEWER_EXAMPLE),
+        ] {
+            assert_eq!(
+                definition(&Employee::new(id, name, role)),
+                example,
+                "regenerate examples/agents/{id}.md from its const"
+            );
+        }
+    }
+
+    /// The checked-in example bodies, one per canonical role.
+    const ORCHESTRATOR_EXAMPLE: &str = include_str!("../examples/agents/orchestrator.md");
+    const PLANNER_EXAMPLE: &str = include_str!("../examples/agents/planner.md");
+    const RESEARCHER_EXAMPLE: &str = include_str!("../examples/agents/researcher.md");
+    const WRITER_EXAMPLE: &str = include_str!("../examples/agents/writer.md");
+    const REVIEWER_EXAMPLE: &str = include_str!("../examples/agents/reviewer.md");
+
+    /// No worker prompt tells the employee to deliver to the user: that is the
+    /// orchestrator's alone, and a worker that thinks otherwise answers `@user`
+    /// into a relay it did not expect.
+    #[test]
+    fn no_worker_prompt_claims_the_user() {
+        for id in ["planner", "researcher", "writer", "reviewer"] {
+            let text = definition(&Employee::new(id, "N", "Role"));
+            assert!(
+                !text.contains("@user <"),
+                "{id} still delivers to the user: {text}"
+            );
+            assert!(
+                text.contains("@orchestrator"),
+                "{id} does not know where to report: {text}"
+            );
+        }
     }
 
     /// The root's contract, stated where the model reads it: it delegates, it

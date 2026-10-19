@@ -68,6 +68,16 @@ fn wheel(column: u16, row: u16) -> MouseEvent {
     }
 }
 
+/// A wheel notch upward — the bounded way back to the top of the grid.
+fn wheel_up(column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
 /// A left click at a cell.
 fn click(column: u16, row: u16) -> MouseEvent {
     MouseEvent {
@@ -269,5 +279,146 @@ fn grid_cells_and_hit_testing_agree_at_every_pinned_size() {
                 "{width}×{height}: the last page repeats the first — scrolling did nothing"
             );
         }
+
+        // R1b — the *draw* seam, asserted from a rendered frame rather than from
+        // the geometry. `grid_cells` and `hit_target_at` could agree with each
+        // other while `pipeline::render` drew a different order, so the claim
+        // "the grid draws `card_order`" is pinned here: every employee the grid
+        // owns appears as a card title exactly once, and the root never does.
+        assert_render_draws_card_order(&mut app, size);
     }
+}
+
+/// R1b: the drawn frame contains one card per employee in `card_order`, and the
+/// orchestrator is never drawn as one.
+///
+/// This is the guard the drawing needs on its own: mutating `pipeline::render` to
+/// read `workflow_order()` leaves every geometry assertion above green (the two
+/// orders differ only by the root, which is not a card), but it would draw the
+/// root as a card — which the "no root card head" clause below catches directly.
+fn assert_render_draws_card_order(app: &mut App, size: (u16, u16)) {
+    let (width, height) = size;
+    let panel = mywaker::ui::team_area(size);
+    if panel.width == 0 || panel.height == 0 {
+        return; // no panel, no cards to draw (40×24)
+    }
+
+    // From the top, so the first page is a known, whole set of cards. The loop is
+    // bounded by the offset itself: each notch up can only decrease it, so this
+    // terminates even if the clamp is broken.
+    let mut guard = 0;
+    while app.roster_scroll() > 0 {
+        app.update(Message::Mouse(wheel_up(panel.x + 1, panel.y)));
+        guard += 1;
+        assert!(guard < 1000, "scrolling up did not reach the top");
+    }
+
+    let frame = screen(app, width, height);
+    let rows = rows(&frame, width);
+    let in_panel = |needle: &str| -> usize {
+        rows.iter()
+            .enumerate()
+            .filter(|(y, _)| {
+                let y = *y as u16;
+                y >= panel.y && y < panel.bottom()
+            })
+            .map(|(_, row)| {
+                let chars: Vec<char> = row.chars().collect();
+                let start = (panel.x as usize).min(chars.len());
+                let end = (panel.right() as usize).min(chars.len());
+                chars[start..end].iter().collect::<String>()
+            })
+            .map(|row| row.matches(needle).count())
+            .sum()
+    };
+
+    // The root is never a card: its stage label is not a card title, and it has no
+    // card head. (The strip prints the root by *name*, not by stage label.)
+    assert_eq!(
+        in_panel(" ORCHESTRATOR "),
+        0,
+        "{width}×{height}: the orchestrator was drawn as a card:\n{frame}"
+    );
+    if let Some(root) = app
+        .team()
+        .employees()
+        .iter()
+        .position(|employee| employee.id == "orchestrator")
+    {
+        let name = app.team().employees()[root].name.as_str();
+        assert_eq!(
+            in_panel(&format!("● {name}")),
+            0,
+            "{width}×{height}: the root was drawn with a card head:\n{frame}"
+        );
+    }
+
+    // Every card the geometry says is on this page is drawn, exactly once, with
+    // its own head. Names anchor the count: several generalists share `GENERAL`,
+    // so a label count could not tell one card from eight.
+    //
+    // A panel too narrow for the head (60×16 leaves the team panel 4 columns)
+    // truncates the card instead of drawing it, so the clause is scoped to panels
+    // with room — the root-is-not-a-card clause above still runs everywhere.
+    let drawn = mywaker::ui::grid_cells(app, size);
+    assert!(
+        !drawn.is_empty(),
+        "{width}×{height}: the page draws no cards"
+    );
+    let widest = drawn
+        .iter()
+        .map(|(employee, _)| app.team().employees()[*employee].name.len())
+        .max()
+        .unwrap_or(0);
+    // `● ` plus the name, inside the card's two borders.
+    let head_fits = panel.width as usize >= widest + 4;
+    for (employee, _) in &drawn {
+        let employee = &app.team().employees()[*employee];
+        let head = format!("● {}", employee.name);
+        if head_fits {
+            assert_eq!(
+                in_panel(&head),
+                1,
+                "{width}×{height}: {}'s card head was drawn {} times:\n{frame}",
+                employee.name,
+                in_panel(&head)
+            );
+        } else {
+            // Too narrow for the head: the card must still be drawn (its border),
+            // and it must not be the root.
+            assert_ne!(
+                employee.id, "orchestrator",
+                "{width}×{height}: the root was drawn as a card"
+            );
+        }
+    }
+}
+
+/// The frame split into rows of `width` cells. Splits on characters, not bytes: a
+/// cell can hold a multi-byte glyph (`┄`, `◆`), and a byte chunk would cut one in
+/// half.
+fn rows(frame: &str, width: u16) -> Vec<String> {
+    frame
+        .chars()
+        .collect::<Vec<char>>()
+        .chunks(width as usize)
+        .map(|row| row.iter().collect())
+        .collect()
+}
+
+/// Render the whole app at `size` on a throwaway terminal and return the buffer's
+/// symbols, one character per cell.
+fn screen(app: &App, width: u16, height: u16) -> String {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
+    terminal
+        .draw(|frame| mywaker::ui::render(frame, app))
+        .expect("a frame draws");
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
 }
