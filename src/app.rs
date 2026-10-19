@@ -378,6 +378,16 @@ pub struct App {
     /// the input body has been scrolled right to keep the cursor in view when
     /// the prompt overflows the terminal width.
     input_scroll: usize,
+    /// Whether the roster's prompt bar has the keyboard. While it does, keys are
+    /// text (or line editing) rather than the roster's single-letter shortcuts;
+    /// see [`Self::handle_roster_key`].
+    prompt_focused: bool,
+    /// Goals submitted from the roster prompt, oldest first — for Up/Down recall.
+    prompt_history: Vec<String>,
+    /// Current position in the prompt history navigation, when recalling.
+    prompt_hist_index: Option<usize>,
+    /// Prompt draft saved when history navigation started (restored on Down).
+    prompt_hist_draft: String,
     /// Last known terminal size, for page-scroll estimation.
     last_size: (u16, u16),
     /// First card row shown in the roster grid. The wheel scrolls it and a
@@ -468,6 +478,10 @@ impl App {
             input: String::new(),
             input_cursor: 0,
             input_scroll: 0,
+            prompt_focused: false,
+            prompt_history: Vec::new(),
+            prompt_hist_index: None,
+            prompt_hist_draft: String::new(),
             last_size: (80, 24),
             roster_scroll: 0,
             chats: HashMap::new(),
@@ -686,21 +700,15 @@ impl App {
         }
 
         match self.mode {
-            Mode::Roster => match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.initiate_shutdown(),
-                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-self.roster_cols()),
-                KeyCode::Down | KeyCode::Char('j') => self.move_selection(self.roster_cols()),
-                KeyCode::Left | KeyCode::Char('h') => self.move_selection(-1),
-                KeyCode::Right | KeyCode::Char('l') => self.move_selection(1),
-                KeyCode::PageUp => self.move_selection_grid(-self.roster_page()),
-                KeyCode::PageDown => self.move_selection_grid(self.roster_page()),
-                KeyCode::Enter => self.start_chat(self.selected),
-                KeyCode::Char('p') | KeyCode::Char('P') => self.open_projects(),
-                KeyCode::Char('m') | KeyCode::Char('M') => self.open_models(),
-                KeyCode::Char(' ') => self.toggle_engine_pause(),
-                KeyCode::Char('s') => self.toggle_task_pause(),
-                _ => {}
-            },
+            Mode::Roster => {
+                // A focused prompt bar owns the keyboard: `q`, `s`, `p` … are text
+                // there, not shortcuts. `Esc` (and `Tab`/`i`) hand the roster back.
+                if self.prompt_focused {
+                    self.handle_prompt_key(key);
+                } else {
+                    self.handle_roster_key(key);
+                }
+            }
             Mode::Projects => match key.code {
                 KeyCode::Esc => self.mode = Mode::Roster,
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -737,6 +745,57 @@ impl App {
                 _ => {}
             },
             Mode::Chat => self.handle_chat_key(key),
+        }
+    }
+
+    /// Handle a key on the roster screen while the prompt bar is **not** focused:
+    /// the single-letter shortcuts, which stay exactly as they were.
+    fn handle_roster_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.initiate_shutdown(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-self.roster_cols()),
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(self.roster_cols()),
+            KeyCode::Left | KeyCode::Char('h') => self.move_selection(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection_grid(-self.roster_page()),
+            KeyCode::PageDown => self.move_selection_grid(self.roster_page()),
+            KeyCode::Enter => self.start_chat(self.selected),
+            // `i` and `Tab` both drop into the prompt: one is the plan's key, the
+            // other the conventional "next field".
+            KeyCode::Char('i') | KeyCode::Tab => self.focus_prompt(),
+            KeyCode::Char('p') | KeyCode::Char('P') => self.open_projects(),
+            KeyCode::Char('m') | KeyCode::Char('M') => self.open_models(),
+            KeyCode::Char(' ') => self.toggle_engine_pause(),
+            KeyCode::Char('s') => self.toggle_task_pause(),
+            _ => {}
+        }
+    }
+
+    /// Handle a key while the prompt bar is focused: line editing, history, and
+    /// `Enter` to submit. `Esc` blurs; every other key edits the buffer.
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        match key.code {
+            KeyCode::Esc => self.blur_prompt(),
+            KeyCode::Enter if shift => self.input_insert('\n'),
+            KeyCode::Enter => self.submit_goal(),
+            KeyCode::Up => self.prompt_history_up(),
+            KeyCode::Down => self.prompt_history_down(),
+            KeyCode::Left => self.cursor_left(),
+            KeyCode::Right => self.cursor_right(),
+            KeyCode::Home => self.cursor_home(),
+            KeyCode::End => self.cursor_end(),
+            KeyCode::Delete => self.input_delete_forward(),
+            KeyCode::Char('w') if ctrl => self.input_delete_word(),
+            KeyCode::Char('u') if ctrl => self.input_delete_to_start(),
+            KeyCode::Char('a') if ctrl => self.cursor_home(),
+            KeyCode::Char('e') if ctrl => self.cursor_end(),
+            KeyCode::Backspace => self.input_delete_backward(),
+            KeyCode::Tab => self.blur_prompt(),
+            KeyCode::Char(c) => self.input_insert(c),
+            _ => {}
         }
     }
 
@@ -803,7 +862,13 @@ impl App {
         match kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 match ui::hit::target_at(self, self.last_size, mouse.column, mouse.row) {
-                    Some(ui::hit::Target::Employee(index)) => self.selected = index,
+                    Some(ui::hit::Target::Employee(index)) => {
+                        self.selected = index;
+                        // A click on a card takes the keyboard back from the
+                        // prompt: the user pointed at the grid.
+                        self.blur_prompt();
+                    }
+                    Some(ui::hit::Target::Prompt) => self.focus_prompt(),
                     Some(ui::hit::Target::Project(index)) => self.project_selected = index,
                     Some(ui::hit::Target::Model(index)) => self.model_selected = index,
                     None => {}
@@ -1008,7 +1073,12 @@ impl App {
     }
 
     /// Display columns available for the input body — the prompt (`> `) and the
-    /// panel's two side borders aside — derived from the terminal width.
+    /// panel's two side borders aside.
+    ///
+    /// The chat input sits in the chat panel (which spans `main`, the full
+    /// terminal width less the title/hint bars); the roster prompt spans the whole
+    /// width. Both leave the same four columns of chrome, so only the width source
+    /// differs.
     fn input_body_width(&self) -> usize {
         (self.last_size.0 as usize).saturating_sub(4)
     }
@@ -1135,7 +1205,9 @@ impl App {
 
     /// Insert a bracketed paste into the input at the cursor.
     fn handle_paste(&mut self, text: &str) {
-        if self.mode != Mode::Chat {
+        // The one input buffer serves the chat and the roster prompt; a paste goes
+        // to whichever has the keyboard.
+        if self.mode != Mode::Chat && !self.prompt_focused {
             return;
         }
         let at = self.input_byte_offset();
@@ -1206,6 +1278,108 @@ impl App {
             && let Some(chat) = self.chats.get_mut(&employee)
         {
             chat.hist_index = None;
+        }
+        self.prompt_hist_index = None;
+    }
+
+    // --- the roster prompt ---
+
+    /// Give the roster's prompt bar the keyboard (`i`, `Tab`, or a click on it).
+    ///
+    /// The bar shares the one `input` buffer with the chat, so focusing it starts
+    /// from whatever is there — which is empty, because the buffer is cleared on
+    /// every mode switch.
+    fn focus_prompt(&mut self) {
+        self.prompt_focused = true;
+        self.prompt_hist_index = None;
+        self.command_menu = None;
+        self.follow_input_cursor();
+    }
+
+    /// Hand the keyboard back to the roster shortcuts, keeping whatever is typed
+    /// in the bar (an abandoned goal is not thrown away by `Esc`).
+    fn blur_prompt(&mut self) {
+        self.prompt_focused = false;
+        self.prompt_hist_index = None;
+    }
+
+    /// Recall the previous goal into the prompt (`↑`).
+    fn prompt_history_up(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        match self.prompt_hist_index {
+            None => {
+                self.prompt_hist_draft = self.input.clone();
+                let last = self.prompt_history.len() - 1;
+                self.prompt_hist_index = Some(last);
+                self.input = self.prompt_history[last].clone();
+            }
+            Some(0) => {}
+            Some(i) => {
+                self.prompt_hist_index = Some(i - 1);
+                self.input = self.prompt_history[i - 1].clone();
+            }
+        }
+        self.input_cursor = self.grapheme_len();
+        self.follow_input_cursor();
+    }
+
+    /// Move back toward the draft (`↓`), restoring it past the newest goal.
+    fn prompt_history_down(&mut self) {
+        let Some(i) = self.prompt_hist_index else {
+            return;
+        };
+        if i + 1 < self.prompt_history.len() {
+            self.prompt_hist_index = Some(i + 1);
+            self.input = self.prompt_history[i + 1].clone();
+        } else {
+            self.prompt_hist_index = None;
+            self.input = std::mem::take(&mut self.prompt_hist_draft);
+        }
+        self.input_cursor = self.grapheme_len();
+        self.follow_input_cursor();
+    }
+
+    /// Submit the goal typed on the roster screen.
+    ///
+    /// A goal is the orchestrator's work: it is the root that decomposes and
+    /// delegates, so the prompt always routes there rather than to whichever card
+    /// happens to be selected. `Enter` in a card's chat is still how you talk to
+    /// that employee directly.
+    fn submit_goal(&mut self) {
+        let text = self.input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let Some(employee) = self.orchestrator_index() else {
+            self.push_log("no orchestrator on the roster — cannot route the goal".to_string());
+            return;
+        };
+
+        self.input.clear();
+        self.input_cursor = 0;
+        self.input_scroll = 0;
+        self.prompt_hist_index = None;
+        if self.prompt_history.last() != Some(&text) {
+            self.prompt_history.push(text.clone());
+        }
+
+        // The goal starts a chain rooted at the orchestrator's own chat, so its
+        // eventual `@user` is delivered there. The chat may not exist yet — a
+        // goal typed on the roster screen is the first thing this employee is
+        // asked to do — so it is created here rather than dropped.
+        self.chats.entry(employee).or_default();
+        self.push_to_chat(employee, TranscriptRole::User, text.clone());
+        self.team.set_last_task(employee, Some(task_summary(&text)));
+        self.origin_of.insert(employee, employee);
+        self.depth_of.insert(employee, 0);
+        self.push_log(format!("◆ goal → orchestrator: {}", task_summary(&text)));
+
+        if !self.can_prompt(employee) {
+            self.enqueue_prompt(employee, text);
+        } else {
+            self.dispatch_prompt(employee, text);
         }
     }
 
@@ -1292,6 +1466,10 @@ impl App {
 
         self.mode = Mode::Chat;
         self.chat_employee = Some(employee);
+        // The input buffer is shared with the roster prompt: leaving the roster
+        // drops the keyboard there, so a chat never opens holding a half-typed
+        // goal.
+        self.prompt_focused = false;
         self.input.clear();
         self.input_cursor = 0;
         self.input_scroll = 0;
@@ -1824,7 +2002,6 @@ impl App {
         // Leave the chat state (session + transcript) intact so re-entering the
         // same employee resumes the conversation instead of starting fresh.
     }
-
     fn handle_transcript(&mut self, employee: usize, messages: Vec<SessionMessage>) {
         // Tally token usage (idempotent per message id against transcript reloads).
         for message in &messages {
@@ -3308,6 +3485,51 @@ impl App {
 
     pub fn input(&self) -> &str {
         &self.input
+    }
+
+    /// Whether the roster's prompt bar has the keyboard.
+    pub fn prompt_focused(&self) -> bool {
+        self.prompt_focused
+    }
+
+    /// The orchestrator's display name (`None` on a roster with no root, which
+    /// only a hand-built fixture can produce).
+    pub fn orchestrator_name(&self) -> Option<&str> {
+        self.orchestrator().map(|employee| employee.name.as_str())
+    }
+
+    /// The orchestrator's live status, for the prompt bar's border.
+    pub fn orchestrator_status(&self) -> Option<EmployeeStatus> {
+        self.orchestrator().map(|employee| employee.status)
+    }
+
+    /// The orchestrator's assigned model, when it has one.
+    pub fn orchestrator_model(&self) -> Option<&str> {
+        self.orchestrator()
+            .and_then(|employee| employee.model.as_deref())
+    }
+
+    /// The root employee, if the roster has one.
+    fn orchestrator(&self) -> Option<&crate::team::Employee> {
+        self.team
+            .employees()
+            .iter()
+            .find(|employee| employee.id == crate::team::ORCHESTRATOR_ID)
+    }
+
+    /// How many employees are mid-turn *under* the root — the work the
+    /// orchestrator has handed out and is waiting on.
+    ///
+    /// The root's own turn is excluded: it is the one delegating, so counting it
+    /// would make an idle team look busy the moment a goal is typed.
+    pub fn delegating_count(&self) -> usize {
+        let orchestrator = self.orchestrator_index();
+        self.team
+            .employees()
+            .iter()
+            .enumerate()
+            .filter(|(index, employee)| Some(*index) != orchestrator && employee.is_busy())
+            .count()
     }
 
     /// Cursor position within the input, in grapheme clusters (0..=len).

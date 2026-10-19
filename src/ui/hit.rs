@@ -15,6 +15,8 @@ use super::{layout, pipeline};
 pub enum Target {
     /// An employee's card in the roster grid (an index into the team).
     Employee(usize),
+    /// The roster's prompt bar: a click focuses it.
+    Prompt,
     /// A row of the project picker (an index into [`App::projects`]).
     Project(usize),
     /// A row of the model picker (an index into [`App::filtered_models`]).
@@ -23,9 +25,19 @@ pub enum Target {
 
 /// Resolve a point against the layout of the frame drawn for a terminal of
 /// `size` cells.
+///
+/// The prompt bar is checked before `main`, because it is the one band outside
+/// `main` that is clickable: it sits between the panels and the log, so a point
+/// there is not inside `main` at all.
 pub fn target_at(app: &App, size: (u16, u16), x: u16, y: u16) -> Option<Target> {
-    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1)).main;
+    let regions = layout::Regions::of(Rect::new(0, 0, size.0, size.1), app.mode());
     let point = Position::from((x, y));
+
+    if app.mode() == Mode::Roster && regions.prompt.contains(point) {
+        return Some(Target::Prompt);
+    }
+
+    let main = regions.main;
     if !main.contains(point) {
         return None;
     }

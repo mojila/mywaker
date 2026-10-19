@@ -1,12 +1,15 @@
-//! The ratatui renderer: title bar, sidebar, employee grid, chat, log, help.
+//! The ratatui renderer: title bar, sidebar, employee grid, prompt, chat, log,
+//! help.
 
 mod chat;
 pub(crate) mod hit;
+pub(crate) mod input;
 mod layout;
 mod modal;
 mod models;
 mod pipeline;
 mod projects;
+mod prompt;
 mod robot;
 pub mod sidebar;
 mod status;
@@ -46,10 +49,11 @@ pub(crate) fn truncate(text: &str, width: usize) -> String {
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
-    let regions = layout::Regions::of(frame.area());
+    let regions = layout::Regions::of(frame.area(), app.mode());
 
     render_title(frame, app, regions.title);
     render_main(frame, app, regions.main);
+    prompt::render(frame, app, regions.prompt);
     render_log(frame, app, regions.log);
     render_help(frame, app, regions.help);
 
@@ -76,7 +80,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 /// geometry the renderer draws into, rather than recomputing the `24 | fill | 32`
 /// split by hand — which is what `docs/acceptance-sidebar.md` §3 requires.
 pub fn sidebar_area(size: (u16, u16)) -> Rect {
-    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1)).main;
+    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster).main;
     layout::roster_areas(main)[0]
 }
 
@@ -86,8 +90,14 @@ pub fn sidebar_area(size: (u16, u16)) -> Rect {
 /// the panel the renderer draws into instead of recomputing the `24 | fill | 32`
 /// split.
 pub fn team_area(size: (u16, u16)) -> Rect {
-    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1)).main;
+    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster).main;
     layout::roster_areas(main)[1]
+}
+
+/// The roster prompt bar's rectangle for a terminal of `size` cells — the band
+/// between `main` and the log, where a goal is typed.
+pub fn prompt_area(size: (u16, u16)) -> Rect {
+    layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster).prompt
 }
 
 /// The employee cards on screen for a terminal of `size` cells, as
@@ -279,6 +289,7 @@ fn hint_bar(app: &App) -> Line<'static> {
         Mode::Roster => &[
             ("↑↓←→", "move"),
             ("wheel", "scroll"),
+            ("i", "goal"),
             ("Enter", "chat"),
             ("p", "projects"),
             ("m", "model"),
@@ -384,11 +395,17 @@ fn help_lines() -> Vec<Line<'static>> {
         key("↑↓←→ h/j/k/l", "move around the employee grid"),
         key("PgUp/PgDn", "move a page of cards"),
         key("wheel", "scroll the grid (the selection stays put)"),
+        key("i · Tab", "type a goal for the orchestrator"),
         key("Enter", "chat with the selected employee"),
         key("m", "pick a model"),
         key("p", "choose the working project"),
         key("Space", "pause / resume the task engine"),
         key("s", "pause / resume the selected employee's task"),
+        Line::from(""),
+        head(" goal prompt"),
+        key("Enter", "send the goal · Shift+Enter newline"),
+        key("↑/↓", "recall a previous goal"),
+        key("Esc · Tab", "back to the roster keys"),
         Line::from(""),
         head(" chat"),
         key("Enter", "send · Shift+Enter newline"),
@@ -404,7 +421,7 @@ fn help_lines() -> Vec<Line<'static>> {
 /// A full-screen help overlay, centred over the current view.
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, area);
-    let popup = centered(area, 68, 20);
+    let popup = centered(area, 68, 30);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Color::Cyan)

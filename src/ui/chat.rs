@@ -316,62 +316,15 @@ fn inline_code_line(seg: &str, base: Style) -> Line<'static> {
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     let text = app.input();
     let cursor = app.input_cursor();
-    let byte = text
-        .grapheme_indices(true)
-        .nth(cursor)
-        .map(|(i, _)| i)
-        .unwrap_or(text.len());
-
     // Body width: the panel's two side borders plus the `> ` prompt.
     let body_width = area.width.saturating_sub(4) as usize;
+    let scroll = super::input::scroll(text, cursor, body_width, app.input_scroll());
 
-    // Effective scroll keeps the cursor visible (mirrors `App`'s own follow, so
-    // the window is correct even on a render that precedes the next edit).
-    let cursor_col = text[..byte].width();
-    let mut scroll = app.input_scroll();
-    if cursor_col < scroll {
-        scroll = cursor_col;
-    }
-    if body_width > 0 && cursor_col >= scroll + body_width {
-        scroll = cursor_col + 1 - body_width;
-    }
-    // Mirror `App`'s shrink retraction: pull the scroll back to the minimal
-    // in-view value so a shortened input doesn't render as a bare cursor block.
-    if body_width > 0 {
-        scroll = scroll.min(cursor_col.saturating_add(1).saturating_sub(body_width));
-    }
-
-    let (before, _) = trim_leading_columns(&text[..byte], scroll);
-    let after = &text[byte..];
-
-    let line = Line::from(vec![
-        Span::styled("> ", Color::Cyan),
-        Span::raw(before),
-        Span::styled("█", Color::Cyan),
-        Span::raw(after.to_string()),
-    ]);
+    let line = super::input::line(text, cursor, scroll, "> ", true);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Color::DarkGray);
     frame.render_widget(Paragraph::new(line).block(block), area);
-}
-
-/// Trim the leading `columns` display columns from `text`, stopping at a
-/// grapheme-cluster boundary. Returns the trimmed remainder and the columns
-/// actually removed (≤ `columns`).
-fn trim_leading_columns(text: &str, columns: usize) -> (String, usize) {
-    if columns == 0 {
-        return (text.to_string(), 0);
-    }
-    let mut removed = 0;
-    for (idx, g) in text.grapheme_indices(true) {
-        let w = g.width();
-        if removed + w > columns {
-            return (text[idx..].to_string(), removed);
-        }
-        removed += w;
-    }
-    (String::new(), removed)
 }
 
 /// Render the slash-command autocomplete menu as a floating list anchored just
@@ -503,14 +456,5 @@ mod tests {
         let decomposed = "e\u{301}e\u{301}e\u{301}";
         let out = chunk_lines(decomposed, 2);
         assert_eq!(out, vec!["e\u{301}e\u{301}", "e\u{301}"]);
-    }
-
-    #[test]
-    fn trim_leading_columns_stops_at_grapheme_boundary() {
-        assert_eq!(trim_leading_columns("abc", 1), ("bc".to_string(), 1));
-        // A 2-column emoji can't be half-trimmed: trimming one column leaves it.
-        assert_eq!(trim_leading_columns("😀ab", 1), ("😀ab".to_string(), 0));
-        assert_eq!(trim_leading_columns("😀ab", 2), ("ab".to_string(), 2));
-        assert_eq!(trim_leading_columns("abc", 9), (String::new(), 3));
     }
 }

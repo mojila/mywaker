@@ -890,6 +890,237 @@ fn selecting_the_orchestrator_does_not_scroll_the_grid() {
     assert_eq!(app.roster_scroll(), 0, "the root sits above the first page");
 }
 
+// --- the roster prompt ---
+
+/// A goal typed on the roster screen goes to the orchestrator, whatever card
+/// happens to be selected — the root is the one that decomposes and delegates.
+#[test]
+fn submit_goal_routes_to_the_orchestrator_not_the_selection() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+    app.selected = writer; // the cursor is on a card, not the root
+
+    press(&mut app, KeyCode::Char('i'));
+    assert!(app.prompt_focused());
+    for c in "ship the release".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    // The goal is the orchestrator's: it is in that chat, queued for the root's
+    // session, and the writer never saw it.
+    assert!(
+        app.chats[&root]
+            .transcript
+            .iter()
+            .any(|line| line.role == TranscriptRole::User && line.text == "ship the release")
+    );
+    assert!(
+        app.chats[&root]
+            .queue_running
+            .iter()
+            .any(|queued| queued == "ship the release"),
+        "the root's session is not live, so the goal is queued"
+    );
+    assert!(
+        !app.chats.contains_key(&writer) || app.chats[&writer].outbox.is_empty(),
+        "the selected card must not receive the goal"
+    );
+
+    // The chain is rooted at the orchestrator, so a later `@user` delivers there.
+    assert_eq!(app.origin_of.get(&root), Some(&root));
+    assert_eq!(app.depth_of.get(&root), Some(&0));
+
+    // The buffer is cleared and the bar keeps the keyboard for the next goal.
+    assert!(app.input().is_empty());
+    assert!(app.prompt_focused());
+    assert_eq!(app.prompt_history, vec!["ship the release".to_string()]);
+}
+
+/// `↑`/`↓` in the prompt recall previous goals, restoring the draft past the
+/// newest one.
+#[test]
+fn the_prompt_recalls_previous_goals() {
+    let (mut app, _rx) = make_app();
+    press(&mut app, KeyCode::Char('i'));
+
+    for goal in ["first goal", "second goal"] {
+        for c in goal.chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+    }
+
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input(), "second goal");
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input(), "first goal");
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input(), "first goal", "clamped at the oldest goal");
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.input(), "second goal");
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.input(), "", "past the newest goal is the draft");
+}
+
+/// A half-typed goal survives `Esc`: blurring the bar is not a cancel.
+#[test]
+fn escaping_the_prompt_keeps_the_typed_goal() {
+    let (mut app, _rx) = make_app();
+    press(&mut app, KeyCode::Char('i'));
+    for c in "unfinished".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.prompt_focused());
+    assert_eq!(app.input(), "unfinished");
+
+    // And focusing again resumes editing the same text.
+    press(&mut app, KeyCode::Tab);
+    assert!(app.prompt_focused());
+    assert_eq!(app.input(), "unfinished");
+}
+
+/// While the bar has the keyboard, the roster's single-letter shortcuts are text.
+/// `q` types a `q` instead of quitting, `s`/`p`/`m` likewise.
+#[test]
+fn roster_shortcuts_are_text_while_the_prompt_is_focused() {
+    let (mut app, _rx) = make_app();
+    press(&mut app, KeyCode::Char('i'));
+
+    for c in "qspm".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert_eq!(app.input(), "qspm");
+    assert!(!app.is_shutting_down(), "`q` must not quit while typing");
+    assert_eq!(app.mode(), Mode::Roster, "`p`/`m` must not open a picker");
+
+    // Blurred, the same keys are shortcuts again. `m` needs a connected client
+    // (there is no model catalog to browse otherwise), so the check uses `p`,
+    // which is purely local.
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(app.mode(), Mode::Projects);
+}
+
+/// The shortcuts are untouched while the bar is *not* focused — the plan's hard
+/// requirement.
+#[test]
+fn roster_shortcuts_still_work_when_the_prompt_is_not_focused() {
+    let (mut app, _rx) = make_app();
+    assert!(
+        !app.prompt_focused(),
+        "the roster opens with the bar blurred"
+    );
+
+    press(&mut app, KeyCode::Char('p'));
+    assert_eq!(app.mode(), Mode::Projects);
+}
+
+/// A bracketed paste goes into the focused prompt, and is ignored when neither
+/// the chat nor the prompt has the keyboard.
+#[test]
+fn paste_lands_in_the_focused_prompt() {
+    let (mut app, _rx) = make_app();
+    app.update(Message::Paste("ignored".to_string()));
+    assert_eq!(app.input(), "", "no field is focused");
+
+    press(&mut app, KeyCode::Char('i'));
+    app.update(Message::Paste("a pasted goal".to_string()));
+    assert_eq!(app.input(), "a pasted goal");
+    assert_eq!(app.input_cursor(), "a pasted goal".len());
+}
+
+/// `Enter` on an empty or whitespace-only prompt is a no-op: nothing is queued,
+/// nothing is logged, and the history does not grow.
+#[test]
+fn an_empty_goal_is_not_submitted() {
+    let (mut app, _rx) = make_app();
+    press(&mut app, KeyCode::Char('i'));
+
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Char(' '));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.prompt_history.is_empty());
+    let root = employee(&app, "orchestrator");
+    assert!(!app.chats.contains_key(&root) || app.chats[&root].queue_running.is_empty());
+}
+
+/// Opening a chat drops the keyboard from the roster prompt, so a half-typed goal
+/// cannot follow the user into an employee's conversation.
+#[tokio::test]
+async fn opening_a_chat_clears_the_prompt_buffer() {
+    let (mut app, _rx) = make_app();
+    press(&mut app, KeyCode::Char('i'));
+    for c in "half a goal".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    assert!(app.prompt_focused());
+
+    // Opening a chat is gated on a connection, so the fixture supplies one: the
+    // point of the test is the buffer, not the transport.
+    app.client = Some(crate::opencode::OpenCode::with_base(
+        "http://127.0.0.1:1".parse().expect("a literal URL parses"),
+        "sekrit",
+    ));
+    app.start_chat(employee(&app, "writer"));
+
+    assert_eq!(app.mode(), Mode::Chat);
+    assert!(!app.prompt_focused());
+    assert!(app.input().is_empty(), "the chat opens on an empty buffer");
+}
+
+/// A click on the prompt band focuses the bar; a click on a card takes the
+/// keyboard back and selects that employee.
+#[test]
+fn clicking_the_prompt_focuses_it_and_a_card_blurs_it() {
+    let (mut app, _rx) = make_app();
+    app.last_size = (120, 40);
+
+    let band = ui::prompt_area((120, 40));
+    assert!(band.height > 0, "the roster draws the band");
+    app.handle_mouse(mouse_click(band.x + 2, band.y));
+    assert!(app.prompt_focused(), "a click on the bar focuses it");
+    assert_eq!(
+        ui::hit_target_at(&app, (120, 40), band.x + 2, band.y),
+        Some(ui::Target::Prompt)
+    );
+
+    let (column, row) = find_on_screen(&app, 120, 40, " WRITER ");
+    app.handle_mouse(mouse_click(column, row));
+    assert_eq!(app.selected(), employee(&app, "writer"));
+    assert!(
+        !app.prompt_focused(),
+        "a card click takes the keyboard back"
+    );
+}
+
+/// The roster's prompt band does not cost the panels a row: `main` is the same
+/// rectangle it was before the bar existed.
+#[test]
+fn the_prompt_band_does_not_shrink_the_panels() {
+    let (mut app, _rx) = make_app();
+    app.update(Message::Resize(120, 40));
+
+    let main = ui::team_area((120, 40));
+    assert_eq!(main.y, 1);
+    assert_eq!(main.height, 32, "40 - title - prompt - log - help");
+
+    let band = ui::prompt_area((120, 40));
+    assert_eq!(band.y, main.bottom(), "the bar sits directly under main");
+    assert_eq!(band.height, 2);
+
+    // Nothing in the grid changed shape: the geometry is the one the panels were
+    // built against.
+    assert!(!ui::grid_cells(&app, (120, 40)).is_empty());
+}
+
 #[test]
 fn renders_grid_with_mixed_statuses() {
     let (mut app, _rx) = make_app();

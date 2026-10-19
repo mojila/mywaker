@@ -4,23 +4,44 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 
+use crate::app::Mode;
+
 /// A frame's stacked bands: the title bar, the active screen (`main`), the log,
 /// and the hint bar.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Regions {
     pub title: Rect,
     pub main: Rect,
+    /// The roster's prompt band: the orchestrator bar on the main screen. Zero
+    /// height on every other screen, so `main` keeps the height it had before
+    /// the bar existed.
+    pub prompt: Rect,
     pub log: Rect,
     pub help: Rect,
 }
 
+/// The prompt band's height on the roster screen: two rows, one per line of the
+/// bordered bar (who you are talking to, then what you are typing).
+pub(crate) const PROMPT_HEIGHT: u16 = 2;
+
 impl Regions {
-    /// Split the whole terminal `area` into its bands.
-    pub(crate) fn of(area: Rect) -> Self {
-        let [title, main, log, help] = Layout::vertical([
+    /// Split the whole terminal `area` into its bands for `mode`.
+    ///
+    /// The log is the band that gives way: the roster spends two of its rows on
+    /// the prompt bar (and two fewer on the log), so `main` — the panels the user
+    /// reads — is exactly as tall as it was before the bar existed. Every other
+    /// screen keeps a six-row log and no prompt band.
+    pub(crate) fn of(area: Rect, mode: Mode) -> Self {
+        let (prompt_height, log_height) = match mode {
+            Mode::Roster => (PROMPT_HEIGHT, 4),
+            Mode::Chat | Mode::Projects | Mode::Models => (0, 6),
+        };
+
+        let [title, main, prompt, log, help] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
-            Constraint::Length(6),
+            Constraint::Length(prompt_height),
+            Constraint::Length(log_height),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -28,6 +49,7 @@ impl Regions {
         Self {
             title,
             main,
+            prompt,
             log,
             help,
         }
@@ -163,13 +185,77 @@ mod tests {
         assert_eq!(grid.width + 24 + 32, main.width);
     }
 
+    /// The roster spends two rows on the prompt bar, taken from the log — never
+    /// from `main`, whose height is what the grid, sidebar and tasks panel were
+    /// sized against.
     #[test]
     fn regions_stack_the_frame() {
-        let regions = Regions::of(Rect::new(0, 0, 100, 40));
+        let regions = Regions::of(Rect::new(0, 0, 100, 40), Mode::Chat);
 
         assert_eq!(regions.title, Rect::new(0, 0, 100, 1));
         assert_eq!(regions.log, Rect::new(0, 33, 100, 6));
         assert_eq!(regions.help, Rect::new(0, 39, 100, 1));
         assert_eq!(regions.main, Rect::new(0, 1, 100, 32));
+        assert_eq!(regions.prompt, Rect::new(0, 33, 100, 0));
+    }
+
+    /// In roster mode the prompt band exists and the log gives up exactly its
+    /// height, so `main` is byte-for-byte the same rectangle as on any other
+    /// screen.
+    #[test]
+    fn the_roster_prompt_band_comes_out_of_the_log() {
+        let area = Rect::new(0, 0, 100, 40);
+        let roster = Regions::of(area, Mode::Roster);
+        let chat = Regions::of(area, Mode::Chat);
+
+        assert_eq!(roster.prompt.height, PROMPT_HEIGHT);
+        assert_eq!(roster.prompt, Rect::new(0, 33, 100, PROMPT_HEIGHT));
+        assert_eq!(roster.log, Rect::new(0, 35, 100, 4));
+        assert_eq!(
+            roster.main, chat.main,
+            "the prompt band must not shrink the panels"
+        );
+        assert_eq!(roster.help, chat.help);
+
+        // Every band tiles the frame with no gap and no overlap.
+        let bands = [
+            roster.title,
+            roster.main,
+            roster.prompt,
+            roster.log,
+            roster.help,
+        ];
+        let mut y = area.y;
+        for band in bands {
+            assert_eq!(band.y, y, "{band:?}");
+            y += band.height;
+        }
+        assert_eq!(y, area.bottom());
+    }
+
+    /// A frame too short for every band still tiles: ratatui shrinks the bands
+    /// rather than overlapping them, and the hint bar keeps its row at the
+    /// bottom. The prompt band is never taller than it asked for.
+    #[test]
+    fn the_prompt_band_degrades_on_a_short_frame() {
+        let area = Rect::new(0, 0, 40, 3);
+        let regions = Regions::of(area, Mode::Roster);
+
+        assert!(regions.prompt.height <= PROMPT_HEIGHT);
+        assert_eq!(regions.help.bottom(), area.bottom(), "the hint bar stays");
+
+        // Whatever the split, the bands are disjoint and in order.
+        let bands = [
+            regions.title,
+            regions.main,
+            regions.prompt,
+            regions.log,
+            regions.help,
+        ];
+        for (index, band) in bands.iter().enumerate() {
+            for other in &bands[index + 1..] {
+                assert!(!band.intersects(*other), "{band:?} ∩ {other:?}");
+            }
+        }
     }
 }

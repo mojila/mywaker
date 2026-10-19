@@ -1,0 +1,271 @@
+//! The roster's prompt bar: the goal input on the main screen, addressed to the
+//! orchestrator.
+//!
+//! Two rows: a top border carrying who you are talking to (the root's name, its
+//! status, its model, and how many hand-offs are in flight), and one content row
+//! holding `> ` and the line editor. The editor itself is
+//! [`super::input`], shared with the chat bar, so the two cursors behave the same.
+//!
+//! The bar is always drawn — an unfocused one has no caret — because it is how the
+//! main screen tells the user a goal can be typed there at all.
+
+use ratatui::{
+    Frame,
+    layout::{Alignment, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+};
+
+use crate::app::App;
+
+use super::input;
+
+/// The prefix on the content row, matching the chat input.
+const PREFIX: &str = "> ";
+
+pub fn render(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let focused = app.prompt_focused();
+    let accent = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(accent));
+
+    // The content row: the line editor, windowed to the bar's inner width (the
+    // `> ` prefix is part of the body budget, as in chat).
+    let body_width = area.width.saturating_sub(PREFIX.len() as u16 + 1) as usize;
+    let scroll = input::scroll(
+        app.input(),
+        app.input_cursor(),
+        body_width,
+        app.input_scroll(),
+    );
+    let line = input::line(app.input(), app.input_cursor(), scroll, PREFIX, focused);
+
+    frame.render_widget(
+        Paragraph::new(line).block(block.clone().title(Line::from(left_title(app)))),
+        area,
+    );
+
+    // The right end of the border: how much delegation is in flight. Drawn over
+    // the border row, so it reads as part of the frame rather than as text in the
+    // input.
+    if let Some(badge) = right_badge(app) {
+        let top = Rect::new(area.x, area.y, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(badge)).alignment(Alignment::Right),
+            top,
+        );
+    }
+}
+
+/// The left half of the border: `orchestrator · Otto · idle · model`, graded so
+/// the name survives a narrow bar.
+fn left_title(app: &App) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            " orchestrator ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {} ", app.orchestrator_name().unwrap_or("—")),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    if let Some(status) = app.orchestrator_status() {
+        spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!("{} ", status.label()),
+            Style::default().fg(super::status::color(status)),
+        ));
+    }
+
+    if let Some(model) = app.orchestrator_model() {
+        spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!("{model} "),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    spans
+}
+
+/// The right half of the border: `◆ N delegating`, only while something is in
+/// flight, so an idle team keeps the bar quiet.
+fn right_badge(app: &App) -> Option<Vec<Span<'static>>> {
+    let count = app.delegating_count();
+    if count == 0 {
+        return None;
+    }
+    let plural = if count == 1 { "" } else { "s" };
+    Some(vec![
+        Span::styled("◆ ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{count} delegating{plural} "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM),
+        ),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::message::Message;
+    use crate::team::{EmployeeStatus, Team};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
+        App::new(Config::default(), tx)
+    }
+
+    /// Deliver a plain key through the app's own key path, so the tests exercise
+    /// the focus routing rather than the editor directly.
+    fn press(app: &mut App, code: KeyCode) {
+        app.update(Message::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// Draw the bar on a throwaway terminal and return the buffer's symbols.
+    fn bar(app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render(frame, app, area);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// The border names the root and shows its live status, so the main screen
+    /// says who a typed goal is going to.
+    #[test]
+    fn the_bar_names_the_orchestrator_and_its_status() {
+        let app = app();
+        let text = bar(&app, 100);
+        assert!(text.contains("orchestrator"), "{text}");
+        assert!(text.contains("Otto"), "{text}");
+        assert!(text.contains("idle"), "{text}");
+
+        let mut team = Team::starter();
+        team.set_status_by_id(crate::team::ORCHESTRATOR_ID, EmployeeStatus::Working);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
+        let working = App::with_team(Config::default(), tx, team);
+        assert!(bar(&working, 100).contains("working"));
+    }
+
+    /// The assigned model is shown when there is one, and omitted when there is
+    /// not — the bar never prints a placeholder model.
+    #[test]
+    fn the_bar_shows_the_root_model_when_assigned() {
+        let app = app();
+        assert!(!bar(&app, 100).contains("deepseek"), "no model yet");
+
+        let mut team = Team::starter();
+        team.employee_mut(crate::team::ORCHESTRATOR_ID)
+            .expect("root")
+            .model = Some("deepseek-v4-pro".to_string());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
+        let assigned = App::with_team(Config::default(), tx, team);
+        assert!(bar(&assigned, 100).contains("deepseek-v4-pro"));
+    }
+
+    /// The input row is the shared line editor: prefix, text, caret.
+    #[test]
+    fn the_content_row_is_the_line_editor() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('i'));
+        assert!(app.prompt_focused(), "`i` focuses the bar");
+        type_text(&mut app, "ship the release");
+
+        let text = bar(&app, 60);
+        assert!(text.contains("> ship the release"), "{text}");
+        assert!(text.contains(input::CURSOR), "a focused bar shows a caret");
+    }
+
+    /// An unfocused bar has no caret, so the main screen shows where the keyboard
+    /// is not.
+    #[test]
+    fn an_unfocused_bar_has_no_caret() {
+        let app = app();
+        assert!(!bar(&app, 60).contains(input::CURSOR));
+    }
+
+    /// The badge counts the employees working under the root, and disappears when
+    /// the team is idle.
+    #[test]
+    fn the_badge_reports_delegation_in_flight() {
+        let app = app();
+        assert!(!bar(&app, 100).contains("delegating"), "idle team");
+
+        // Two workers mid-turn under the root: the root has handed work out.
+        let mut team = Team::starter();
+        team.set_status_by_id("researcher", EmployeeStatus::Working);
+        team.set_status_by_id("writer", EmployeeStatus::Thinking);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
+        let delegating = App::with_team(Config::default(), tx, team);
+        let text = bar(&delegating, 100);
+        assert!(text.contains("◆ 2 delegating"), "{text}");
+    }
+
+    /// The root's own turn is not delegation: it is the one doing the delegating.
+    #[test]
+    fn the_roots_own_turn_is_not_counted_as_delegation() {
+        let mut team = Team::starter();
+        team.set_status_by_id(crate::team::ORCHESTRATOR_ID, EmployeeStatus::Working);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
+        let app = App::with_team(Config::default(), tx, team);
+        assert!(!bar(&app, 100).contains("delegating"));
+    }
+
+    /// The bar survives a narrow terminal without panicking, and still shows the
+    /// input row.
+    #[test]
+    fn the_bar_degrades_on_a_narrow_terminal() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('i'));
+        type_text(&mut app, "abcdef");
+        let text = bar(&app, 12);
+        assert!(text.contains('>'), "{text}");
+    }
+
+    /// A zero-height band draws nothing (the roster's log keeps its rows on a
+    /// short frame).
+    #[test]
+    fn a_zero_height_band_draws_nothing() {
+        let app = app();
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, Rect::new(0, 0, 40, 0)))
+            .unwrap();
+    }
+}
