@@ -1,7 +1,7 @@
 //! Status presentation: the single home for the glyph, colour, and spinner used
 //! to draw an employee's or a task's lifecycle state.
 //!
-//! Three panels render the same lifecycle status — the workflow pipeline, the
+//! Three panels render the same lifecycle status — the employee grid, the
 //! tasks panel, and the robot avatar — and each had grown its own copy of the
 //! tables (the spinner alone existed four times). They live here instead.
 //!

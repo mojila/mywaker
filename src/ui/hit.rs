@@ -13,7 +13,7 @@ use super::{layout, pipeline};
 /// What a point on screen points at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
-    /// An employee's node in the roster pipeline (an index into the team).
+    /// An employee's card in the roster grid (an index into the team).
     Employee(usize),
     /// A row of the project picker (an index into [`App::projects`]).
     Project(usize),
@@ -56,18 +56,17 @@ pub fn target_at(app: &App, size: (u16, u16), x: u16, y: u16) -> Option<Target> 
     }
 }
 
-/// The employee whose pipeline node covers the point. The pipeline's own
-/// geometry decides, so a click agrees with the node it was aimed at — and the
-/// shared Jev node (which stands for no employee) answers `None`.
+/// The employee whose grid card covers the point. The grid's own geometry
+/// decides — with the app's scroll offset — so a click agrees with the card it
+/// was aimed at. The Jev header and the gaps between cards stand for no employee
+/// and answer `None`.
 fn employee_at(app: &App, area: Rect, point: Position) -> Option<Target> {
     let order = app.workflow_order();
-    let (root, leaves) = order.split_first()?;
-    pipeline::tree(area, *root, leaves)
-        .nodes
+    pipeline::grid(area, &order, app.roster_scroll())
+        .cells
         .into_iter()
-        .find(|node| node.area.contains(point))
-        .and_then(|node| node.employee)
-        .map(Target::Employee)
+        .find(|cell| cell.area.contains(point))
+        .map(|cell| Target::Employee(cell.employee))
 }
 
 /// The list row under `y`, for a list scrolled to the window its selection asks

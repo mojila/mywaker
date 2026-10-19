@@ -45,25 +45,58 @@ pub fn path_for(employee: &Employee) -> Option<PathBuf> {
 /// The markdown definition for `employee`: YAML frontmatter plus a role prompt.
 ///
 /// Canonical workflow roles reuse the role prompts documented under
-/// `examples/agents/` (planner, researcher, writer, reviewer — the engineer
-/// prompt has no checked-in file), so a hired teammate starts from the same
-/// prompt the examples show; any other role gets a generic identity prompt built
-/// from the employee's name and human role.
+/// `examples/agents/` (planner, researcher, writer, reviewer — the engineer prompt
+/// has no checked-in file), so a hired teammate starts from the same prompt the
+/// examples show. The asset-creator id (`modeler`) has a mandate of its own but no
+/// [`Role`]; its checked-in `examples/agents/modeler.md` mirrors the `MODELER` text
+/// exactly, and a test keeps the two in step. Any other role gets a generic
+/// identity prompt built from the employee's name and human role.
 pub fn definition(employee: &Employee) -> String {
-    let description = {
-        let role = employee.role.trim();
-        if role.is_empty() {
-            employee.id.as_str()
-        } else {
-            role
-        }
-    };
-
     format!(
         "---\ndescription: {}\nmode: all\n---\n\n{}\n",
-        yaml_scalar(description),
+        yaml_scalar(&description(employee)),
         prompt(employee)
     )
+}
+
+/// The frontmatter `description` for `employee`.
+///
+/// It has to describe the agent that will actually run, so it follows the same
+/// effective id the prompt does ([`Employee::agent_id`]) rather than blindly
+/// copying [`Employee::role`]. Otherwise an employee with id `qa` and
+/// `agent = "reviewer"` would write `description: "QA lead"` above the reviewer
+/// prompt — a frontmatter/body contradiction.
+///
+/// Resolution order: a canonical role named by the effective id, then the
+/// asset-creator mandate's own description, then the employee's human role, and
+/// finally the id (for an employee whose role was left blank).
+fn description(employee: &Employee) -> String {
+    let agent_id = employee.agent_id();
+
+    let role = Role::from_label(agent_id);
+    if role != Role::General {
+        return capitalize(role.label());
+    }
+    if agent_id == MODELER_ID {
+        return MODELER_DESCRIPTION.to_string();
+    }
+
+    let role = employee.role.trim();
+    if role.is_empty() {
+        agent_id.to_string()
+    } else {
+        role.to_string()
+    }
+}
+
+/// Uppercase the first character, leaving the rest alone (`reviewer` → `Reviewer`),
+/// so a role-derived description reads as prose in the frontmatter.
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Ensure `employee`'s definition exists, writing it only when absent. Returns
@@ -116,8 +149,37 @@ fn yaml_scalar(value: &str) -> String {
 }
 
 /// The system-prompt body for `employee`.
+///
+/// Both branches key on the same thing — [`Employee::agent_id`], the id of the
+/// OpenCode agent that will actually run the prompt. The asset-creator mandate is
+/// selected by id rather than a [`Role`]: roles order the plan → research →
+/// implement → write → review pipeline, and an asset creator sits outside that
+/// chain (its id resolves to [`Role::General`], like any other non-workflow id).
 fn prompt(employee: &Employee) -> String {
-    match employee.workflow_role() {
+    match employee.agent_id() {
+        MODELER_ID => MODELER.into(),
+        _ => role_prompt(employee),
+    }
+}
+
+/// The prompt for a canonical workflow id, or the generic identity prompt when the
+/// id maps to no canonical role.
+///
+/// The role is read off [`Employee::agent_id`] — the same key [`prompt`] uses — so
+/// an `agent` override selects the role prompt for the agent it names, not the one
+/// implied by the employee's own id.
+///
+/// **This deliberately differs from the pipeline.** [`Employee::workflow_role`]
+/// (and everything built on it — `stage_label`, `App::workflow_order`, the
+/// fan-out aggregator choice) resolves the role from the employee's *id*, because
+/// those are display/ordering concerns that must stay stable for a given employee.
+/// Prompt selection is about the agent that will actually run, so it follows the
+/// `agent` override. The two can therefore disagree: an employee with id `qa` and
+/// `agent = "reviewer"` gets the reviewer *prompt* while still rendering in the
+/// `GENERAL` pipeline stage. That is intended — the pipeline orders the team, the
+/// prompt tells the agent how to behave.
+fn role_prompt(employee: &Employee) -> String {
+    match Role::from_label(employee.agent_id()) {
         Role::Planner => PLANNER.into(),
         Role::Researcher => RESEARCHER.into(),
         Role::Engineer => ENGINEER.into(),
@@ -186,6 +248,67 @@ When something is wrong, hand it back with line-leading `@<id> <instruction>`
 directives rather than silently rewriting it. When it passes, approve and return it
 to the user with `@user <note>`.";
 
+/// The canonical id of the asset-creator mandate — the one string both [`prompt`]
+/// and [`description`] key on.
+const MODELER_ID: &str = "modeler";
+
+/// The frontmatter description that pairs with [`MODELER`], and the one written
+/// into `examples/agents/modeler.md`.
+const MODELER_DESCRIPTION: &str = "3D asset creator";
+
+/// The 3D asset-creator mandate, mirrored in `examples/agents/modeler.md`.
+///
+/// **Keyed on the effective agent id**, not the employee id: [`prompt`] matches
+/// [`Employee::agent_id`], so `agent = "modeler"` selects this mandate for any
+/// employee, while an employee whose own id is `modeler` but whose `agent`
+/// override names something else does **not** get it — the override wins, because
+/// it is the agent that actually runs.
+///
+/// Two Blender bridges are named here on purpose, because conflating them sends the
+/// employee at the wrong port: `blender-toolkit` speaks WebSocket on `localhost:9400+`,
+/// while `product-polish`, `threejs-export`, and the `polyhaven-*` scripts speak the
+/// socket-addon protocol on `localhost:9876`.
+const MODELER: &str = "You are the **modeler**, the team's 3D asset creator.
+
+Work within your own role and leave work that belongs to a teammate to them: hand it off
+with a line-leading `@<id> <instruction>` directive. Deliver your finished result back to
+the user with `@user <summary>`.
+
+## 3D mandate
+
+You own the 3D remit end to end: every 3D asset the team needs — a model, a textured
+scene, a rendered turntable — is yours to build, and nothing outside it is.
+
+**The pipeline.** Work in stages, and say which stage you are in:
+
+1. **Source** — `image-to-3d` (one photo) or `multi-image-to-3d` (1–4 angles of the same
+   object) to bring a reference into 3D. Both read `MESHY_API_KEY` from the environment
+   and download the GLB into the working directory.
+2. **Build** — `blender-toolkit` for Blender-side geometry, materials, modifiers, and rig
+   work. It is a TypeScript CLI driving Blender over its own WebSocket server
+   (`localhost:9400+`) — not an MCP bridge.
+3. **Surface** — `polyhaven-texture-apply` or `polyhaven-material-swap` for real PBR
+   materials; `product-polish` for the glossy product-shot finish.
+4. **Scene & light** — `polyhaven-studio-setup` for a studio, `polyhaven-scene-builder`
+   for a pedestal/props composition, `polyhaven-hdri-showcase` to compare lighting.
+5. **Deliver** — `threejs-export` for a web viewer (GLB + HTML), or a render for stills.
+   For motion, the camera skills are the deliverable: `turntable` for a full 360° orbit,
+   `perfect-loop` when it must loop seamlessly, and `crane-shot` / `slow-zoom` /
+   `dolly-rotate` / `dynamic-full-loop` for a reveal.
+
+Stages 3–5 drive Blender through the socket addon on `localhost:9876` (its `--port`
+flag) — a different mechanism from stage 2's WebSocket server, and not interchangeable.
+
+**Blender discipline.** Look at the result and judge your own work. Look shader nodes up
+by type, never by name. Read enum identifiers instead of hardcoding them. Imported and
+generated models arrive at arbitrary scale: size them from the reported world bounding
+box and seat them on the ground before assessing a composition.
+
+**Boundaries.** You do not write application code, documentation, or plans; hand those to
+`@writer`, `@planner`, or `@researcher` with a line-leading directive. Ask `@reviewer` to
+check a deliverable and `@tester` to verify a pipeline. Deliver the finished asset and
+where it lives with `@user <summary>`.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +337,7 @@ mod tests {
             ("writer", "You are the **writer**"),
             ("reviewer", "You are the **reviewer**"),
             ("engineer", "You are the **engineer**"),
+            ("modeler", "You are the **modeler**"),
         ] {
             let employee = Employee::new(id, "N", "Role");
             assert!(
@@ -221,6 +345,170 @@ mod tests {
                 "{id} should get its canonical prompt"
             );
         }
+    }
+
+    /// The mandate text the UI and the docs both point at: every skill it names must
+    /// be a real roster entry, and the two Blender bridges must stay distinct.
+    #[test]
+    fn modeler_gets_the_3d_mandate() {
+        let employee = Employee::new("modeler", "Echo", "3D asset creator");
+        let text = definition(&employee);
+
+        assert!(text.contains("## 3D mandate"), "should carry the mandate");
+        for skill in [
+            "image-to-3d",
+            "multi-image-to-3d",
+            "blender-toolkit",
+            "polyhaven-texture-apply",
+            "polyhaven-material-swap",
+            "product-polish",
+            "polyhaven-studio-setup",
+            "polyhaven-scene-builder",
+            "polyhaven-hdri-showcase",
+            "threejs-export",
+            // Stage 5's motion deliverables — the "rendered turntable" promise.
+            "turntable",
+            "perfect-loop",
+            "crane-shot",
+        ] {
+            assert!(text.contains(skill), "the mandate should name `{skill}`");
+        }
+
+        // blender-toolkit drives Blender over its own WebSocket, not MCP.
+        assert!(
+            text.contains("localhost:9400"),
+            "should name the WebSocket port"
+        );
+        assert!(
+            text.contains("localhost:9876"),
+            "should name the socket-addon port"
+        );
+        assert!(
+            !text.contains("through MCP") && !text.contains("via MCP"),
+            "must not describe blender-toolkit as an MCP bridge: {text}"
+        );
+    }
+
+    /// The mandate is selected by the canonical agent id, so an employee that names
+    /// `modeler` in its `agent` override gets it without renaming itself.
+    #[test]
+    fn modeler_mandate_follows_the_agent_override() {
+        let mut employee = Employee::new("atlas", "Atlas", "3D asset creator");
+        assert!(
+            definition(&employee).contains("**Atlas** (`atlas`)"),
+            "a plain id still gets the generic identity prompt"
+        );
+
+        employee.agent = Some("modeler".into());
+        assert!(
+            definition(&employee).contains("## 3D mandate"),
+            "the `agent` override should select the mandate"
+        );
+    }
+
+    /// The role prompt is keyed on the agent id, exactly like the modeler mandate:
+    /// an employee whose `agent` override names a canonical role gets that role's
+    /// prompt, not the generic identity prompt its own id would imply.
+    #[test]
+    fn role_prompt_follows_the_agent_override() {
+        let mut employee = Employee::new("qa", "Quinn", "QA lead");
+        assert!(
+            definition(&employee).contains("**Quinn** (`qa`)"),
+            "an id with no canonical role gets the generic identity prompt"
+        );
+
+        employee.agent = Some("reviewer".into());
+        assert!(
+            definition(&employee).contains("You are the **reviewer**"),
+            "the `agent` override should select the role prompt it names"
+        );
+
+        // …and the two branches agree: a `modeler` override still wins over a
+        // canonical role implied by the employee id.
+        let mut employee = Employee::new("writer", "Wren", "Writer");
+        employee.agent = Some("modeler".into());
+        assert!(definition(&employee).contains("## 3D mandate"));
+    }
+
+    /// The checked-in copy and the generated definition cannot drift: a generated
+    /// `modeler` file is byte-identical to `examples/agents/modeler.md`. Both the
+    /// `MODELER` doc comment and the README claim they match, so the claim is a test.
+    #[test]
+    fn modeler_definition_matches_the_checked_in_example() {
+        let employee = Employee::new("modeler", "Echo", "3D asset creator");
+        assert_eq!(
+            definition(&employee),
+            include_str!("../examples/agents/modeler.md"),
+            "regenerate examples/agents/modeler.md from the MODELER const"
+        );
+    }
+
+    /// The frontmatter describes the agent that will actually run, so it follows
+    /// the same effective id the prompt does. Without this, `qa` with
+    /// `agent = "reviewer"` would write `description: "QA lead"` above the reviewer
+    /// prompt — frontmatter contradicting body.
+    #[test]
+    fn description_follows_the_resolved_agent() {
+        // A canonical role named by the override wins over the human role.
+        let mut employee = Employee::new("qa", "Quinn", "QA lead");
+        employee.agent = Some("reviewer".into());
+        let text = definition(&employee);
+        assert!(
+            text.contains("description: \"Reviewer\""),
+            "the description should follow the reviewer override: {text}"
+        );
+        assert!(
+            !text.contains("QA lead"),
+            "the stale human role must not win"
+        );
+        assert!(text.contains("You are the **reviewer**"));
+
+        // The modeler override gets the mandate's own description.
+        let mut employee = Employee::new("atlas", "Atlas", "3D asset creator");
+        employee.agent = Some(MODELER_ID.into());
+        assert!(definition(&employee).contains("description: \"3D asset creator\""));
+
+        // No canonical override: the human role still describes the agent.
+        let employee = Employee::new("qa", "Quinn", "QA lead");
+        assert!(definition(&employee).contains("description: \"QA lead\""));
+    }
+
+    /// Pinning the *loss* case: an employee whose id names a canonical role but
+    /// whose `agent` override points elsewhere gets the generic identity prompt, not
+    /// that role's prompt. This is a deliberate decision — the override names the
+    /// agent that actually runs — not an accident of keying on the wrong field.
+    #[test]
+    fn a_non_canonical_agent_override_demotes_a_canonical_id() {
+        let mut employee = Employee::new("planner", "Dex", "Planner");
+        employee.agent = Some("atlas".into());
+
+        let text = definition(&employee);
+        assert!(
+            text.contains("**Dex** (`planner`)"),
+            "an unknown agent id falls back to the generic identity prompt: {text}"
+        );
+        assert!(
+            !text.contains("You are the **planner**"),
+            "the planner prompt must not be selected when the override names another agent"
+        );
+        // The pipeline still files this employee under PLANNER — the divergence is
+        // the point, and it is documented on `role_prompt`.
+        assert_eq!(employee.workflow_role(), Role::Planner);
+        assert_eq!(employee.stage_label(), "PLANNER");
+    }
+
+    /// The two keyings differ on purpose: the prompt follows `agent_id`, the
+    /// pipeline follows the employee id. Same employee, two answers.
+    #[test]
+    fn prompt_and_pipeline_resolve_the_role_from_different_fields() {
+        let mut employee = Employee::new("qa", "Quinn", "QA lead");
+        employee.agent = Some("reviewer".into());
+
+        // Prompt: the reviewer.
+        assert!(definition(&employee).contains("You are the **reviewer**"));
+        // Pipeline: still GENERAL, because ordering keys on the id.
+        assert_eq!(employee.workflow_role(), Role::General);
+        assert_eq!(employee.stage_label(), "GENERAL");
     }
 
     #[test]

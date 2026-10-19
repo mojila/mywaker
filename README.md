@@ -8,29 +8,53 @@ task stream, and an explicit model selector that lets you assign a model to ever
 employee.
 
 ```
-┌─ mywaker · project: acme ───────────────────────────────────────┐
-│       ┌─[◌ ◌]─┐                                                 │
-│       │  ───  │   ┌─ PLANNER ─┐   ┌ RESEARCHER ─┐   ┌ WRITER ┐ │
-│       ├──┬─┬──┤   │  ● Dex    │─▶ │  ◔ Aria     │─▶ │○ Bruno │ │
-├────────┴───────┴──┴───────────┴───┴─────────────┴───┴────────┴─┤
-│  log ┃ stream 4 agents · 132 events · connected                │
-├─────────────────────────────────────────────────────────────────┤
-│  ←/→ stage │ Enter chat │ p projects │ q quit                   │
-└─────────────────────────────────────────────────────────────────┘
+ mywaker  a team of AI employees                                                       ⠋ connecting…
+┌ waker ───────────────┐ team · 4                                   ┌ tasks ───────────────────────┐
+│  ⠋   ◉   ◉           │ jev ◆ on — @jev · jev-1-13-free            │⠋ Dex · Planner               │
+│  ┌─⠋─┐               │┌ PLANNER ───┐ ┌ RESEARCHER ┐ ┌ WRITER ────┐│  —                           │
+│MYWAKER               ││⠋ Dex       │ │▶ Aria      │ │● Bruno     ││                              │
+│  └─────┘             ││Planner     │ │Research le…│ │Writer      ││▶ Aria · Research lead        │
+│                      ││thinking    │ │working     │ │idle        ││  —                           │
+│now ⠋ connecting      ││gpt-6-luna  │ │none        │ │none        ││                              │
+│                      │└────────────┘ └────────────┘ └────────────┘│● Bruno · Writer              │
+│who ▶ Aria            │                                            │  —                           │
+│Research lead         │┌ REVIEWER ──┐                              │                              │
+│none                  ││● Cleo      │                              │● Cleo · Reviewer             │
+│— · session —         ││Reviewer    │                              │  —                           │
+│                      ││idle        │                              │                              │
+│pulse ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁││none        │                              │                              │
+│                      │└────────────┘                              │                              │
+└──────────────────────┘                                            └──────────────────────────────┘
+┌ log ─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ stream 0 agents · 0 events                                                                       │
+│ usage 0/0 in/out · cache 0% (0) · ram 4.0 MiB · cpu 0.0%                                         │
+│connecting to OpenCode…                                                                           │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ↑↓←→ move  wheel scroll  Enter chat  p projects  m model  Space pause  s task  ? help  q quit
 ```
 
-The team renders as a **workflow pipeline** — a left → right diagram ordered
-plan → research → write → review. Each stage is a box (name, role, live status,
-model) that lights up in its status colour (yellow thinking, cyan working,
-green done) while the robot avatar mirrors the aggregate state.
+The team renders as an **employee grid** — three cards per row, ordered plan →
+research → write → review. Each card is a box (name, role, live status, model)
+that lights up in its status colour (yellow thinking, cyan working, green done)
+while the sidebar's robot mirrors the aggregate state. Jev, the shared question
+answerer, is a one-row header above the grid rather than a card of its own.
 
 ## What it does
 
-- **Workflow pipeline** — the team rendered as a left → right diagram (plan →
-  research → write → review), one stage box per employee with live status +
-  model; the running stage lights up in its status colour.
+- **Employee grid** — the team as a fixed three-column grid (one column on a
+  narrow panel), ordered plan → research → write → review, one card per employee
+  with live status + model; the running employee lights up in its status colour.
+  The wheel scrolls the grid, the arrows move the selection and reveal it, and
+  the title reads `team · N · rows a-b/c` while the roster overflows.
 - **Live task board** — a right-hand panel listing every employee with their
   latest task and status, updated as work streams in (per-employee `last_task`).
+- **Inspector sidebar** — the left column carries more than the avatar: a compact
+  robot over an aggregate "now" line, the selected employee's model and provider,
+  an activity sparkline, queue vitals, uptime with Jev's state, and any alerts.
+  Sections drop whole as the terminal gets shorter, so a 24-row window still shows
+  the team's state without clipping (spec:
+  [`docs/acceptance-sidebar.md`](docs/acceptance-sidebar.md)).
 - **Animated robot avatar** — a state-driven ASCII robot that idles, thinks,
   works, and wraps up in real time as streaming deltas arrive.
 - **Chat & live streaming** — talk to an employee and watch the response stream
@@ -39,9 +63,9 @@ green done) while the robot avatar mirrors the aggregate state.
   (`mywaker model list`) and assign one per employee (`mywaker model set` or the
   TUI picker via `m`). The chosen model is persisted to `team.toml` and applied
   to that employee's sessions.
-- **Mouse or keyboard** — click a pipeline node or picker row to select it and
-  wheel to step or scroll; every control also has a key, so the TUI is fully
-  usable either way.
+- **Mouse or keyboard** — click a card or picker row to select it, wheel to
+  scroll the grid or page a transcript; every control also has a key, so the TUI
+  is fully usable either way.
 - **Autonomous triggers** — cron schedules (`[[schedules]]`) and file-change
   watch hooks (`[[watches]]`) fire tasks at employees with no chat required. Each
   task persists across restarts and retries up to three times on failure.
@@ -124,7 +148,9 @@ new employee never hits `Agent not found`. The write goes to OpenCode's *global*
 agents dir — `$XDG_CONFIG_HOME/opencode/agents/`, else `~/.config/opencode/agents/`
 — which matches the global roster in `team.toml`. Canonical ids
 (`planner`/`researcher`/`writer`/`reviewer`/`engineer`) get the documented role
-prompt; any other role gets a generic identity prompt you can edit.
+prompt, and the `modeler` asset creator gets its own 3D mandate. Every other id
+gets a generic identity prompt you can edit — `image` included, deliberately: 2D
+asset work sits outside the 3D mandate.
 
 ```bash
 mywaker employee add qa -n Quinn -r Tester   # writes ~/.config/opencode/agents/qa.md
@@ -139,8 +165,10 @@ prefer to write your own:
   `planner` / `researcher` / `writer` / `reviewer` agents as an `opencode.jsonc`
   `agents` block you can drop in or merge.
 - [`examples/agents/*.md`](examples/agents) — the same roles as individual
-  markdown agent files. Copy them into `~/.config/opencode/agents/` (global,
-  available in every project) or a project's `.opencode/agents/` (project-local).
+  markdown agent files, plus the `modeler` asset-creator mandate. Copy them into
+  `~/.config/opencode/agents/` (global, available in every project) or a project's
+  `.opencode/agents/` (project-local). The `modeler` file is byte-identical to the
+  mandate baked into `mywaker` (`src/agent.rs`), and a unit test keeps it that way.
 
 If an employee's agent id still isn't defined anywhere, the employee starts a
 session anyway — it falls back to OpenCode's default agent (with a note in the log)
@@ -150,7 +178,9 @@ rather than failing with `Agent not found`.
 
 | Key | Action |
 |---|---|
-| `←` / `→` or `h` / `l` (also `↑`/`↓`, `j`/`k`) | Move the workflow stage / select an employee |
+| `←` / `→` or `h` / `l` | Move one card left / right in the employee grid |
+| `↑` / `↓` or `j` / `k` | Move one card row up / down (same column) |
+| `PgUp` / `PgDn` | Move a viewport of cards (the selection follows and is revealed) |
 | `Enter` | Chat with the selected employee |
 | `m` | Pick a model for the selected employee |
 | `p` | Choose the working project |
@@ -161,12 +191,13 @@ rather than failing with `Agent not found`.
 | `Esc` | Back / leave chat |
 | `q` / `Ctrl-C` | Quit |
 | Click | Select the employee, project, or model you clicked |
-| Wheel | Move the selection, or page the chat transcript |
+| Wheel | Scroll the employee grid, or page the chat transcript |
 
 Mouse capture is on, so the terminal's own selection is bypassed — hold `Shift`
 while dragging to copy text as usual. Clicking only moves the selection: opening
 a chat, adopting a project, and assigning a model still take `Enter`, so a stray
-click can't change anything.
+click can't change anything. The wheel scrolls the grid's viewport without moving
+the selection, so looking around never changes what `Enter` would open.
 
 ## Model selection
 

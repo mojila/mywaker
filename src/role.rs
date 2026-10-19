@@ -1,8 +1,8 @@
-//! Workflow role, used only to order the team as a pipeline in the UI.
+//! Workflow role, used only to order the team as a grid in the UI.
 //!
 //! This is a *display/ordering* concern, not model routing: each employee's
-//! role is derived from their (stable) id and only drives the pipeline
-//! diagram's stage order and labels.
+//! role is derived from their (stable) id and only drives the employee grid's
+//! card order and labels.
 //!
 //! Resolution lives with the data owner — [`crate::team::Employee::workflow_role`]
 //! wraps [`Role::from_label`] — so the rest of the app asks an employee for its
@@ -47,7 +47,7 @@ impl Role {
     }
 
     /// Position in the canonical plan → research → implement → write → review
-    /// workflow, used to order the team as a pipeline in the UI.
+    /// workflow, used to order the team as a grid in the UI.
     pub fn order(self) -> u8 {
         match self {
             Role::Planner => 0,

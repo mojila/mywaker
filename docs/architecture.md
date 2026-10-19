@@ -14,6 +14,7 @@ mywaker/
 ├── PLAN.md
 ├── docs/
 │   ├── acceptance.md          frozen acceptance criteria — pause / continue (M6.5)
+│   ├── acceptance-sidebar.md  frozen acceptance criteria — left sidebar (A1–A10, SB1–SB6)
 │   ├── architecture.md        (this file)
 │   └── todos.md
 ├── .opencode/                  (created in M4 — OpenCode agent defs, the "employees")
@@ -36,7 +37,7 @@ mywaker/
     ├── agent.rs              OpenCode agent definitions — write a starter on hire
     ├── workflow.rs           delegation protocol (parse `@id` directives, team preamble)
     ├── jev.rs                Jev (System One) client — answers `@jev` + `form.created`
-    ├── role.rs               Role enum — workflow stage order/labels for the pipeline
+    ├── role.rs               Role enum — workflow stage order/labels for the grid
     ├── task.rs               Task model + state machine + retry (cap 3)
     ├── persistence.rs        JSON store (tasks + per-employee memory), atomic write
     ├── scheduler.rs          tokio-cron-scheduler — `[[schedules]]` → dispatch
@@ -51,7 +52,8 @@ mywaker/
         ├── layout.rs         screen geometry — regions and list windows, shared with hit-testing
         ├── hit.rs            mouse hit-testing — a point → the employee/row under it
         ├── robot.rs          animated robot avatar (state-driven ASCII)
-        ├── pipeline.rs       team tree diagram — planner → jev → leaves
+        ├── sidebar.rs        left sidebar — avatar + Now + inspector + vitals, priority `fit` (see acceptance-sidebar.md)
+        ├── pipeline.rs       team grid — 3-column employee cards, Jev header, scrollable viewport
         ├── tasks.rs          per-employee board + persisted task queue
         ├── chat.rs           conversation transcript + streaming (modal)
         ├── modal.rs          reopen prompt — the tasks paused at the last shutdown
@@ -62,7 +64,7 @@ mywaker/
 
 Note: the `dashboard.rs`/`components.rs` sketches were dropped — the roster lives
 in `pipeline.rs`, the popups in their own modules, and the original M8 "tabbed
-layout" is superseded by the pipeline + right-hand tasks panel.
+layout" is superseded by the employee grid + right-hand tasks panel.
 
 Note: `opencode/client.rs` and `opencode/session.rs` from the original sketch were
 folded into `opencode/mod.rs` (the client is small enough to live in one file); the
@@ -226,9 +228,9 @@ consts; no per-frame allocation.
 - Palette: cyan primary, green success, red error, yellow warnings (sparing), dim/mute.
 - True-color with automatic fallback.
 - The lifecycle status → glyph/colour/spinner mapping lives in one place
-  (`ui/status.rs`), so the pipeline, the tasks panel, and the avatar cannot drift
-  apart; `EmployeeStatus::label()` (`team.rs`) supplies the text without pulling a
-  UI dependency into the model layer.
+  (`ui/status.rs`), so the employee grid, the tasks panel, and the avatar cannot
+  drift apart; `EmployeeStatus::label()` (`team.rs`) supplies the text without
+  pulling a UI dependency into the model layer.
 - The bottom hint bar is data: `ui::hint_bar` holds one `(key, description)` list
   per screen and `ui::hint_line` styles it, so a screen's hints are an edit to one
   list. The full-screen overlay's body is `ui::help_lines`.
@@ -237,10 +239,31 @@ consts; no per-frame allocation.
   command, its argument hint, its one-line description, and whether the menu offers
   it, so the menu and the listing cannot drift apart.
 - Mouse hit-testing reads the same geometry the renderer draws into: the frame
-  regions and list windows in `ui/layout.rs`, and the node rectangles
-  `ui/pipeline.rs::tree` hands to both the renderer and `ui/hit.rs`. A click can
+  regions and list windows in `ui/layout.rs`, and the card rectangles
+  `ui/pipeline.rs::grid` hands to both the renderer and `ui::hit`. A click can
   therefore only land on something on screen, on the row it points at. Clicks move
   the selection; activation stays on `Enter`.
+- The left sidebar (`ui/sidebar.rs`) is **sectioned, not ad-hoc**: each section
+  carries a marker (`MYWAKER`, `now`, `who`, `pulse`, `vitals`, `uptime`, `alert`)
+  and a frozen priority, and `fit` keeps the longest prefix whose cumulative
+  height fits. A short terminal therefore loses whole sections from the bottom
+  instead of clipping one, and the acceptance tests assert on the markers rather
+  than on layout arithmetic (`docs/acceptance-sidebar.md` §2). The sidebar is
+  deliberately **not** a hit target — `ui::hit` never resolves a point inside it.
+- The employee grid (`ui/pipeline.rs`) is one geometry function, `grid`, read by
+  the renderer *and* `ui::hit`; the public `ui::grid_cells` seam exposes the same
+  rectangles to the acceptance tests. The panel is a viewport with new state,
+  `App::roster_scroll`: the wheel scrolls it, arrows move the selection and reveal
+  it (`pipeline::reveal`), and both the offset and the card rects are clamped so
+  only whole rows are ever drawn. The selection is the *team index*, not a grid
+  position, so the order still comes from `App::workflow_order()`.
+- The employee grid degrades in a fixed order: the Jev header strip is dropped
+  first (it is a status line, not work), then whole card rows. A card row is only
+  counted when its full height fits, so a short main area can never produce a box
+  with a top border and no body, and a partial row is never drawn at the bottom
+  of the viewport either. The same rule covers the horizontal axis: below a
+  12-column card the grid falls back to one full-width column instead of
+  squeezing three unreadable ones.
 
 ---
 
@@ -301,6 +324,11 @@ load (serde `deny_unknown_fields`).
 - Render tests build their screen through one helper per test crate
   (`src/app/tests.rs::screen`, `tests/render.rs::screen`) — draw at a size, return the
   buffer's symbols — so a rendering assertion only says what it looks for.
+- The roster is driven end-to-end through the public TEA seams rather than
+  reimplementing input: `App::update(Message::Key / Mouse / Resize)` for the
+  actions, `ui::team_area` for the panel, and `ui::grid_cells` for the cards the
+  renderer drew. `ui::Target` is re-exported so a test can compare
+  `Option<Target>` from `ui::hit_target_at` directly.
 
 ---
 
@@ -329,7 +357,7 @@ The previous cross-provider *router* (Kenari catalog + weighted capability/cost
 scoring + task-complexity inference) was removed: automatic routing was assigning
 models the user never actually selected, and the routed `model` was never wired to
 the session. The role enum survives only as `role::Role`, used to order the team
-as a pipeline in the UI. Jev (System One) survives as `jev::JevClient`, used for
+as a grid in the UI. Jev (System One) survives as `jev::JevClient`, used for
 `@jev` questions and `form.created` auto-answer — it is a *decision answerer*,
 unrelated to model selection.
 
@@ -379,13 +407,12 @@ can hand the final result back to the user.
    into the asking employee's chat (`Message::JevAnswer`). With no Jev client
    configured it answers `FALLBACK_VERDICT` ("yes") deterministically. Both Jev
    surfaces share one transport (`JevClient::ask`), one confidence gate
-   (`confident_choice`) and one shape of deterministic fallback. The **pipeline
-   diagram** (`src/ui/pipeline.rs`)
-   shows Jev as a node reached from the planner above and the employees below:
-   the diagram is a top-down tree — planner on top, **Jev** in the middle, and the
-   remaining employees (researcher, writer, reviewer, …) fanned out along the
-   bottom — with an on/off state, so the "every employee delegates questions to
-   Jev" relationship is visible in the UI.
+   (`confident_choice`) and one shape of deterministic fallback. The **employee
+   grid** (`src/ui/pipeline.rs`) keeps Jev visible as a one-row header above the
+   cards — `jev ◆ on — @jev` with the decision model — so the "every employee
+   delegates questions to Jev" relationship is still legible without spending a
+   card on a non-employee. The header is the first band dropped when the panel is
+   short, and it is never a hit target.
 
 6. **Parallel fan-out + aggregation** — `@parallel <goal>` (aliases `@all` /
    `@fanout` / `@team`) broadcasts one goal to every teammate except the source

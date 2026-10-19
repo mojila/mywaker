@@ -1,4 +1,4 @@
-//! The ratatui renderer: title bar, robot avatar, team pipeline, chat, log, help.
+//! The ratatui renderer: title bar, sidebar, employee grid, chat, log, help.
 
 mod chat;
 pub(crate) mod hit;
@@ -8,8 +8,11 @@ mod models;
 mod pipeline;
 mod projects;
 mod robot;
+pub mod sidebar;
 mod status;
 mod tasks;
+
+pub use hit::Target;
 
 use ratatui::{
     Frame,
@@ -21,8 +24,6 @@ use ratatui::{
 
 use crate::app::{App, Mode};
 use crate::usage::{fmt_bytes, fmt_count};
-
-use robot::{RobotState, render as render_robot};
 
 /// The connecting/shutdown indicator spins at half the roster cadence, so it
 /// indexes the shared frames directly rather than via [`status::spinner`].
@@ -67,6 +68,79 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.show_help() {
         render_help_overlay(frame, frame.area());
     }
+}
+
+/// The sidebar's rectangle for a terminal of `size` cells.
+///
+/// Public so the sidebar acceptance tests (`tests/sidebar.rs`) read the *same*
+/// geometry the renderer draws into, rather than recomputing the `24 | fill | 32`
+/// split by hand — which is what `docs/acceptance-sidebar.md` §3 requires.
+pub fn sidebar_area(size: (u16, u16)) -> Rect {
+    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1)).main;
+    layout::roster_areas(main)[0]
+}
+
+/// The team panel's rectangle for a terminal of `size` cells.
+///
+/// Public for the same reason as [`sidebar_area`]: the grid acceptance tests read
+/// the panel the renderer draws into instead of recomputing the `24 | fill | 32`
+/// split.
+pub fn team_area(size: (u16, u16)) -> Rect {
+    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1)).main;
+    layout::roster_areas(main)[1]
+}
+
+/// The employee cards on screen for a terminal of `size` cells, as
+/// `(employee index, cell rect)` in draw order.
+///
+/// This reads the same `pipeline::grid` geometry the renderer draws from, with
+/// the app's current scroll offset, so an acceptance test can click the middle of
+/// a card and know which employee it should select. The Jev header is not a card
+/// and never appears here.
+pub fn grid_cells(app: &App, size: (u16, u16)) -> Vec<(usize, Rect)> {
+    let order = app.workflow_order();
+    pipeline::grid(team_area(size), &order, app.roster_scroll())
+        .cells
+        .into_iter()
+        .map(|cell| (cell.employee, cell.area))
+        .collect()
+}
+
+/// What a point on screen points at, for the acceptance tests' hit-target
+/// assertions. Re-exported so callers don't need the private `hit` module.
+pub fn hit_target_at(app: &App, size: (u16, u16), x: u16, y: u16) -> Option<Target> {
+    hit::target_at(app, size, x, y)
+}
+
+/// The largest scroll offset the roster grid accepts for a terminal of `size`
+/// cells and a roster of `count` employees.
+///
+/// Crate-internal: [`App::roster_max_scroll`] is the seam the tests use, and it
+/// exists so the clamp and the drawing share one number.
+pub(crate) fn roster_max_scroll(size: (u16, u16), count: usize) -> usize {
+    pipeline::shape(team_area(size), count).max_offset
+}
+
+/// How many whole card rows fit on screen — the `PgUp`/`PgDn` step.
+pub(crate) fn roster_page(size: (u16, u16), count: usize) -> usize {
+    pipeline::shape(team_area(size), count).visible_rows
+}
+
+/// Columns in the roster grid at this terminal size: three normally, one when
+/// the panel is too narrow for readable cards.
+pub(crate) fn roster_cols(size: (u16, u16)) -> usize {
+    pipeline::shape(team_area(size), 0).cols
+}
+
+/// The offset that reveals the card at workflow `position`, scrolling no further
+/// than necessary.
+pub(crate) fn reveal_roster(
+    size: (u16, u16),
+    count: usize,
+    position: usize,
+    offset: usize,
+) -> usize {
+    pipeline::reveal(team_area(size), count, position, offset)
 }
 
 fn render_title(frame: &mut Frame, app: &App, area: Rect) {
@@ -126,37 +200,12 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Projects => projects::render(frame, app, area),
         Mode::Models => models::render(frame, app, area),
         Mode::Roster => {
-            let [robot_area, team_area, tasks_area] = layout::roster_areas(area);
-            render_robot_widget(frame, app, robot_area);
+            let [sidebar_area, team_area, tasks_area] = layout::roster_areas(area);
+            sidebar::render(frame, app, sidebar_area);
             pipeline::render(frame, app, team_area);
             tasks::render(frame, app, tasks_area);
         }
     }
-}
-
-fn render_robot_widget(frame: &mut Frame, app: &App, area: Rect) {
-    let state = robot_state(app);
-    let lines = render_robot(state, app.frame());
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Color::DarkGray)
-        .title(" waker ".bold().cyan());
-
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-fn robot_state(app: &App) -> RobotState {
-    if app.connection_error().is_some() {
-        return RobotState::Error;
-    }
-    if !app.is_connected() {
-        return RobotState::Thinking;
-    }
-    if app.team().is_busy() {
-        return RobotState::Working;
-    }
-    RobotState::Idle
 }
 
 fn render_log(frame: &mut Frame, app: &App, area: Rect) {
@@ -226,7 +275,8 @@ fn stream_stats(app: &App) -> Line<'static> {
 fn hint_bar(app: &App) -> Line<'static> {
     let hints: &[(&str, &str)] = match app.mode() {
         Mode::Roster => &[
-            ("←/→", "stage"),
+            ("↑↓←→", "move"),
+            ("wheel", "scroll"),
             ("Enter", "chat"),
             ("p", "projects"),
             ("m", "model"),
@@ -326,10 +376,12 @@ fn help_lines() -> Vec<Line<'static>> {
         head(" global"),
         key("q · Esc", "quit (any screen)"),
         key("?", "this help overlay"),
-        key("click · wheel", "select · step / scroll"),
+        key("click · wheel", "select · scroll"),
         Line::from(""),
         head(" roster"),
-        key("←/→ j/k", "move workflow stage"),
+        key("↑↓←→ h/j/k/l", "move around the employee grid"),
+        key("PgUp/PgDn", "move a page of cards"),
+        key("wheel", "scroll the grid (the selection stays put)"),
         key("Enter", "chat with the selected employee"),
         key("m", "pick a model"),
         key("p", "choose the working project"),

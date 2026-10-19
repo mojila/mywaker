@@ -256,6 +256,83 @@ impl ResumePrompt {
     }
 }
 
+/// A rolling window of per-tick event counts, for the sidebar's activity
+/// sparkline.
+///
+/// One sample is pushed per [`Message::Tick`], holding the number of OpenCode
+/// events that arrived since the previous tick. The buffer is capped at
+/// [`Pulse::CAPACITY`] samples and is deliberately cheap: it is a display-only
+/// trend, never persisted and never read by dispatch.
+#[derive(Debug, Default)]
+pub struct Pulse {
+    samples: Vec<u64>,
+    /// The event count as of the previous tick, so a tick can record the delta.
+    last_seen: u64,
+}
+
+impl Pulse {
+    /// How many tick samples the window keeps.
+    pub const CAPACITY: usize = 48;
+
+    /// Record one tick: push the delta since the previous tick (zero when no
+    /// events arrived) and drop the oldest sample once the window is full.
+    pub fn tick(&mut self, event_count: u64) {
+        let delta = event_count.saturating_sub(self.last_seen);
+        self.last_seen = event_count;
+        self.record(delta);
+    }
+
+    /// Append one sample directly, without a tick baseline — the seam the
+    /// containment test uses to change the window and nothing else.
+    pub fn record(&mut self, sample: u64) {
+        self.samples.push(sample);
+        if self.samples.len() > Self::CAPACITY {
+            let excess = self.samples.len() - Self::CAPACITY;
+            self.samples.drain(..excess);
+        }
+    }
+
+    /// The samples, oldest first (at most [`Self::CAPACITY`]).
+    pub fn samples(&self) -> &[u64] {
+        &self.samples
+    }
+
+    /// Forget the window and the tick baseline.
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.last_seen = 0;
+    }
+}
+
+/// A roll-up of the persisted task queue, for the sidebar's vitals lines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskStats {
+    /// Queued but not started.
+    pub pending: usize,
+    /// Currently running.
+    pub running: usize,
+    /// Running again after a failure.
+    pub retrying: usize,
+    /// Held (user or shutdown pause).
+    pub paused: usize,
+    /// Finished successfully.
+    pub succeeded: usize,
+    /// Finished in failure.
+    pub failed: usize,
+}
+
+impl TaskStats {
+    /// Work still in flight — pending, running, retrying, or paused.
+    pub fn active(&self) -> usize {
+        self.pending + self.running + self.retrying + self.paused
+    }
+
+    /// Work that has reached a terminal state.
+    pub fn finished(&self) -> usize {
+        self.succeeded + self.failed
+    }
+}
+
 pub struct App {
     config: Config,
     tx: Sender<Message>,
@@ -302,6 +379,11 @@ pub struct App {
     input_scroll: usize,
     /// Last known terminal size, for page-scroll estimation.
     last_size: (u16, u16),
+    /// First card row shown in the roster grid. The wheel scrolls it and a
+    /// selection move reveals the selected card; [`Self::roster_scroll`] clamps
+    /// it against the current terminal size and roster length, so the stored
+    /// value is only ever a hint after a resize or a smaller team.
+    roster_scroll: usize,
     /// Per-employee chat state, keyed by roster index.
     chats: HashMap<usize, Chat>,
     /// Selected index in the slash-command autocomplete menu, when it is open
@@ -334,6 +416,10 @@ pub struct App {
     /// The reopen prompt: set at startup when mywaker itself paused tasks on the
     /// way out. `None` — the normal case — means nothing is offered.
     resume_prompt: Option<ResumePrompt>,
+    /// When this run started, for the sidebar's uptime readout.
+    started_at: Instant,
+    /// Per-tick event counts, for the sidebar's activity sparkline.
+    pulse: Pulse,
 }
 
 impl App {
@@ -370,6 +456,7 @@ impl App {
             input_cursor: 0,
             input_scroll: 0,
             last_size: (80, 24),
+            roster_scroll: 0,
             chats: HashMap::new(),
             command_menu: None,
             delegation_count: 0,
@@ -384,6 +471,8 @@ impl App {
             store_path: None,
             show_help: false,
             resume_prompt: None,
+            started_at: Instant::now(),
+            pulse: Pulse::default(),
         }
     }
 
@@ -460,16 +549,27 @@ impl App {
         self.persist_store();
     }
 
-    fn update(&mut self, message: Message) {
+    /// Process one message: the `Update` half of TEA.
+    ///
+    /// Public so integration tests can drive the real input paths
+    /// (`Message::Key`, `Message::Mouse`, `Message::Resize`) instead of
+    /// reimplementing what a key or a click does.
+    pub fn update(&mut self, message: Message) {
         match message {
             Message::Tick => {
                 self.frame = self.frame.wrapping_add(1);
+                self.pulse.tick(self.event_count);
                 self.tick_reliability();
                 self.metrics.refresh();
             }
             Message::Resize(w, h) => {
                 self.last_size = (w, h);
                 self.follow_input_cursor();
+                // A shorter (or taller) panel changes how many rows fit, so the
+                // stored offset is normalised now rather than left stale for
+                // every later reader to clamp.
+                let clamped = self.roster_scroll();
+                self.roster_scroll = clamped;
             }
             Message::Key(key) => self.handle_key(key),
             Message::Mouse(mouse) => self.handle_mouse(mouse),
@@ -575,12 +675,12 @@ impl App {
         match self.mode {
             Mode::Roster => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.initiate_shutdown(),
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
-                    self.move_selection_stage(-1);
-                }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
-                    self.move_selection_stage(1);
-                }
+                KeyCode::Up | KeyCode::Char('k') => self.move_selection_grid(-self.roster_cols()),
+                KeyCode::Down | KeyCode::Char('j') => self.move_selection_grid(self.roster_cols()),
+                KeyCode::Left | KeyCode::Char('h') => self.move_selection_grid(-1),
+                KeyCode::Right | KeyCode::Char('l') => self.move_selection_grid(1),
+                KeyCode::PageUp => self.move_selection_grid(-self.roster_page()),
+                KeyCode::PageDown => self.move_selection_grid(self.roster_page()),
                 KeyCode::Enter => self.start_chat(self.selected),
                 KeyCode::Char('p') | KeyCode::Char('P') => self.open_projects(),
                 KeyCode::Char('m') | KeyCode::Char('M') => self.open_models(),
@@ -656,9 +756,9 @@ impl App {
     }
 
     /// Handle a mouse event: a click moves the selection to whatever it landed on
-    /// (a roster node, a picker row), and a wheel notch steps the active screen the
-    /// way its arrow keys do. Activation stays on Enter — a stray click never
-    /// adopts a project or reassigns a model.
+    /// (a roster card, a picker row), and a wheel notch scrolls the active
+    /// screen the way its paging keys do. Activation stays on Enter — a stray
+    /// click never adopts a project or reassigns a model.
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let kind = mouse.kind;
         // Only clicks and wheel notches are input; motion is ignored (and must
@@ -703,9 +803,13 @@ impl App {
     }
 
     /// Step the active screen by one row: a wheel notch, mirroring the arrow keys.
+    ///
+    /// The roster is the exception: its grid is a viewport, so a notch scrolls
+    /// the view rather than moving the selection (which the arrows own). A user
+    /// who scrolls to look around never changes what `Enter` would open.
     fn step_screen(&mut self, delta: isize) {
         match self.mode {
-            Mode::Roster => self.move_selection_stage(delta),
+            Mode::Roster => self.scroll_roster(delta),
             Mode::Chat => self.scroll_transcript(delta),
             Mode::Projects => {
                 self.project_selected =
@@ -2880,11 +2984,11 @@ impl App {
             .into_owned()
     }
 
-    // --- workflow pipeline (roster ordering) ---
+    // --- workflow ordering & the roster grid ---
 
     /// Employee storage indices in canonical workflow order (plan → research →
-    /// write → review → general), stable by name within a stage. The roster
-    /// renders (and the cursor moves) in this order rather than storage order.
+    /// write → review → general), stable by name within a stage. The roster grid
+    /// draws (and the cursor moves) in this order rather than storage order.
     pub fn workflow_order(&self) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..self.team.len()).collect();
         indices.sort_by_key(|&i| {
@@ -2894,8 +2998,13 @@ impl App {
         indices
     }
 
-    /// Move the roster cursor one workflow stage (per [`Self::workflow_order`]).
-    fn move_selection_stage(&mut self, delta: isize) {
+    /// Move the roster cursor one cell in the grid, revealing the card it lands
+    /// on.
+    ///
+    /// The grid is read left-to-right, top-to-bottom, so `delta` walks that
+    /// order; the plan's arrow keys call this with `±1` (←/→) and `±cols`
+    /// (↑/↓), which keeps the column fixed.
+    fn move_selection_grid(&mut self, delta: isize) {
         let order = self.workflow_order();
         if order.is_empty() {
             return;
@@ -2903,6 +3012,44 @@ impl App {
         let position = order.iter().position(|&i| i == self.selected).unwrap_or(0);
         let next = (position as isize + delta).clamp(0, order.len() as isize - 1) as usize;
         self.selected = order[next];
+        self.reveal_selection();
+    }
+
+    /// Scroll the roster grid by `delta` rows, clamped to
+    /// `[0, roster_max_scroll]`. This moves the viewport only: the selection
+    /// stays where the user put it, so scrolling never changes what `Enter`
+    /// opens.
+    fn scroll_roster(&mut self, delta: isize) {
+        let max = self.roster_max_scroll();
+        // Start from the clamped offset, not the raw field: after a resize the
+        // stored value can be past the last page, and one notch up should land on
+        // the last page, not one short of it.
+        let next = (self.roster_scroll() as isize + delta).clamp(0, max as isize);
+        self.roster_scroll = next as usize;
+    }
+
+    /// Bring the selected card inside the viewport, scrolling the minimum
+    /// distance. Called after every selection move, so the keyboard can never
+    /// move the cursor somewhere the user cannot see.
+    fn reveal_selection(&mut self) {
+        let order = self.workflow_order();
+        let position = order.iter().position(|&i| i == self.selected).unwrap_or(0);
+        self.roster_scroll =
+            ui::reveal_roster(self.last_size, order.len(), position, self.roster_scroll);
+    }
+
+    /// Columns in the roster grid at the current terminal size — the `↑`/`↓`
+    /// step, so a vertical move keeps the column.
+    fn roster_cols(&self) -> isize {
+        ui::roster_cols(self.last_size) as isize
+    }
+
+    /// The `PgUp`/`PgDn` step, in cells: the plan pins it to one viewport of
+    /// rows. On the one-column fallback that is exactly a page; on a three-column
+    /// grid it is a shorter hop, which keeps the key symmetrical with the rows
+    /// the panel actually shows rather than skipping cells the user never saw.
+    fn roster_page(&self) -> isize {
+        ui::roster_page(self.last_size, self.team.len()) as isize
     }
 
     // --- project discovery ---
@@ -2958,6 +3105,23 @@ impl App {
 
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// The roster grid's scroll offset, in whole card rows, clamped to what the
+    /// current terminal size and roster allow.
+    ///
+    /// The stored value is a hint: a resize or a shorter team can leave it past
+    /// the last page, so every reader goes through this clamp rather than the
+    /// raw field. That keeps the drawing, hit-testing, and the accessor itself
+    /// in agreement after the window changes size.
+    pub fn roster_scroll(&self) -> usize {
+        self.roster_scroll.min(self.roster_max_scroll())
+    }
+
+    /// The largest scroll offset the roster grid accepts right now — the last
+    /// page that still shows whole rows. `0` when everything fits.
+    pub fn roster_max_scroll(&self) -> usize {
+        ui::roster_max_scroll(self.last_size, self.team.len())
     }
 
     pub fn frame(&self) -> u64 {
@@ -3066,15 +3230,14 @@ impl App {
         self.server_info.is_some()
     }
 
-    /// True when a Jev (System One) client is attached — the pipeline diagram
-    /// shows the Jev node "on" then.
+    /// True when a Jev (System One) client is attached — the grid's Jev header
+    /// strip shows it "on" then.
     pub fn jev_enabled(&self) -> bool {
         self.jev.is_some()
     }
 
     /// The decision model the attached Jev client asks (`None` while Jev is
-    /// off) — the pipeline diagram renders it on the Jev node next to the
-    /// on/off state.
+    /// off) — the grid's header strip renders it next to the on/off state.
     pub fn jev_model(&self) -> Option<&str> {
         self.jev.as_ref().map(JevClient::model)
     }
@@ -3127,6 +3290,103 @@ impl App {
     /// renderer draws the modal from this and the prompter is the only writer.
     pub fn resume_prompt(&self) -> Option<&ResumePrompt> {
         self.resume_prompt.as_ref()
+    }
+
+    // --- sidebar vitals ---
+
+    /// Advance one animation tick without going through the message loop.
+    ///
+    /// The render tests need to compare frame *n* against *n+1* (A9), and the
+    /// event loop's tick is a `Message` the tests can't send. This is the same
+    /// advance the loop performs — frame counter, pulse sample, reliability
+    /// sweep — minus the process-metrics refresh, which needs wall time and is
+    /// irrelevant to what the sidebar draws.
+    pub fn advance(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+        self.pulse.tick(self.event_count);
+        self.tick_reliability();
+    }
+
+    /// Append one sample to the activity pulse window without advancing the
+    /// animation frame.
+    ///
+    /// The sidebar's sparkline is a pure function of this window, and nothing
+    /// else in the frame reads it — which makes this the A2 containment seam:
+    /// two renders that differ only here must be identical outside the sidebar.
+    /// [`Self::advance`] cannot serve that purpose, because it also bumps the
+    /// frame counter the title bar's spinner reads.
+    pub fn record_pulse(&mut self, events: u64) {
+        self.pulse.record(events);
+    }
+
+    /// How long this run has been up, for the sidebar's runtime line.
+    pub fn uptime(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    /// The per-tick event counts behind the activity sparkline, oldest first.
+    pub fn pulse(&self) -> &[u64] {
+        self.pulse.samples()
+    }
+
+    /// How many employees are mid-turn (`Thinking` or `Working`).
+    pub fn busy_count(&self) -> usize {
+        self.team
+            .employees()
+            .iter()
+            .filter(|employee| employee.is_busy())
+            .count()
+    }
+
+    /// How many employees are specifically `Thinking` (a subset of `busy_count`).
+    pub fn thinking_count(&self) -> usize {
+        self.team
+            .employees()
+            .iter()
+            .filter(|employee| employee.status == EmployeeStatus::Thinking)
+            .count()
+    }
+
+    /// How many chats hold a live OpenCode session.
+    pub fn live_sessions(&self) -> usize {
+        self.chats
+            .values()
+            .filter(|chat| chat.session_id.is_some())
+            .count()
+    }
+
+    /// How many prompts are queued behind an employee's current turn.
+    pub fn queued_prompts(&self) -> usize {
+        self.chats
+            .values()
+            .map(|chat| chat.queue_running.len())
+            .sum()
+    }
+
+    /// A roll-up of the persisted task queue by status.
+    pub fn task_stats(&self) -> TaskStats {
+        let mut stats = TaskStats::default();
+        for task in &self.store.tasks {
+            match task.status {
+                TaskStatus::Pending => stats.pending += 1,
+                TaskStatus::Running => stats.running += 1,
+                TaskStatus::Retrying => stats.retrying += 1,
+                TaskStatus::Paused => stats.paused += 1,
+                TaskStatus::Succeeded => stats.succeeded += 1,
+                TaskStatus::Failed => stats.failed += 1,
+            }
+        }
+        stats
+    }
+
+    /// The most recent failed task's summary, for the sidebar's alert line.
+    pub fn last_failure(&self) -> Option<&str> {
+        self.store
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.status == TaskStatus::Failed)
+            .map(|task| task.goal.as_str())
     }
 }
 

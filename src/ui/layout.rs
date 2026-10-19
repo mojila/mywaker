@@ -34,8 +34,8 @@ impl Regions {
     }
 }
 
-/// The roster's three panels, left to right: the robot avatar, the team pipeline,
-/// and the tasks board.
+/// The roster's three panels, left to right: the sidebar, the team grid, and the
+/// tasks board.
 pub(crate) fn roster_areas(main: Rect) -> [Rect; 3] {
     Layout::horizontal([
         Constraint::Length(24),
@@ -154,13 +154,13 @@ mod tests {
     #[test]
     fn roster_panels_tile_the_main_area() {
         let main = Rect::new(0, 1, 120, 30);
-        let [robot, pipeline, tasks] = roster_areas(main);
+        let [sidebar, grid, tasks] = roster_areas(main);
 
-        assert_eq!(robot.x, main.x);
-        assert_eq!(robot.width, 24);
-        assert_eq!(pipeline.x, robot.right());
+        assert_eq!(sidebar.x, main.x);
+        assert_eq!(sidebar.width, 24);
+        assert_eq!(grid.x, sidebar.right());
         assert_eq!(tasks.right(), main.right());
-        assert_eq!(pipeline.width + 24 + 32, main.width);
+        assert_eq!(grid.width + 24 + 32, main.width);
     }
 
     #[test]

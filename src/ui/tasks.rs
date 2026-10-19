@@ -1,5 +1,5 @@
 //! The "tasks" panel: a right-hand list of every employee and its latest
-//! task, complementing the workflow pipeline. Read-only — the pipeline stays
+//! task, complementing the employee grid. Read-only — the grid stays
 //! the selection surface; this panel just surfaces what each teammate is up to.
 //!
 //! Above the per-employee board sits the persisted scheduled-task queue: the

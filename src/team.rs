@@ -104,13 +104,13 @@ impl Employee {
 
     /// The employee's workflow role, resolved from the stable id (which doubles
     /// as the OpenCode agent id). This is the one place the id → [`Role`] mapping
-    /// happens: the pipeline's stage order and stage labels both read it, so the
+    /// happens: the grid's card order and stage labels both read it, so the
     /// id-as-role convention lives with the data rather than at the call sites.
     pub fn workflow_role(&self) -> Role {
         Role::from_label(&self.id)
     }
 
-    /// The pipeline stage label for this employee (`"ENGINEER"`, …).
+    /// The card's stage label for this employee (`"ENGINEER"`, …).
     pub fn stage_label(&self) -> String {
         self.workflow_role().label().to_ascii_uppercase()
     }

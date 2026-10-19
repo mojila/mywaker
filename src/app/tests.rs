@@ -573,7 +573,7 @@ fn workflow_order_sorts_by_stage_then_name() {
 }
 
 #[test]
-fn renders_pipeline_with_mixed_statuses() {
+fn renders_grid_with_mixed_statuses() {
     let (mut app, _rx) = make_app();
     app.team.set_status(3, EmployeeStatus::Thinking); // planner
     app.team.set_status(0, EmployeeStatus::Working); // researcher
@@ -2277,12 +2277,12 @@ fn find_on_screen(app: &App, width: u16, height: u16, needle: &str) -> (u16, u16
 }
 
 #[test]
-fn clicking_a_pipeline_node_selects_that_employee() {
+fn clicking_a_grid_card_selects_that_employee() {
     let (mut app, _rx) = make_app();
     app.last_size = (120, 40);
 
-    // The node the renderer drew is the node the click resolves to. The anchor is
-    // the node's own title (its stage label, uppercased), because a name alone
+    // The card the renderer drew is the card the click resolves to. The anchor is
+    // the card's own title (its stage label, uppercased), because a name alone
     // would also match the tasks panel, which prints every name.
     for (stage, index) in [
         ("RESEARCHER", 0),
@@ -2292,14 +2292,94 @@ fn clicking_a_pipeline_node_selects_that_employee() {
     ] {
         let (column, row) = find_on_screen(&app, 120, 40, &format!(" {stage} "));
         app.handle_mouse(mouse_click(column, row));
-        assert_eq!(app.selected(), index, "clicking the {stage} node");
+        assert_eq!(app.selected(), index, "clicking the {stage} card");
     }
 
-    // The shared Jev node stands for no employee: it is not a target.
+    // The Jev strip is a header, not a card: it is not a target.
     app.selected = 0;
-    let (column, row) = find_on_screen(&app, 120, 40, "answers questions");
+    let (column, row) = find_on_screen(&app, 120, 40, "◆");
     app.handle_mouse(mouse_click(column, row));
-    assert_eq!(app.selected(), 0, "the Jev node has no employee to select");
+    assert_eq!(
+        app.selected(),
+        0,
+        "the Jev header has no employee to select"
+    );
+}
+
+/// G6: every drawn card resolves to its own employee at any scroll offset, and
+/// the title row, the Jev header, and the gaps between cards resolve to nothing.
+#[test]
+fn grid_hit_testing_matches_the_drawn_cards_at_any_offset() {
+    let (mut app, _rx) = make_app();
+    app.team = long_team(12);
+    // 120×24: a 64-column team panel (three 20-cell cards per row) only two card
+    // rows tall, so the twelve employees overflow into four rows.
+    let size = (120, 24);
+    app.last_size = size;
+    let max = app.roster_max_scroll();
+    assert!(max > 0, "the fixture must overflow the viewport");
+
+    for offset in [0, 1, max] {
+        app.roster_scroll = offset;
+
+        let cells = ui::grid_cells(&app, size);
+        assert_eq!(cells.len() % 3, 0, "only whole rows are drawn");
+        for (employee, rect) in &cells {
+            let (x, y) = (rect.x + 2, rect.y + 2); // inside the border
+            assert_eq!(
+                ui::hit_target_at(&app, size, x, y),
+                Some(ui::Target::Employee(*employee)),
+                "cell {rect:?} at offset {offset}"
+            );
+        }
+
+        let area = ui::team_area(size);
+        // The title row is never a card.
+        assert_eq!(ui::hit_target_at(&app, size, area.x + 1, area.y), None);
+        // The header strip sits between the title and the first card row, and is
+        // never a card either.
+        let first = cells[0].1;
+        assert_eq!(first.y, area.y + 2, "the header is drawn above the grid");
+        assert_eq!(ui::hit_target_at(&app, size, area.x + 1, area.y + 1), None);
+
+        // The one-column gap between the first two cards is not a card.
+        let second = cells[1].1;
+        assert_eq!(second.y, first.y, "three cards share the first row");
+        assert_eq!(
+            ui::hit_target_at(&app, size, first.right(), first.y + 2),
+            None,
+            "the column gap is not a card"
+        );
+    }
+}
+
+/// G7/G6: at 80×24 the team panel is 24 columns wide, so the grid falls back to
+/// one column — and hit-testing follows that fallback rather than the 3-column
+/// assumption.
+#[test]
+fn narrow_panel_hit_tests_one_column_cards() {
+    let (mut app, _rx) = make_app();
+    let size = (80, 24);
+    app.last_size = size;
+
+    let cells = ui::grid_cells(&app, size);
+    assert!(!cells.is_empty(), "at least one card row fits");
+    for pair in cells.windows(2) {
+        assert_eq!(pair[0].1.x, pair[1].1.x, "one full-width column");
+        assert!(pair[1].1.y > pair[0].1.y, "cards stack vertically");
+    }
+    assert!(
+        cells
+            .iter()
+            .all(|(_, rect)| rect.width == ui::team_area(size).width),
+        "the single column spans the whole panel"
+    );
+    for (employee, rect) in &cells {
+        assert_eq!(
+            ui::hit_target_at(&app, size, rect.x + 2, rect.y + 2),
+            Some(ui::Target::Employee(*employee))
+        );
+    }
 }
 
 #[test]
@@ -2308,32 +2388,176 @@ fn clicking_outside_a_target_keeps_the_selection() {
     app.last_size = (120, 40);
     app.selected = 2;
 
-    // Title bar, hint bar, robot avatar, tasks panel, empty space above the tree.
+    // Title bar, hint bar, sidebar, tasks panel, empty space below the grid.
     for (column, row) in [(0, 0), (119, 39), (2, 20), (119, 8), (40, 2)] {
         app.handle_mouse(mouse_click(column, row));
     }
     assert_eq!(app.selected(), 2);
 }
 
-#[test]
-fn wheel_steps_the_roster_selection() {
-    let (mut app, _rx) = make_app();
-
-    // The starter stage order is planner, researcher, writer, reviewer, starting
-    // on the researcher — the same walk ←/→ makes, clamping at both ends.
-    app.handle_mouse(mouse_wheel(60, 20, false));
-    assert_eq!(app.selected(), 1);
-    app.handle_mouse(mouse_wheel(60, 20, true));
-    assert_eq!(app.selected(), 0);
-
-    for _ in 0..5 {
-        app.handle_mouse(mouse_wheel(60, 20, true));
+/// A roster of `count` generalist employees — long enough to overflow the panel
+/// at the sizes these tests use, and in workflow order already (all `General`).
+fn long_team(count: usize) -> Team {
+    let mut team = Team::default();
+    for i in 0..count {
+        team.add_employee(crate::team::Employee::new(
+            format!("e{i:02}"),
+            format!("Emp {i:02}"),
+            "Generalist",
+        ))
+        .expect("unique ids");
     }
-    assert_eq!(app.selected(), 3, "the wheel stops at the first stage");
-    for _ in 0..5 {
+    team
+}
+
+/// G4: the wheel scrolls the grid's viewport and clamps at both ends — it never
+/// moves the selection, so a stray notch can't change what `Enter` opens.
+#[test]
+fn wheel_scrolls_the_employee_grid() {
+    let (mut app, _rx) = make_app();
+    app.team = long_team(12);
+    app.last_size = (80, 24);
+    let max = app.roster_max_scroll();
+    assert!(max > 0, "the fixture must overflow the viewport");
+    let selected = app.selected();
+
+    app.handle_mouse(mouse_wheel(60, 20, false));
+    assert_eq!(app.roster_scroll(), 1, "a notch scrolls one row down");
+    assert_eq!(app.selected(), selected, "the wheel never moves the cursor");
+
+    for _ in 0..max + 5 {
         app.handle_mouse(mouse_wheel(60, 20, false));
     }
-    assert_eq!(app.selected(), 2, "and at the last");
+    assert_eq!(app.roster_scroll(), max, "clamped to the last full page");
+
+    for _ in 0..max + 5 {
+        app.handle_mouse(mouse_wheel(60, 20, true));
+    }
+    assert_eq!(app.roster_scroll(), 0, "and back at the top");
+    assert_eq!(app.selected(), selected);
+}
+
+/// G3: a resize that shortens the viewport (or a shorter team) cannot leave the
+/// offset past the last page.
+#[test]
+fn roster_scroll_reclamps_after_a_resize() {
+    let (mut app, _rx) = make_app();
+    app.team = long_team(12);
+    app.last_size = (80, 24); // one column, two rows visible: plenty to scroll
+    let max = app.roster_max_scroll();
+    assert!(max > 0);
+    app.roster_scroll = max;
+
+    // A terminal wide and tall enough for all four card rows leaves nothing to
+    // scroll.
+    app.update(Message::Resize(160, 60));
+    assert_eq!(app.roster_max_scroll(), 0);
+    assert_eq!(app.roster_scroll(), 0, "the accessor clamps a stale offset");
+
+    // A resize that makes the viewport shorter than before re-clamps to the new
+    // last page rather than leaving the old offset stranded past the end.
+    app.update(Message::Resize(120, 20));
+    let shrunk = app.roster_max_scroll();
+    app.roster_scroll = usize::MAX;
+    assert_eq!(app.roster_scroll(), shrunk);
+}
+
+/// G5: arrows move by one cell across the row, and by a whole row up/down —
+/// wrapping at the edges, as the plan specifies.
+#[test]
+fn arrows_move_around_the_grid_and_reveal_the_selection() {
+    let (mut app, _rx) = make_app();
+    // 120×24: a 64-column team panel (three 20-cell cards per row) that is only
+    // two card rows tall, so a 30-strong roster has to scroll.
+    app.team = long_team(30);
+    app.last_size = (120, 24);
+    assert!(app.roster_max_scroll() > 0, "the fixture must overflow");
+    app.selected = 0;
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.selected(), 1);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.selected(), 0);
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.selected(), 0, "clamped at the first cell");
+
+    // Down is one row: three cells on.
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.selected(), 3);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.selected(), 0);
+
+    // The selection is always revealed: walking to the bottom scrolls the
+    // viewport just far enough, and never past the last page.
+    for _ in 0..40 {
+        press(&mut app, KeyCode::Down);
+    }
+    assert_eq!(app.selected(), 29, "clamped at the last cell");
+    assert_eq!(app.roster_scroll(), app.roster_max_scroll());
+
+    for _ in 0..40 {
+        press(&mut app, KeyCode::Up);
+    }
+    assert_eq!(app.selected(), 0);
+    assert_eq!(app.roster_scroll(), 0, "and back to the top of the grid");
+}
+
+/// The plan's row-edge rule: moving left off the first cell of a row lands on
+/// the last cell of the row above (the grid is read as one linear sequence), and
+/// right off the last cell of a row continues onto the next row.
+#[test]
+fn arrows_wrap_at_row_edges() {
+    let (mut app, _rx) = make_app();
+    app.team = long_team(12);
+    app.last_size = (120, 40); // three columns, all rows visible
+
+    app.selected = 3; // first cell of the second row
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.selected(), 2, "left of the first cell is the row above");
+    press(&mut app, KeyCode::Right);
+    assert_eq!(
+        app.selected(),
+        3,
+        "and right returns to the row's first cell"
+    );
+
+    app.selected = 2; // last cell of the first row
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.selected(), 3, "right of the last cell is the row below");
+
+    // Vertically the column is kept: up from the second row is one row up.
+    app.selected = 4;
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.selected(), 1);
+}
+
+/// G5: `PgUp`/`PgDn` move by one viewport of rows (`±visible_rows` cells, as the
+/// plan pins it), clamped and revealed.
+#[test]
+fn page_keys_move_by_a_viewport() {
+    let (mut app, _rx) = make_app();
+    app.team = long_team(30);
+    app.last_size = (120, 24); // three cards per row, two rows on screen
+    let page = app.roster_page() as usize;
+    assert!(page > 0);
+
+    app.selected = 0;
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(app.selected(), page, "a page is one viewport of rows");
+    // The reveal rule keeps it on screen: the viewport followed, and the
+    // selected card is among the ones drawn.
+    let drawn: Vec<usize> = ui::grid_cells(&app, app.last_size)
+        .into_iter()
+        .map(|(employee, _)| employee)
+        .collect();
+    assert!(
+        drawn.contains(&app.selected()),
+        "the selection must be on screen after a page move"
+    );
+
+    press(&mut app, KeyCode::PageUp);
+    assert_eq!(app.selected(), 0);
+    assert_eq!(app.roster_scroll(), 0);
 }
 
 #[test]
@@ -2652,4 +2876,156 @@ async fn global_form_is_answered_with_its_location_header() {
         replies[0].2.as_deref(),
         Some("%2FUsers%2Fme%2FProjects%2Fapp")
     );
+}
+
+// --- sidebar vitals (SB2, SB4) -------------------------------------------------
+
+/// SB2: `Pulse` keeps the last 48 tick samples, pushes 0 on an idle tick, and
+/// resets cleanly.
+#[test]
+fn pulse_keeps_the_last_48_ticks() {
+    let (mut app, _rx) = make_app();
+    assert_eq!(app.pulse(), &[] as &[u64], "a fresh app has no samples");
+
+    // An idle tick records a zero rather than skipping the slot: the sparkline's
+    // x-axis is ticks, so a quiet tick has to occupy a column.
+    app.advance();
+    assert_eq!(app.pulse(), &[0], "an idle tick pushes 0");
+
+    // The window is capped at CAPACITY, oldest first. The literal is part of the
+    // criterion (§5 SB2: "the last 48 tick samples"), so it is asserted directly
+    // — a test that only used `Pulse::CAPACITY` would pass whatever the constant
+    // became.
+    assert_eq!(Pulse::CAPACITY, 48, "SB2 pins the window at 48 samples");
+    for tick in 0..(Pulse::CAPACITY + 12) {
+        app.record_pulse(tick as u64);
+    }
+    assert_eq!(app.pulse().len(), 48);
+    let expected: Vec<u64> = (12..(Pulse::CAPACITY + 12) as u64).collect();
+    assert_eq!(
+        app.pulse(),
+        expected.as_slice(),
+        "the oldest samples are dropped, not the newest"
+    );
+
+    // `tick` records the delta since the previous tick, not the running total.
+    let mut pulse = Pulse::default();
+    pulse.tick(5);
+    pulse.tick(5);
+    pulse.tick(9);
+    assert_eq!(
+        pulse.samples(),
+        &[5, 0, 4],
+        "one sample per tick, as a delta"
+    );
+
+    // Reset clears both the window and the baseline.
+    pulse.reset();
+    assert!(pulse.samples().is_empty());
+    pulse.tick(3);
+    assert_eq!(pulse.samples(), &[3], "the baseline was cleared too");
+}
+
+/// SB4: the aggregate accessors agree with a synthetic team and task set.
+#[test]
+fn aggregate_accessors_count_states() {
+    // A connected app, so the aggregate mood is `Idle` rather than the
+    // `connecting` fallback — every other render test in the suite runs
+    // disconnected, which left that branch unexercised.
+    let (mut app, _rx) = make_app();
+    app.update(Message::Connected {
+        client: OpenCode::with_base(
+            reqwest::Url::parse("http://127.0.0.1:1").expect("a valid base url"),
+            "sekrit",
+        ),
+        info: ServerInfo {
+            version: "2.0.32".into(),
+            pid: None,
+            urls: Vec::new(),
+        },
+    });
+    assert!(app.is_connected());
+
+    // A fresh roster: four idle employees, no chats, no tasks.
+    assert_eq!(app.team().len(), 4);
+    assert_eq!(app.busy_count(), 0);
+    assert_eq!(app.thinking_count(), 0);
+    assert_eq!(app.live_sessions(), 0);
+    assert_eq!(app.queued_prompts(), 0);
+    assert_eq!(app.task_stats(), TaskStats::default());
+
+    // Two busy employees, one of them specifically thinking. `thinking_count` is
+    // a subset of `busy_count`, and `Working` counts as busy but not thinking.
+    app.team.set_status(0, EmployeeStatus::Thinking);
+    app.team.set_status(1, EmployeeStatus::Working);
+    assert_eq!(app.busy_count(), 2);
+    assert_eq!(app.thinking_count(), 1);
+
+    // Terminal states are not busy: the turn is over.
+    app.team.set_status(2, EmployeeStatus::Done);
+    app.team.set_status(3, EmployeeStatus::Error);
+    assert_eq!(app.busy_count(), 2, "done and error are not busy");
+    assert_eq!(app.thinking_count(), 1);
+
+    // Sessions and queued prompts are counted per chat.
+    open_chat(&mut app, 0);
+    open_chat(&mut app, 1);
+    app.chats.entry(0).or_default().queue_running = vec!["one".into(), "two".into()];
+    app.chats.entry(1).or_default().queue_running = vec!["three".into()];
+    assert_eq!(app.live_sessions(), 2);
+    assert_eq!(app.queued_prompts(), 3);
+
+    // The task roll-up counts each status into its own bucket, and the derived
+    // totals follow.
+    let pending = Task::new("sweep the inbox", Some("researcher".into()));
+    let mut running = Task::new("write the changelog", Some("writer".into()));
+    assert!(running.transition(TaskStatus::Running));
+    let mut retrying = Task::new("retry the build", Some("writer".into()));
+    assert!(retrying.transition(TaskStatus::Running));
+    assert!(retrying.transition(TaskStatus::Retrying));
+    let mut paused = Task::new("hold the release", None);
+    assert!(paused.pause());
+    let mut succeeded = Task::new("ship it", None);
+    assert!(succeeded.transition(TaskStatus::Running));
+    succeeded.succeed("done");
+    let mut failed = Task::new("roll back", None);
+    assert!(failed.transition(TaskStatus::Running));
+    failed.fail("boom");
+
+    for task in [pending, running, retrying, paused, succeeded, failed] {
+        app.store.upsert_task(task);
+    }
+    let stats = app.task_stats();
+    assert_eq!(stats.pending, 1);
+    assert_eq!(stats.running, 1);
+    assert_eq!(stats.retrying, 1);
+    assert_eq!(stats.paused, 1);
+    assert_eq!(stats.succeeded, 1);
+    assert_eq!(stats.failed, 1);
+    assert_eq!(
+        stats.active(),
+        4,
+        "in-flight work is pending+running+retrying+paused"
+    );
+    assert_eq!(stats.finished(), 2, "terminal work is succeeded+failed");
+
+    // The alert line reads the most recent failure's goal.
+    assert_eq!(app.last_failure(), Some("roll back"));
+}
+
+/// SB3 / A10: uptime advances, and the sidebar's formatter turns it into the
+/// coarse label the runtime row draws.
+#[test]
+fn uptime_advances() {
+    let (app, _rx) = make_app();
+    let first = app.uptime();
+    std::thread::sleep(std::time::Duration::from_millis(12));
+    assert!(
+        app.uptime() > first,
+        "uptime is monotonic (first {first:?}, now {:?})",
+        app.uptime()
+    );
+    // A live app is under a minute old, which is exactly the `Ns` branch the
+    // runtime row prints in a real session.
+    assert!(app.uptime() < std::time::Duration::from_secs(60));
 }

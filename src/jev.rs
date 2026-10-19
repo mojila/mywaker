@@ -66,7 +66,7 @@ impl JevClient {
     }
 
     /// The decision model id this client asks (`jev-1-13-free` unless
-    /// overridden) — shown on the pipeline's Jev node.
+    /// overridden) — shown in the roster grid's Jev header strip.
     pub fn model(&self) -> &str {
         &self.model
     }

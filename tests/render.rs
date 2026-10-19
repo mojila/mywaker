@@ -41,10 +41,10 @@ fn renders_wide_terminal_without_panicking() {
 #[test]
 fn renders_narrow_terminal_without_panicking() {
     // A 40-column pane is narrower than the roster's fixed side panels
-    // (24-col robot + 32-col tasks), so the pipeline column collapses to zero
-    // width and the robot nameplate clips. Rendering must still degrade
-    // gracefully — no overflow, no panic — with the tasks panel and roster
-    // names surviving intact.
+    // (24-col sidebar + 32-col tasks), so the team column collapses to zero
+    // width. Rendering must still degrade gracefully — no overflow, no panic —
+    // with the tasks panel and sidebar names surviving intact, and the grid
+    // drawing no cards into a panel that does not exist.
     let text = screen(&app(), 40, 24);
 
     assert!(
@@ -52,6 +52,25 @@ fn renders_narrow_terminal_without_panicking() {
         "tasks panel missing at narrow width"
     );
     assert!(text.contains("Aria"), "roster name missing at narrow width");
+    assert!(
+        ui::grid_cells(&app(), (40, 24)).is_empty(),
+        "a zero-width team panel has no cards to draw"
+    );
+}
+
+/// The grid falls back to one full-width column once a 3-column card would be
+/// narrower than 12 cells — and still renders without panicking.
+#[test]
+fn renders_one_column_grid_in_a_narrow_team_panel() {
+    let text = screen(&app(), 80, 24);
+    let cells = ui::grid_cells(&app(), (80, 24));
+    let panel = ui::team_area((80, 24));
+
+    assert!(!cells.is_empty(), "the starter roster has cards at 80×24");
+    for (_, rect) in &cells {
+        assert_eq!(rect.width, panel.width, "one column spans the panel");
+    }
+    assert!(text.contains("jev"), "the Jev header is still drawn");
 }
 
 #[test]
