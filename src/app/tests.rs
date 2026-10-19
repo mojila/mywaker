@@ -99,7 +99,7 @@ fn dispatch_delegations_routes_to_teammate() {
     ]))
     .unwrap();
 
-    app.handle_transcript(0, messages);
+    app.handle_transcript(orchestrator, messages);
 
     assert_eq!(app.delegation_count, 1);
     assert!(
@@ -108,6 +108,158 @@ fn dispatch_delegations_routes_to_teammate() {
             .iter()
             .any(|line| line.text.contains("draft the doc"))
     );
+}
+
+// --- delegation traces (the wires) ---
+
+/// A hand-off records one outbound trace from the root to the worker it went to,
+/// so the wires have something to draw.
+#[test]
+fn a_hand_off_records_a_trace_from_the_root() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, root);
+    app.chats.entry(writer).or_default().session_id = Some("ses_w".into());
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"plan it","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"text","text":"@writer draft the doc"}],"finish":"done"}
+    ]))
+    .unwrap();
+    app.handle_transcript(root, messages);
+
+    assert_eq!(app.traces().len(), 1);
+    let trace = app.traces()[0];
+    assert_eq!(trace.from, root);
+    assert_eq!(trace.to, writer);
+    assert_eq!(trace.kind, TraceKind::Out);
+    assert_eq!(trace.started, app.frame());
+}
+
+/// A worker's report records a trace back up to the root, in the report colour's
+/// direction — the pair of the hand-off that started it.
+#[test]
+fn a_report_records_a_trace_back_to_the_root() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+    app.origin_of.insert(writer, writer);
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"draft it","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"text","text":"@user the draft is ready"}],"finish":"done"}
+    ]))
+    .unwrap();
+    app.handle_transcript(writer, messages);
+
+    let trace = app
+        .traces()
+        .iter()
+        .find(|trace| trace.kind == TraceKind::Report)
+        .expect("the report is traced");
+    assert_eq!(trace.from, writer);
+    assert_eq!(trace.to, root);
+}
+
+/// A fan-out traces one broadcast per worker, in the fan-out colour.
+#[test]
+fn a_fan_out_records_a_broadcast_per_worker() {
+    let (mut app, _rx) = make_app();
+    let planner = employee(&app, "planner");
+    open_chat(&mut app, planner);
+    app.fan_out(planner, "ship it".to_string());
+
+    let broadcast: Vec<DelegationTrace> = app
+        .traces()
+        .iter()
+        .copied()
+        .filter(|trace| trace.kind == TraceKind::Fanout)
+        .collect();
+    assert!(!broadcast.is_empty(), "a fan-out draws its briefs");
+    for trace in &broadcast {
+        assert_eq!(trace.from, planner);
+        assert_ne!(trace.to, planner, "the source does not wire to itself");
+    }
+}
+
+/// A hand-off to yourself is not a wire: nothing moved, so nothing is drawn.
+#[test]
+fn a_self_hand_off_records_no_trace() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    app.trace(writer, writer, TraceKind::Out);
+    assert!(app.traces().is_empty());
+}
+
+/// Traces are capped, oldest dropped first, so a long chain cannot grow the list
+/// without bound.
+#[test]
+fn traces_are_capped_at_the_limit() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+
+    for _ in 0..App::TRACE_LIMIT + 5 {
+        app.trace(root, writer, TraceKind::Out);
+    }
+    assert_eq!(app.traces().len(), App::TRACE_LIMIT);
+}
+
+/// A trace's packet advances with the frame and is pruned once it has run its
+/// course — so the wires animate without the app keeping any history.
+#[test]
+fn traces_advance_and_expire() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+    app.trace(root, writer, TraceKind::Out);
+
+    let start = app.traces()[0];
+    assert_eq!(
+        start.progress(app.frame()),
+        0.0,
+        "a new packet is at the port"
+    );
+
+    app.advance();
+    let midway = app.traces()[0];
+    assert!(midway.progress(app.frame()) > 0.0);
+    assert!(midway.progress(app.frame()) < 1.0);
+
+    // Walk to the TTL: the packet has arrived, and the next tick forgets it.
+    for _ in 0..DelegationTrace::TTL {
+        app.advance();
+    }
+    assert!(app.traces().is_empty(), "an expired trace is pruned");
+}
+
+/// `progress` is a pure function of the trace and the frame, clamped to `1.0` so
+/// a stale trace cannot overshoot its wire.
+#[test]
+fn trace_progress_is_pure_and_clamped() {
+    let trace = DelegationTrace {
+        from: 0,
+        to: 1,
+        kind: TraceKind::Out,
+        started: 100,
+    };
+
+    assert_eq!(trace.progress(100), 0.0);
+    assert_eq!(
+        trace.progress(100),
+        trace.progress(100),
+        "same frame, same value"
+    );
+    assert_eq!(trace.progress(106), 0.5);
+    assert_eq!(trace.progress(112), 1.0);
+    assert_eq!(trace.progress(999), 1.0, "clamped, never past the end");
+
+    assert!(!trace.is_expired(111));
+    assert!(trace.is_expired(112));
 }
 
 /// A `@jev` directive routes the question to the decision model and posts the
@@ -2914,11 +3066,16 @@ fn grid_hit_testing_matches_the_drawn_cards_at_any_offset() {
         let area = ui::team_area(size);
         // The title row is never a card.
         assert_eq!(ui::hit_target_at(&app, size, area.x + 1, area.y), None);
-        // The header strip sits between the title and the first card row, and is
-        // never a card either.
+        // The strip and bus sit between the title and the first card row, and
+        // neither is a card.
         let first = cells[0].1;
-        assert_eq!(first.y, area.y + 2, "the header is drawn above the grid");
+        assert_eq!(
+            first.y,
+            area.y + 3,
+            "the strip and bus are drawn above the grid"
+        );
         assert_eq!(ui::hit_target_at(&app, size, area.x + 1, area.y + 1), None);
+        assert_eq!(ui::hit_target_at(&app, size, area.x + 1, area.y + 2), None);
 
         // The one-column gap between the first two cards is not a card.
         let second = cells[1].1;
@@ -2943,14 +3100,21 @@ fn narrow_panel_hit_tests_one_column_cards() {
     let cells = ui::grid_cells(&app, size);
     assert!(!cells.is_empty(), "at least one card row fits");
     for pair in cells.windows(2) {
-        assert_eq!(pair[0].1.x, pair[1].1.x, "one full-width column");
+        assert_eq!(pair[0].1.x, pair[1].1.x, "one column");
         assert!(pair[1].1.y > pair[0].1.y, "cards stack vertically");
     }
+    // The single column keeps its one-column riser to its left, so the card is
+    // the panel minus that gutter.
+    let panel = ui::team_area(size);
     assert!(
         cells
             .iter()
-            .all(|(_, rect)| rect.width == ui::team_area(size).width),
-        "the single column spans the whole panel"
+            .all(|(_, rect)| rect.width == panel.width.saturating_sub(1)),
+        "the single column spans the panel less its riser"
+    );
+    assert!(
+        cells.iter().all(|(_, rect)| rect.x == panel.x + 1),
+        "the riser is the panel's first column"
     );
     for (employee, rect) in &cells {
         assert_eq!(

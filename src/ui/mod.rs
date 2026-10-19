@@ -14,6 +14,7 @@ mod robot;
 pub mod sidebar;
 mod status;
 mod tasks;
+mod wires;
 
 pub use hit::Target;
 

@@ -128,7 +128,7 @@ impl Chat {
 }
 
 /// A parallel fan-out: one goal broadcast to several workers, whose outputs are
-/// collected and handed to an aggregator (the reviewer) once they all finish.
+/// collected and handed to an aggregator (the orchestrator) once they all finish.
 #[derive(Debug)]
 struct FanOut {
     /// Worker employees fanned out to (excluding the source and the aggregator).
@@ -334,6 +334,67 @@ impl TaskStats {
     }
 }
 
+/// What a hand-off did, for the delegation wires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceKind {
+    /// Work going out: the root handing a piece of the goal to a worker.
+    Out,
+    /// Work coming back: a worker reporting a finished part upward.
+    Report,
+    /// A fan-out brief: one goal broadcast to the whole team at once.
+    Fanout,
+}
+
+impl TraceKind {
+    /// The trace's colour: cyan out, green back, yellow for a broadcast — the
+    /// same reading as the roster's status colours.
+    pub fn color(self) -> ratatui::style::Color {
+        use ratatui::style::Color;
+        match self {
+            TraceKind::Out => Color::Cyan,
+            TraceKind::Report => Color::Green,
+            TraceKind::Fanout => Color::Yellow,
+        }
+    }
+}
+
+/// One hand-off, drawn as a packet travelling the wires between two employees.
+///
+/// A trace is a *display* record: it is created when a hand-off is dispatched and
+/// forgotten a moment later ([`App::tick_traces`]), so the UI can animate work
+/// moving through the tree without keeping a history nobody asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegationTrace {
+    /// Roster index of the employee the work left.
+    pub from: usize,
+    /// Roster index of the employee it went to.
+    pub to: usize,
+    pub kind: TraceKind,
+    /// The frame the trace was recorded on, so its age is a pure function of the
+    /// app's frame counter — the UI never reads a clock.
+    pub started: u64,
+}
+
+impl DelegationTrace {
+    /// How many ticks a trace lives. At the default 100 ms tick this is ~1.2 s,
+    /// long enough to read a packet cross the panel and short enough that a
+    /// finished chain leaves no clutter.
+    pub const TTL: u64 = 12;
+    /// How far along its journey the packet is, as `0.0..=1.0`, at `frame`.
+    ///
+    /// Pure: same trace and frame, same answer, which is what lets the renderer
+    /// be a function of the app state.
+    pub fn progress(&self, frame: u64) -> f32 {
+        let age = frame.saturating_sub(self.started);
+        (age.min(Self::TTL) as f32) / (Self::TTL as f32)
+    }
+
+    /// True once the packet has run its course and can be forgotten.
+    pub fn is_expired(&self, frame: u64) -> bool {
+        frame.saturating_sub(self.started) >= Self::TTL
+    }
+}
+
 pub struct App {
     config: Config,
     tx: Sender<Message>,
@@ -431,6 +492,9 @@ pub struct App {
     started_at: Instant,
     /// Per-tick event counts, for the sidebar's activity sparkline.
     pulse: Pulse,
+    /// Recent hand-offs, for the delegation wires. Capped at
+    /// [`App::TRACE_LIMIT`] and pruned by [`App::tick_traces`].
+    traces: Vec<DelegationTrace>,
 }
 
 impl App {
@@ -438,6 +502,10 @@ impl App {
         Self::with_team(config, tx, Team::starter())
     }
 
+    /// How many hand-off traces are kept at once. A long chain can dispatch
+    /// several per frame; the window only has to cover what the wires draw, so
+    /// the oldest are dropped rather than the list growing without bound.
+    pub const TRACE_LIMIT: usize = 12;
     pub fn with_team(config: Config, tx: Sender<Message>, mut team: Team) -> Self {
         // The orchestrator is a roster invariant, not a starter-roster detail:
         // every app has one, whether it was loaded, built by a fixture, or
@@ -500,6 +568,7 @@ impl App {
             resume_prompt: None,
             started_at: Instant::now(),
             pulse: Pulse::default(),
+            traces: Vec::new(),
         }
     }
 
@@ -587,6 +656,7 @@ impl App {
                 self.frame = self.frame.wrapping_add(1);
                 self.pulse.tick(self.event_count);
                 self.tick_reliability();
+                self.tick_traces();
                 self.metrics.refresh();
             }
             Message::Resize(w, h) => {
@@ -2172,6 +2242,34 @@ impl App {
         }
     }
 
+    /// Record one hand-off for the wires, dropping the oldest once the window is
+    /// full. The cap is what keeps a long chain from growing the trace list
+    /// without bound; TTL expiry is [`Self::tick_traces`]' job.
+    fn trace(&mut self, from: usize, to: usize, kind: TraceKind) {
+        if from == to {
+            // A hand-off to yourself is not a wire: nothing moved.
+            return;
+        }
+        self.traces.push(DelegationTrace {
+            from,
+            to,
+            kind,
+            started: self.frame,
+        });
+        if self.traces.len() > Self::TRACE_LIMIT {
+            let excess = self.traces.len() - Self::TRACE_LIMIT;
+            self.traces.drain(..excess);
+        }
+    }
+
+    /// Forget the traces whose packets have finished travelling. Driven from the
+    /// tick and from [`Self::advance`], so the UI's traces are always a function
+    /// of the current frame.
+    fn tick_traces(&mut self) {
+        let frame = self.frame;
+        self.traces.retain(|trace| !trace.is_expired(frame));
+    }
+
     /// Send every queued delegation prompt out to `employee`'s live session.
     fn flush_outbox(&mut self, employee: usize) {
         // Without a client there is nowhere to send them: leave the outbox — and
@@ -2309,6 +2407,7 @@ impl App {
             return;
         }
         self.inherit_chain(source, target);
+        self.trace(source, target, TraceKind::Out);
         self.send_to_employee(target, delegation.message);
     }
 
@@ -2348,6 +2447,7 @@ impl App {
             return;
         }
         self.inherit_chain(source, orchestrator);
+        self.trace(source, orchestrator, TraceKind::Report);
         self.send_to_employee(orchestrator, format!("Report from {name}:\n\n{message}"));
     }
 
@@ -2457,6 +2557,7 @@ impl App {
             // Each worker gets the parallel-round brief, not the bare goal, so it
             // contributes its own part instead of handing off or answering as if
             // it owned the final deliverable.
+            self.trace(source, worker, TraceKind::Fanout);
             self.send_to_employee(worker, workflow::fanout_brief(&goal));
         }
     }
@@ -2538,6 +2639,16 @@ impl App {
             "fan-out #{id} complete — aggregating via {}",
             self.team.name_at(aggregator).unwrap_or_default()
         ));
+        // The synthesis is the round coming back together: draw it as a report
+        // from the round's workers into the aggregator.
+        for worker in self
+            .fanouts
+            .get(&id)
+            .map(|f| f.workers.clone())
+            .unwrap_or_default()
+        {
+            self.trace(worker, aggregator, TraceKind::Report);
+        }
         self.send_to_employee(aggregator, prompt);
     }
 
@@ -3532,6 +3643,20 @@ impl App {
             .count()
     }
 
+    /// The hand-offs still being drawn, oldest first.
+    pub fn traces(&self) -> &[DelegationTrace] {
+        &self.traces
+    }
+
+    /// Record a hand-off trace directly.
+    ///
+    /// The render tests need a packet on the wires without standing up a whole
+    /// delegation chain (which needs a client, sessions and transcripts), and the
+    /// trace list is otherwise written only by the dispatch paths.
+    pub fn record_trace_for_test(&mut self, from: usize, to: usize) {
+        self.trace(from, to, TraceKind::Out);
+    }
+
     /// Cursor position within the input, in grapheme clusters (0..=len).
     pub fn input_cursor(&self) -> usize {
         self.input_cursor
@@ -3686,6 +3811,7 @@ impl App {
         self.frame = self.frame.wrapping_add(1);
         self.pulse.tick(self.event_count);
         self.tick_reliability();
+        self.tick_traces();
     }
 
     /// Append one sample to the activity pulse window without advancing the

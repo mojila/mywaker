@@ -68,9 +68,15 @@ fn renders_one_column_grid_in_a_narrow_team_panel() {
 
     assert!(!cells.is_empty(), "the starter roster has cards at 80×24");
     for (_, rect) in &cells {
-        assert_eq!(rect.width, panel.width, "one column spans the panel");
+        assert_eq!(
+            rect.width,
+            panel.width.saturating_sub(1),
+            "one column spans the panel less its riser"
+        );
     }
-    assert!(text.contains("jev"), "the Jev header is still drawn");
+    // At 24 columns the strip has room for the root but not for Jev: the root's
+    // name is the part that must survive, so `jev` is what gives way.
+    assert!(text.contains("Otto"), "the orchestrator strip is drawn");
 }
 
 #[test]
@@ -93,4 +99,96 @@ fn renders_last_tasks_in_right_panel() {
 
     assert!(text.contains("tasks"), "tasks panel title missing");
     assert!(text.contains("draft the intro"), "last task not rendered");
+}
+
+/// `screen`'s buffer split into rows of `width` cells. Splits on characters, not
+/// bytes: a cell can hold a multi-byte glyph (`┄`, `◆`), and a byte chunk would
+/// cut one in half.
+fn rows(text: &str, width: u16) -> Vec<String> {
+    let cells: Vec<char> = text.chars().collect();
+    cells
+        .chunks(width as usize)
+        .map(|row| row.iter().collect())
+        .collect()
+}
+
+/// The delegation pipeline is drawn: the root's strip, a dashed bus across the
+/// panel, and one riser per card column — so the tree's shape is legible before
+/// anything moves.
+#[test]
+fn renders_the_pipeline_strip_bus_and_risers() {
+    let app = app();
+    let text = screen(&app, 120, 40);
+
+    assert!(text.contains("Otto"), "the orchestrator strip is missing");
+    assert!(text.contains("┄"), "the dashed bus is missing");
+    assert!(text.contains("┆"), "the risers are missing");
+
+    // The bus spans the team panel, and a riser sits in each column's gutter.
+    let cells = ui::grid_cells(&app, (120, 40));
+    assert!(!cells.is_empty(), "the starter roster draws cards");
+    let bus_row = rows(&text, 120)
+        .into_iter()
+        .find(|row| row.contains('┄'))
+        .expect("a bus row exists");
+    assert!(
+        bus_row.chars().filter(|c| *c == '┄').count() > 1,
+        "the bus is a line, not a dot: {bus_row}"
+    );
+}
+
+/// A live hand-off draws a packet on the wires, in the trace's colour — and the
+/// packet moves as the app advances.
+#[test]
+fn renders_a_delegation_packet() {
+    let mut app = app();
+    let root = app
+        .team()
+        .employees()
+        .iter()
+        .position(|e| e.id == "orchestrator")
+        .expect("root");
+    let writer = app
+        .team()
+        .employees()
+        .iter()
+        .position(|e| e.id == "writer")
+        .expect("writer");
+
+    // Record a hand-off through the public model, then draw it.
+    app.record_trace_for_test(root, writer);
+
+    // The packet leaves from the strip's port, so it is on the wire once it has
+    // started moving.
+    app.advance();
+    app.advance();
+    let first = screen(&app, 120, 40);
+    assert!(first.contains("┄"), "the lit wire is drawn");
+    let panel = ui::team_area((120, 40));
+    let bus_y = panel.y + 2; // title, strip, then the bus
+    let packet_on_wire = |frame: &str| {
+        rows(frame, 120)
+            .iter()
+            .skip(bus_y as usize)
+            .take(panel.height as usize - 2)
+            .any(|row| row.contains('◆'))
+    };
+    assert!(packet_on_wire(&first), "the packet is on the wire");
+
+    // The packet advances: a few more ticks draw a different frame.
+    for _ in 0..3 {
+        app.advance();
+    }
+    let later = screen(&app, 120, 40);
+    assert_ne!(first, later, "the packet did not move");
+
+    // And once the trace expires the packet is gone from the wire.
+    for _ in 0..20 {
+        app.advance();
+    }
+    let expired = screen(&app, 120, 40);
+    assert!(
+        !packet_on_wire(&expired),
+        "an expired packet is still drawn: {expired}"
+    );
 }
