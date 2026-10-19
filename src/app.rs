@@ -434,11 +434,18 @@ impl App {
         // handed in by a test. In memory only — `ensure_orchestrator` never
         // writes the file.
         team.ensure_orchestrator();
+        // The root is where the user starts: a goal typed on the roster screen
+        // goes to the orchestrator, so the cursor starts there too.
+        let selected = team
+            .employees()
+            .iter()
+            .position(|e| e.id == crate::team::ORCHESTRATOR_ID)
+            .unwrap_or(0);
         Self {
             config,
             tx,
             team,
-            selected: 0,
+            selected,
             client: None,
             server_info: None,
             agents: Vec::new(),
@@ -681,10 +688,10 @@ impl App {
         match self.mode {
             Mode::Roster => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.initiate_shutdown(),
-                KeyCode::Up | KeyCode::Char('k') => self.move_selection_grid(-self.roster_cols()),
-                KeyCode::Down | KeyCode::Char('j') => self.move_selection_grid(self.roster_cols()),
-                KeyCode::Left | KeyCode::Char('h') => self.move_selection_grid(-1),
-                KeyCode::Right | KeyCode::Char('l') => self.move_selection_grid(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-self.roster_cols()),
+                KeyCode::Down | KeyCode::Char('j') => self.move_selection(self.roster_cols()),
+                KeyCode::Left | KeyCode::Char('h') => self.move_selection(-1),
+                KeyCode::Right | KeyCode::Char('l') => self.move_selection(1),
                 KeyCode::PageUp => self.move_selection_grid(-self.roster_page()),
                 KeyCode::PageDown => self.move_selection_grid(self.roster_page()),
                 KeyCode::Enter => self.start_chat(self.selected),
@@ -2107,14 +2114,7 @@ impl App {
             if delegation.message.is_empty() {
                 return;
             }
-            let origin = self
-                .origin_of
-                .get(&source)
-                .copied()
-                .or(self.chat_employee)
-                .unwrap_or(source);
-            self.push_to_chat(origin, TranscriptRole::Assistant, delegation.message);
-            self.team.set_status(origin, EmployeeStatus::Done);
+            self.deliver_or_report(source, delegation.message);
             return;
         }
 
@@ -2135,9 +2135,61 @@ impl App {
         self.send_to_employee(target, delegation.message);
     }
 
-    /// Ask Jev to answer `question` and post the verdict back into `source`'s
-    /// chat. Without a configured Jev client the deterministic fallback verdict
-    /// is posted in-process — nothing to await, so nothing to spawn.
+    /// A `@user` directive: the orchestrator delivers to the user, a worker's
+    /// result bubbles up to the orchestrator as a report.
+    ///
+    /// The tree has one mouth. A worker that answers `@user` has finished its
+    /// part, not the goal, so its text is relayed to the orchestrator with the
+    /// author named — the orchestrator can then synthesize, ask for a missing
+    /// piece, or deliver. This is what keeps a partial answer from reaching the
+    /// user mid-chain.
+    fn deliver_or_report(&mut self, source: usize, message: String) {
+        let Some(orchestrator) = self.orchestrator_index() else {
+            // No root (an empty roster): fall back to the old direct delivery so
+            // a result is never silently dropped.
+            self.deliver_to_origin(source, message);
+            return;
+        };
+        if source == orchestrator {
+            self.deliver_to_origin(source, message);
+            return;
+        }
+
+        let name = self
+            .team
+            .name_at(source)
+            .unwrap_or_else(|| source.to_string());
+        self.push_log(format!("↥ {name} reported to the orchestrator"));
+        // The report is a hand-off like any other: it joins the same chain (so a
+        // later delivery still lands in the right chat) and is bounded by the
+        // chain-depth guard.
+        if self.chain_depth(source) >= harness::MAX_CHAIN_DEPTH {
+            self.push_log(format!(
+                "delegation chain depth limit reached reporting from '{name}'"
+            ));
+            self.deliver_to_origin(source, message);
+            return;
+        }
+        self.inherit_chain(source, orchestrator);
+        self.send_to_employee(orchestrator, format!("Report from {name}:\n\n{message}"));
+    }
+
+    /// Put `message` in the chat the chain started from, as the final answer.
+    fn deliver_to_origin(&mut self, source: usize, message: String) {
+        let origin = self
+            .origin_of
+            .get(&source)
+            .copied()
+            .or(self.chat_employee)
+            .unwrap_or(source);
+        self.push_to_chat(origin, TranscriptRole::Assistant, message);
+        self.team.set_status(origin, EmployeeStatus::Done);
+    }
+
+    /// The roster index of the orchestrator, when the roster has one.
+    fn orchestrator_index(&self) -> Option<usize> {
+        self.team_index_by_id(crate::team::ORCHESTRATOR_ID)
+    }
     fn route_to_jev(&mut self, source: usize, question: String) {
         self.push_to_chat(source, TranscriptRole::Info, format!("🤖 @jev: {question}"));
         if self.jev.is_none() {
@@ -2162,19 +2214,24 @@ impl App {
     }
 
     /// Fan `goal` out to every teammate in parallel (each interprets it from its
-    /// own role), then aggregate their outputs through a reviewer once all finish.
+    /// own role), then aggregate their outputs through the orchestrator once all
+    /// finish.
     ///
     /// The source and the aggregator are excluded from the worker set. The
-    /// aggregator is the reviewer when one exists and differs from the source,
-    /// else the planner, else the source itself.
+    /// aggregator is the orchestrator — the root owns synthesis — falling back to
+    /// the reviewer, then the planner, then the source itself when no root exists.
     fn fan_out(&mut self, source: usize, goal: String) {
         let team = self.team.employees().to_vec();
 
-        // The aggregator is the reviewer when one differs from the source, else
-        // the planner, else the source itself.
-        let aggregator = ["reviewer", "planner"]
-            .iter()
-            .find_map(|id| self.team_index_by_id(id).filter(|&i| i != source))
+        // The root aggregates; a roster without one falls back to the old
+        // reviewer → planner → source chain.
+        let aggregator = self
+            .orchestrator_index()
+            .or_else(|| {
+                ["reviewer", "planner"]
+                    .iter()
+                    .find_map(|id| self.team_index_by_id(id))
+            })
             .unwrap_or(source);
 
         let mut workers: Vec<usize> = (0..team.len())
@@ -3018,8 +3075,9 @@ impl App {
     // --- workflow ordering & the roster grid ---
 
     /// Employee storage indices in canonical workflow order (plan → research →
-    /// write → review → general), stable by name within a stage. The roster grid
-    /// draws (and the cursor moves) in this order rather than storage order.
+    /// write → review → general), stable by name within a stage. This is the
+    /// whole roster, root included, and it is what the *tasks* panel lists — the
+    /// board shows every employee's work, the orchestrator's included.
     pub fn workflow_order(&self) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..self.team.len()).collect();
         indices.sort_by_key(|&i| {
@@ -3029,14 +3087,35 @@ impl App {
         indices
     }
 
+    /// Employee storage indices the roster **grid** draws, in card order: the
+    /// workflow order minus the orchestrator.
+    ///
+    /// The root is not one of the pipeline stages it directs, so it does not get
+    /// a card among them — it is the strip above the grid (see
+    /// `ui::pipeline`). Everything that draws or hit-tests a card reads this,
+    /// while [`Self::workflow_order`] keeps listing everyone for the tasks
+    /// panel, so the two views can't drift.
+    pub fn card_order(&self) -> Vec<usize> {
+        let orchestrator = self.orchestrator_index();
+        self.workflow_order()
+            .into_iter()
+            .filter(|&index| Some(index) != orchestrator)
+            .collect()
+    }
+
     /// Move the roster cursor one cell in the grid, revealing the card it lands
     /// on.
     ///
     /// The grid is read left-to-right, top-to-bottom, so `delta` walks that
     /// order; the plan's arrow keys call this with `±1` (←/→) and `±cols`
     /// (↑/↓), which keeps the column fixed.
+    ///
+    /// The orchestrator has no card, so it is reached by leaving the grid: `↑`
+    /// from the first card row moves the cursor up to the root, and `↓` from
+    /// there returns it to the card it came from. Both are handled in
+    /// [`Self::move_selection`], which wraps this for the key handler.
     fn move_selection_grid(&mut self, delta: isize) {
-        let order = self.workflow_order();
+        let order = self.card_order();
         if order.is_empty() {
             return;
         }
@@ -3044,6 +3123,46 @@ impl App {
         let next = (position as isize + delta).clamp(0, order.len() as isize - 1) as usize;
         self.selected = order[next];
         self.reveal_selection();
+    }
+
+    /// Move the roster cursor by `delta` cells, with the orchestrator as the row
+    /// above the grid.
+    ///
+    /// `↑` (`delta == -cols`) from the first card row lands on the root rather
+    /// than clamping at the first card; `↓` (`delta == +cols`) from the root
+    /// returns to the first card. Left/right never leave the grid, so a
+    /// horizontal move while the root is selected is a no-op. Everything else is
+    /// the plain grid walk.
+    fn move_selection(&mut self, delta: isize) {
+        let cols = self.roster_cols();
+        let orchestrator = self.orchestrator_index();
+        let on_orchestrator = orchestrator == Some(self.selected);
+        let order = self.card_order();
+        let first_row = order.len().min(cols.max(1) as usize);
+
+        if on_orchestrator {
+            if delta == cols
+                && let Some(&first) = order.first()
+            {
+                self.selected = first;
+                self.reveal_selection();
+            }
+            // Every other direction stays on the root: it has no card to walk
+            // to, and clamping into the grid from a horizontal move would be a
+            // jump the user did not ask for.
+            return;
+        }
+
+        if delta == -cols
+            && let Some(root) = orchestrator
+            && order.iter().take(first_row).any(|&i| i == self.selected)
+        {
+            self.selected = root;
+            self.reveal_selection();
+            return;
+        }
+
+        self.move_selection_grid(delta);
     }
 
     /// Scroll the roster grid by `delta` rows, clamped to
@@ -3062,9 +3181,14 @@ impl App {
     /// Bring the selected card inside the viewport, scrolling the minimum
     /// distance. Called after every selection move, so the keyboard can never
     /// move the cursor somewhere the user cannot see.
+    ///
+    /// The orchestrator has no card, so it cannot be revealed: selecting it
+    /// leaves the viewport where it was, which is the row it sits above.
     fn reveal_selection(&mut self) {
-        let order = self.workflow_order();
-        let position = order.iter().position(|&i| i == self.selected).unwrap_or(0);
+        let order = self.card_order();
+        let Some(position) = order.iter().position(|&i| i == self.selected) else {
+            return;
+        };
         self.roster_scroll =
             ui::reveal_roster(self.last_size, order.len(), position, self.roster_scroll);
     }
@@ -3080,7 +3204,7 @@ impl App {
     /// grid it is a shorter hop, which keeps the key symmetrical with the rows
     /// the panel actually shows rather than skipping cells the user never saw.
     fn roster_page(&self) -> isize {
-        ui::roster_page(self.last_size, self.team.len()) as isize
+        ui::roster_page(self.last_size, self.card_order().len()) as isize
     }
 
     // --- project discovery ---
@@ -3151,8 +3275,12 @@ impl App {
 
     /// The largest scroll offset the roster grid accepts right now — the last
     /// page that still shows whole rows. `0` when everything fits.
+    ///
+    /// Counted over [`Self::card_order`], not the whole roster: the orchestrator
+    /// has no card, so counting it would let the wheel scroll to a page that does
+    /// not exist.
     pub fn roster_max_scroll(&self) -> usize {
-        ui::roster_max_scroll(self.last_size, self.team.len())
+        ui::roster_max_scroll(self.last_size, self.card_order().len())
     }
 
     pub fn frame(&self) -> u64 {

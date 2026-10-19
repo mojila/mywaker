@@ -101,3 +101,89 @@ TEA (The Elm Architecture): `Model → Message → Update → View`, the standar
 - IM/chat-platform connectors (Slack/Linear) — manual chat + cron/hook only.
 - Multi-tenant / enterprise auth / audit UI.
 - Long-term "forget/retain" memory store — v1 keeps per-employee memory JSON only.
+
+---
+
+## 8. Orchestrator-rooted team + main-screen prompt + animated delegation (planned)
+
+Turn the *team* into an explicit tree with one **orchestrator** at the root, give the
+main (roster) screen a prompt input that routes to it, and draw delegation as
+**animated dashed lines**. Everything a flat roster's employees do today moves under
+the orchestrator.
+
+### 8.1 Orchestrator becomes the root employee
+
+- `src/team.rs` — `ORCHESTRATOR_ID = "orchestrator"`. `Team::starter()` gains the
+  orchestrator first (`Otto`), then researcher/writer/reviewer/planner (5 total).
+  New `Team::ensure_orchestrator()` inserts it at index 0 when absent; called by
+  `starter()` and `load_or_starter()` so an existing `team.toml` gains one on launch.
+  `remove_employee("orchestrator")` is refused. `App::with_team` takes `mut team` and
+  calls `ensure_orchestrator()`, preserving the invariant for every fixture.
+- `src/role.rs` — `Role::Orchestrator` at order 0 (Planner 1 → Researcher 2 →
+  Engineer 3 → Writer 4 → Reviewer 5 → General 6); `from_label` aliases `lead`/`root`.
+- `src/agent.rs` + `examples/agents/orchestrator.md` — new `ORCHESTRATOR` prompt
+  (decompose → `@<id>` → synthesize → only it uses `@user`). The other role prompts
+  are rewritten to report finished work upward via `@orchestrator`. The example file
+  is byte-locked to the const (like the modeler test).
+
+### 8.2 Delegation reports upward (bubbling)
+
+- `src/workflow.rs` — `is_orchestrator()`; `team_context()` rendered as a tree with
+  the rule "you report to `@orchestrator`; `@user` is the orchestrator's alone".
+- `src/app.rs` — a worker's final `@user` is **relayed to the orchestrator** as a
+  report (instead of ending the chain); the orchestrator's own `@user` delivers to the
+  user. `fan_out`'s aggregator becomes the orchestrator (fallback reviewer/planner);
+  the orchestrator is excluded from the worker set. Existing `MAX_CHAIN_DEPTH` /
+  `DELEGATION_TOTAL_LIMIT` remain the cycle guards. When the orchestrator finishes with
+  plain text, the result is logged to the main screen.
+- Selection: `card_order()` (= roster minus orchestrator) drives the grid;
+  `workflow_order()` still lists everyone for the tasks panel. `selected` defaults to
+  the orchestrator; `↑` from the first card row reaches it, `Enter`/`m`/`s` work on it.
+
+### 8.3 Main-screen prompt
+
+- `src/ui/layout.rs` — `Regions` gains a `prompt` band; mode-aware:
+  roster `title 1 · main fill · prompt 2 · log 4 · help 1`
+  (others: `prompt 0 · log 6`, so `main` height is unchanged in roster mode).
+- New `src/ui/prompt.rs` — a 2-row bordered bar (`orchestrator` + status + model,
+  `> ` + input + cursor; `◆ N delegating` while traced). Shared cursor/scroll line
+  renderer extracted to `ui/input.rs` (chat + prompt share it).
+- `src/app.rs` — `prompt_focused`, `prompt_history`; `i`/`Tab`/click focuses, `Esc`
+  blurs, `Enter` submits, `↑/↓` recalls goals. One shared `input` buffer, cleared on
+  mode switch. `send_prompt` → `submit_to(employee, text, origin)`; new `submit_goal()`
+  routes the roster prompt to the orchestrator.
+
+### 8.4 Animated dashed delegation
+
+- `src/ui/pipeline.rs` — team panel bands `title · orchestrator strip · bus · cards`;
+  Jev moves into the strip's right side (keeps 2 card rows at 80×24). `Shape` gains
+  `strip`/`bus` rects; a 1-column riser gutter left of each card column; `Node` gains
+  `riser_x`. Degradation drops the bus then the strip only when they'd cost a card row.
+- New `src/ui/wires.rs` — strip, dashed bus (`┄`), and per-trace paths (strip port →
+  bus → riser → card top; reversed for reports). `path(...)` is a pure function.
+  Animation: `progress = age/TTL`, cells behind the `◆` head lit in the trace colour
+  (cyan out, green report, yellow fan-out).
+- `src/app.rs` — `DelegationTrace { from, to, kind, started }`, capped at 12, recorded
+  on every hand-off/report, pruned by `tick_traces()` (from `Tick` and `advance()`),
+  TTL ≈ 12 ticks (~1.2 s); `app.traces()` + `DelegationTrace::age()` keep the UI pure.
+
+### 8.5 Tests & docs
+
+- Unit/integration: role/team order + migration + remove-refusal; workflow wording;
+  orchestrator definition parity; `submit_goal` + bubbling + fan-out aggregator; prompt
+  focus key routing + paste; traces prune + packet movement; `wires::path` contiguity;
+  layout keeps `main` height. Update existing fixtures for the 5-employee roster and
+  the new geometry (`app/tests`, `team`, `pipeline`, `tests/sidebar`, `tests/render`).
+- Docs: README screenshot + orchestrator/`i`/`o` sections; `docs/architecture.md`
+  module list + §10 delegation rewrite + layout notes; `docs/todos.md`; `PLAN.md`
+  vision bullet.
+
+### 8.6 Decisions & risks
+
+- **Focus:** `i`/click focuses the prompt; every existing single-letter shortcut stays
+  unchanged when unfocused. **Drawing:** strip + bus + risers (one column per card).
+  **Routing:** bubble worker results to the orchestrator.
+- Index shift (orchestrator at 0) makes `app/tests` positional assertions noisy;
+  risers cost one column per card; bubbling adds an orchestrator turn per `@user`
+  (bounded by the existing caps). `mode: all` frontmatter is intentionally unchanged
+  until `POST /api/session` behaviour with `mode: subagent` is verified.

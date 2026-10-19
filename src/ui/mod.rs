@@ -95,10 +95,12 @@ pub fn team_area(size: (u16, u16)) -> Rect {
 ///
 /// This reads the same `pipeline::grid` geometry the renderer draws from, with
 /// the app's current scroll offset, so an acceptance test can click the middle of
-/// a card and know which employee it should select. The Jev header is not a card
-/// and never appears here.
+/// a card and know which employee it should select. The order is
+/// [`App::card_order`] — the roster minus the orchestrator — because the root is
+/// the strip above the grid, not one of its cards. The Jev header is not a card
+/// and never appears here either.
 pub fn grid_cells(app: &App, size: (u16, u16)) -> Vec<(usize, Rect)> {
-    let order = app.workflow_order();
+    let order = app.card_order();
     pipeline::grid(team_area(size), &order, app.roster_scroll())
         .cells
         .into_iter()

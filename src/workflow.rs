@@ -71,6 +71,13 @@ pub fn is_jev(target: &str) -> bool {
     matches!(target, "jev" | "judge" | "decide")
 }
 
+/// True when a directive targets the root employee — the one employee that
+/// delivers to the user. Workers report upward to it instead of answering the
+/// user directly.
+pub fn is_orchestrator(target: &str) -> bool {
+    target == crate::team::ORCHESTRATOR_ID
+}
+
 /// True when a directive means "fan this goal out to the whole team in parallel".
 pub fn is_parallel(target: &str) -> bool {
     matches!(target, "parallel" | "fanout" | "all" | "team")
@@ -127,16 +134,31 @@ pub fn contribution(text: &str) -> Option<String> {
 /// The preamble injected into each employee's first prompt so every employee
 /// knows (a) who its teammates are, (b) the role boundaries that keep jobs with
 /// the right teammate, and (c) how to delegate to them.
+///
+/// The roster is drawn as the delegation tree, with the orchestrator at the root.
+/// A worker is told to report *upward* to `@orchestrator` rather than answer the
+/// user, because the orchestrator owns the synthesis and `@user` is its alone.
 pub fn team_context(team: &Team, name: &str) -> String {
     let roster = team
         .employees()
         .iter()
-        .map(|e| format!("  @{} — {}", e.id, e.role))
+        .map(|e| {
+            let marker = if is_orchestrator(&e.id) {
+                "◆"
+            } else {
+                "├─"
+            };
+            format!("  {marker} @{} — {}", e.id, e.role)
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
     format!(
-        "You are {name}, one employee on a team of AI employees:\n{roster}\n\n\
+        "You are {name}, one employee on a team of AI employees. The team is a tree:\n\
+{roster}\n\n\
+The orchestrator is the root. You report to `@orchestrator`; `@user` is the \
+orchestrator's alone, so a finished result goes to the orchestrator, not to the \
+user.\n\n\
 Stick to YOUR OWN role and delegate anything outside it. In particular:\n\
   - The planner only produces plans, roadmaps, and task breakdowns — it never \
 writes the implementation, code, or final prose; it delegates those to the \
@@ -146,10 +168,10 @@ teammate whose role covers them (e.g. the software engineer / writer).\n\
   - The reviewer checks, critiques, and verifies others' work.\n\n\
 When a sub-task is better done by a teammate, delegate it by ending your reply \
 with one or more lines of the form:\n\n  @<id> <instruction>\n\nFor example:\n  \
-@researcher gather the sources\n  @writer implement the feature\n\nTo have the \
+@researcher gather the sources\n  @writer implement the feature\n\nWhen your \
+work is finished, report it upward with `@orchestrator <result>`. To have the \
 whole team work a goal in parallel (each from their own role), end your reply \
-with `@parallel <goal>`. To hand the final result back to the user, prefix a \
-line with @user or @deliver."
+with `@parallel <goal>`."
     )
 }
 
@@ -273,5 +295,33 @@ mod tests {
         // The planner is explicitly told to delegate implementation away.
         assert!(ctx.contains("never writes the implementation"));
         assert!(ctx.contains("software engineer / writer"));
+    }
+
+    /// The roster is a tree: the root is marked, everyone else hangs off it, and
+    /// the reporting rule is stated rather than implied.
+    #[test]
+    fn team_context_roots_the_roster_and_reports_upward() {
+        let team = Team::starter();
+        let ctx = team_context(&team, "Bruno");
+
+        assert!(ctx.contains("◆ @orchestrator"), "{ctx}");
+        assert!(ctx.contains("├─ @writer"), "{ctx}");
+        assert!(
+            ctx.contains("You report to `@orchestrator`"),
+            "the reporting rule must be explicit: {ctx}"
+        );
+        assert!(
+            ctx.contains("`@user` is the orchestrator's alone"),
+            "a worker must not be told it can deliver: {ctx}"
+        );
+        assert!(ctx.contains("@orchestrator <result>"), "{ctx}");
+    }
+
+    #[test]
+    fn is_orchestrator_matches_the_root_id_only() {
+        assert!(is_orchestrator("orchestrator"));
+        assert!(!is_orchestrator("lead"));
+        assert!(!is_orchestrator("writer"));
+        assert!(!is_orchestrator("user"));
     }
 }

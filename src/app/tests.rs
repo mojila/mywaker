@@ -147,8 +147,9 @@ fn dispatch_delegations_routes_question_to_jev() {
 #[test]
 fn dispatch_delegations_delivers_final_answer() {
     let (mut app, _rx) = make_app();
-    open_chat(&mut app, 3); // planner
-    app.origin_of.insert(3, 3);
+    let orchestrator = employee(&app, "orchestrator");
+    open_chat(&mut app, orchestrator);
+    app.origin_of.insert(orchestrator, orchestrator);
 
     let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
         {"id":"m1","time":{"created":1},"text":"plan it","type":"user"},
@@ -157,14 +158,54 @@ fn dispatch_delegations_delivers_final_answer() {
     ]))
     .unwrap();
 
-    app.handle_transcript(3, messages);
+    app.handle_transcript(orchestrator, messages);
 
     assert_eq!(app.delegation_count, 1);
     assert!(
-        app.chats[&3]
+        app.chats[&orchestrator]
             .transcript
             .iter()
             .any(|line| line.role == TranscriptRole::Assistant && line.text == "the final summary")
+    );
+}
+
+/// A worker's `@user` is not the user's answer: it bubbles up to the
+/// orchestrator as a named report, and the origin chat stays untouched.
+#[test]
+fn a_workers_final_answer_bubbles_up_to_the_orchestrator() {
+    let (mut app, _rx) = make_app();
+    let orchestrator = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer); // the writer was prompted directly
+    app.origin_of.insert(writer, writer);
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"draft it","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"text","text":"@user the draft is ready"}],"finish":"done"}
+    ]))
+    .unwrap();
+
+    app.handle_transcript(writer, messages);
+
+    // The user's chat did not receive it as a delivered answer…
+    assert!(
+        !app.chats[&writer]
+            .transcript
+            .iter()
+            .any(|line| line.role == TranscriptRole::Assistant && line.text == "the draft is ready"),
+        "a worker's @user was delivered to the user"
+    );
+    // …the orchestrator did, attributed to the writer.
+    let queued = app.chats[&orchestrator].outbox.join("\n");
+    assert!(queued.contains("Report from Bruno"), "{queued}");
+    assert!(queued.contains("the draft is ready"), "{queued}");
+    assert!(
+        app.log
+            .iter()
+            .any(|line| line.contains("reported to the orchestrator")),
+        "the relay is logged: {:?}",
+        app.log
     );
 }
 
@@ -190,14 +231,15 @@ fn dispatch_delegations_is_idempotent_per_message_id() {
 }
 
 /// `@parallel` fans a goal out to every teammate but the source and the
-/// aggregator (reviewer), registering a fan-out group and dispatching each.
+/// aggregator (the orchestrator), registering a fan-out group and dispatching
+/// each.
 #[test]
 fn parallel_directive_fans_out_to_workers() {
     let (mut app, _rx) = make_app();
     let planner = employee(&app, "planner");
     let researcher = employee(&app, "researcher");
     let writer = employee(&app, "writer");
-    let reviewer = employee(&app, "reviewer");
+    let orchestrator = employee(&app, "orchestrator");
     open_chat(&mut app, planner); // the planner is the source
     app.origin_of.insert(planner, planner);
     app.chats.entry(researcher).or_default().session_id = Some("ses_r".into());
@@ -212,16 +254,16 @@ fn parallel_directive_fans_out_to_workers() {
 
     app.handle_transcript(planner, messages);
 
-    // One fan-out; the reviewer aggregates, and everyone else but the source is
-    // a worker (the orchestrator included, until D gives it the aggregator role).
+    // One fan-out; the orchestrator aggregates, and everyone else but the source
+    // is a worker.
     assert_eq!(app.fanouts.len(), 1);
     let (_, fanout) = app.fanouts.iter().next().unwrap();
     let mut expected: Vec<usize> = (0..app.team.len())
-        .filter(|&i| i != planner && i != reviewer)
+        .filter(|&i| i != planner && i != orchestrator)
         .collect();
     expected.sort_unstable();
     assert_eq!(fanout.workers, expected);
-    assert_eq!(fanout.aggregator, reviewer);
+    assert_eq!(fanout.aggregator, orchestrator);
     assert_eq!(fanout.goal, "build the launch plan");
 
     // The goal reached the workers…
@@ -232,12 +274,12 @@ fn parallel_directive_fans_out_to_workers() {
             "worker {worker} never received the goal: {queued:?}"
         );
     }
-    // …but not the aggregator (reviewer), which only synthesises later.
-    assert!(!app.chats.contains_key(&reviewer));
+    // …but not the aggregator (the orchestrator), which only synthesises later.
+    assert!(!app.chats.contains_key(&orchestrator));
 }
 
 /// Once every worker contributes, the fan-out aggregates their outputs and
-/// hands the synthesis to the reviewer.
+/// hands the synthesis to the orchestrator.
 #[test]
 fn fan_out_aggregates_once_all_workers_finish() {
     let (mut app, _rx) = make_app();
@@ -259,19 +301,20 @@ fn fan_out_aggregates_once_all_workers_finish() {
         .unwrap()
     };
 
-    // The orchestrator contributes too (it is a worker until D re-roots it).
-    app.handle_transcript(orchestrator, assistant("o", "Route the work."));
     // Researcher finishes; the fan-out is not yet complete.
     app.handle_transcript(researcher, assistant("r", "Market research findings."));
     assert!(!app.fanouts.values().next().unwrap().aggregated);
 
-    // Writer finishes; now aggregation fires and the reviewer receives the
-    // synthesized prompt (queued since the reviewer has no live session yet).
+    // Writer finishes; the reviewer is the last worker, so aggregation fires and
+    // the orchestrator receives the synthesized prompt (queued, since it has no
+    // live session yet).
     app.handle_transcript(writer, assistant("w", "Draft copy for the launch."));
+    assert!(!app.fanouts.values().next().unwrap().aggregated);
+    app.handle_transcript(reviewer, assistant("v", "Both parts check out."));
     let (_, fanout) = app.fanouts.iter().next().unwrap();
     assert!(fanout.aggregated);
 
-    let outbox = &app.chats[&reviewer].outbox;
+    let outbox = &app.chats[&orchestrator].outbox;
     assert_eq!(outbox.len(), 1);
     assert!(outbox[0].contains("Market research findings"));
     assert!(outbox[0].contains("Draft copy for the launch"));
@@ -283,12 +326,12 @@ fn fan_out_aggregates_once_all_workers_finish() {
 fn fan_out_briefs_each_worker_not_to_hand_off() {
     let (mut app, _rx) = make_app();
     let planner = employee(&app, "planner");
-    let reviewer = employee(&app, "reviewer");
+    let orchestrator = employee(&app, "orchestrator");
     open_chat(&mut app, planner);
     app.fan_out(planner, "ship it".to_string());
 
     let workers: Vec<usize> = (0..app.team.len())
-        .filter(|&i| i != planner && i != reviewer)
+        .filter(|&i| i != planner && i != orchestrator)
         .collect();
     assert!(workers.len() >= 2, "the fixture needs more than one worker");
     for worker in workers {
@@ -312,6 +355,7 @@ fn worker_final_directive_contributes_instead_of_delivering() {
     let writer = employee(&app, "writer");
     let researcher = employee(&app, "researcher");
     let reviewer = employee(&app, "reviewer");
+    let orchestrator = employee(&app, "orchestrator");
     open_chat(&mut app, planner);
     app.origin_of.insert(planner, planner);
     app.fan_out(planner, "ship it".to_string());
@@ -340,13 +384,12 @@ fn worker_final_directive_contributes_instead_of_delivering() {
         "a worker's directive was dispatched"
     );
 
-    // The round is still waiting on the researcher (and the orchestrator).
+    // The round is still waiting on the researcher and the reviewer.
     assert!(!app.fanouts.values().next().unwrap().aggregated);
 
-    let orchestrator = employee(&app, "orchestrator");
-    app.handle_transcript(orchestrator, assistant("o", "Routed."));
     app.handle_transcript(researcher, assistant("r", "Market research findings."));
-    let outbox = &app.chats[&reviewer].outbox;
+    app.handle_transcript(reviewer, assistant("v", "Both parts check out."));
+    let outbox = &app.chats[&orchestrator].outbox;
     assert_eq!(outbox.len(), 1);
     assert!(outbox[0].contains("Market research findings"));
     assert!(
@@ -363,7 +406,7 @@ fn worker_delegation_does_not_spawn_a_side_chain() {
     let (mut app, _rx) = make_app();
     let planner = employee(&app, "planner");
     let writer = employee(&app, "writer");
-    let reviewer = employee(&app, "reviewer");
+    let orchestrator = employee(&app, "orchestrator");
     open_chat(&mut app, planner);
     app.fan_out(planner, "ship it".to_string());
 
@@ -379,7 +422,7 @@ fn worker_delegation_does_not_spawn_a_side_chain() {
     assert_eq!(app.delegation_count, 0, "worker hand-off was dispatched");
     // Nothing was relayed to anyone: the only outbox entries are the fan-out
     // briefs every worker received, and no new one appeared.
-    for worker in (0..app.team.len()).filter(|&i| i != planner && i != reviewer) {
+    for worker in (0..app.team.len()).filter(|&i| i != planner && i != orchestrator) {
         assert_eq!(
             app.chats[&worker].outbox.len(),
             1,
@@ -413,11 +456,14 @@ fn a_finished_worker_may_delegate_again() {
         ]))
         .unwrap()
     };
-    app.handle_transcript(orchestrator, assistant("o", "Routed."));
     app.handle_transcript(researcher, assistant("r", "Findings."));
     app.handle_transcript(writer, assistant("w", "Copy."));
+    app.handle_transcript(reviewer, assistant("v", "Checked."));
     assert!(app.fanouts.values().next().unwrap().aggregated);
-    assert!(app.chats.contains_key(&reviewer), "the round aggregated");
+    assert!(
+        app.chats.contains_key(&orchestrator),
+        "the round aggregated to the orchestrator"
+    );
 
     // A later reply from that employee delegates normally again.
     app.handle_transcript(
@@ -756,6 +802,94 @@ fn workflow_order_sorts_by_stage_then_name() {
     );
 }
 
+/// The grid's order is the workflow order minus the root: the orchestrator is the
+/// strip above the cards, so it must not be drawn as one. The tasks panel keeps
+/// reading `workflow_order`, which still lists everyone.
+#[test]
+fn card_order_is_the_workflow_order_without_the_orchestrator() {
+    let (app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+
+    let cards: Vec<&str> = app
+        .card_order()
+        .iter()
+        .map(|&i| app.team.employees()[i].id.as_str())
+        .collect();
+    assert_eq!(cards, vec!["planner", "researcher", "writer", "reviewer"]);
+    assert!(!app.card_order().contains(&root), "the root has no card");
+
+    // Both lists are drawn from the same roster, so the cards are a strict
+    // subset — one entry fewer, and in the same relative order.
+    let workflow = app.workflow_order();
+    assert_eq!(workflow.len(), app.card_order().len() + 1);
+    let relative: Vec<usize> = workflow.into_iter().filter(|&i| i != root).collect();
+    assert_eq!(relative, app.card_order());
+}
+
+/// A roster with no orchestrator (a fixture built by hand) has every employee as
+/// a card: the filter is on the root, not on the roster size.
+#[test]
+fn card_order_of_a_roofless_roster_is_the_whole_roster() {
+    let (mut app, _rx) = make_app();
+    app.team = long_team(3);
+    assert_eq!(app.card_order().len(), 3);
+    assert_eq!(app.card_order(), app.workflow_order());
+}
+
+/// The cursor starts on the orchestrator, and `↑` from the first card row reaches
+/// it — the one employee without a card.
+#[test]
+fn the_orchestrator_is_selected_first_and_reached_by_arrowing_up() {
+    let (mut app, _rx) = make_app();
+    app.last_size = (120, 40);
+    let root = employee(&app, "orchestrator");
+    let planner = employee(&app, "planner");
+    let researcher = employee(&app, "researcher");
+
+    assert_eq!(app.selected(), root, "the roster opens on the root");
+
+    // Down from the root lands on the first card, in card order.
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.selected(), planner);
+
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.selected(), researcher);
+
+    // Up from the first card row goes back to the root.
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.selected(), root);
+
+    // Left/right never leave the grid, so from the root they stay put.
+    press(&mut app, KeyCode::Left);
+    assert_eq!(app.selected(), root);
+    press(&mut app, KeyCode::Right);
+    assert_eq!(app.selected(), root);
+}
+
+/// The root is not revealed: selecting it leaves the viewport where the first
+/// card row is, so the strip stays on screen above it.
+#[test]
+fn selecting_the_orchestrator_does_not_scroll_the_grid() {
+    let (mut app, _rx) = make_app();
+    app.team = long_team(30);
+    app.team.ensure_orchestrator();
+    app.selected = employee(&app, "orchestrator");
+    app.last_size = (120, 24); // three columns, two card rows on screen
+    assert!(app.roster_max_scroll() > 0, "the fixture must overflow");
+
+    // Scroll to the bottom, then walk back up to the root.
+    app.selected = *app.card_order().last().unwrap();
+    app.reveal_selection();
+    let bottom = app.roster_scroll();
+    assert_eq!(bottom, app.roster_max_scroll());
+
+    for _ in 0..40 {
+        press(&mut app, KeyCode::Up);
+    }
+    assert_eq!(app.selected(), employee(&app, "orchestrator"));
+    assert_eq!(app.roster_scroll(), 0, "the root sits above the first page");
+}
+
 #[test]
 fn renders_grid_with_mixed_statuses() {
     let (mut app, _rx) = make_app();
@@ -893,6 +1027,7 @@ fn abandoned_worker_still_aggregates_fanout() {
     let researcher = employee(&app, "researcher");
     let writer = employee(&app, "writer");
     let reviewer = employee(&app, "reviewer");
+    let orchestrator = employee(&app, "orchestrator");
     open_chat(&mut app, planner);
     app.origin_of.insert(planner, planner);
     app.fan_out(planner, "ship it".to_string());
@@ -908,7 +1043,7 @@ fn abandoned_worker_still_aggregates_fanout() {
     assert!(fanout.outputs.contains_key(&researcher));
     assert!(!fanout.aggregated);
 
-    // The rest deliver; the fan-out then aggregates through the reviewer.
+    // The rest deliver; the fan-out then aggregates through the orchestrator.
     let assistant = |id: &str, text: &str| -> Vec<SessionMessage> {
         serde_json::from_value(serde_json::json!([
             {"id": format!("{id}_u"), "time":{"created":1}, "text":"ship it","type":"user"},
@@ -917,12 +1052,12 @@ fn abandoned_worker_still_aggregates_fanout() {
         ]))
         .unwrap()
     };
-    app.handle_transcript(employee(&app, "orchestrator"), assistant("o", "Routed."));
     app.handle_transcript(writer, assistant("w", "Draft copy."));
+    app.handle_transcript(reviewer, assistant("v", "Checked."));
 
     let fanout = app.fanouts.values().next().unwrap();
     assert!(fanout.aggregated);
-    let outbox = &app.chats[&reviewer].outbox;
+    let outbox = &app.chats[&orchestrator].outbox;
     assert_eq!(outbox.len(), 1);
     assert!(outbox[0].contains("no deliverable")); // the researcher's ⚠
     assert!(outbox[0].contains("Draft copy."));
@@ -2369,15 +2504,17 @@ fn chain_origin_and_depth_default_then_inherit() {
 fn a_worker_owes_a_fanout_once() {
     let (mut app, _rx) = make_app();
     let planner = employee(&app, "planner");
-    let reviewer = employee(&app, "reviewer");
     let orchestrator = employee(&app, "orchestrator");
-    open_chat(&mut app, planner); // the planner; the reviewer aggregates for it
+    open_chat(&mut app, planner); // the planner; the orchestrator aggregates for it
     app.fan_out(planner, "ship it".to_string());
 
     let id = *app.fanouts.keys().next().unwrap();
     let workers = app.fanouts[&id].workers.clone();
     assert_eq!(workers.len(), 3, "everyone but the source and aggregator");
-    assert!(workers.contains(&orchestrator));
+    assert!(
+        !workers.contains(&orchestrator),
+        "the root aggregates, so it is not a worker"
+    );
     let first = workers[0];
     assert_eq!(app.fanouts_awaiting(first), vec![id]);
 
@@ -2387,7 +2524,10 @@ fn a_worker_owes_a_fanout_once() {
 
     // The source and the aggregator are not workers, so they owe nothing.
     assert!(app.fanouts_awaiting(planner).is_empty(), "the source");
-    assert!(app.fanouts_awaiting(reviewer).is_empty(), "the aggregator");
+    assert!(
+        app.fanouts_awaiting(orchestrator).is_empty(),
+        "the aggregator"
+    );
 
     // The remaining workers' contributions complete the fan-out: aggregated, and
     // owed by nobody afterwards.
@@ -2485,8 +2625,10 @@ fn clicking_a_grid_card_selects_that_employee() {
     // would also match the tasks panel, which prints every name. The expected
     // employee is looked up by id, so the assertion survives the roster root
     // shifting every index by one.
+    //
+    // The orchestrator is deliberately absent: it is the strip above the grid, so
+    // it has no card to click (see `the_orchestrator_has_no_grid_card`).
     for (stage, id) in [
-        ("ORCHESTRATOR", "orchestrator"),
         ("RESEARCHER", "researcher"),
         ("WRITER", "writer"),
         ("REVIEWER", "reviewer"),
@@ -2498,13 +2640,15 @@ fn clicking_a_grid_card_selects_that_employee() {
         assert_eq!(app.selected(), expected, "clicking the {stage} card");
     }
 
-    // The Jev strip is a header, not a card: it is not a target.
-    app.selected = 0;
-    let (column, row) = find_on_screen(&app, 120, 40, "◆");
-    app.handle_mouse(mouse_click(column, row));
+    // The strips above the grid are headers, not cards: neither resolves to an
+    // employee.
+    let root = employee(&app, "orchestrator");
+    app.selected = root;
+    let panel = ui::team_area((120, 40));
+    app.handle_mouse(mouse_click(panel.x + 2, panel.y + 1));
     assert_eq!(
         app.selected(),
-        0,
+        root,
         "the Jev header has no employee to select"
     );
 }

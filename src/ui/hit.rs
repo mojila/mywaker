@@ -61,7 +61,7 @@ pub fn target_at(app: &App, size: (u16, u16), x: u16, y: u16) -> Option<Target> 
 /// was aimed at. The Jev header and the gaps between cards stand for no employee
 /// and answer `None`.
 fn employee_at(app: &App, area: Rect, point: Position) -> Option<Target> {
-    let order = app.workflow_order();
+    let order = app.card_order();
     pipeline::grid(area, &order, app.roster_scroll())
         .cells
         .into_iter()

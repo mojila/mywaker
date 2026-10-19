@@ -26,7 +26,9 @@ use crate::team::Employee;
 use crate::ui::{status, truncate};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let order = app.workflow_order();
+    // The grid draws the pipeline stages only: the orchestrator is the root
+    // above them, not a card among them (see [`App::card_order`]).
+    let order = app.card_order();
 
     if order.is_empty() {
         let block = Block::default()
