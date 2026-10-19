@@ -30,7 +30,11 @@ pub enum Target {
 /// `main` that is clickable: it sits between the panels and the log, so a point
 /// there is not inside `main` at all.
 pub fn target_at(app: &App, size: (u16, u16), x: u16, y: u16) -> Option<Target> {
-    let regions = layout::Regions::of(Rect::new(0, 0, size.0, size.1), app.mode());
+    let regions = layout::Regions::of(
+        Rect::new(0, 0, size.0, size.1),
+        app.mode(),
+        app.orchestrator_is_thinking(),
+    );
     let point = Position::from((x, y));
 
     if app.mode() == Mode::Roster && regions.prompt.contains(point) {

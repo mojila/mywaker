@@ -4,7 +4,7 @@
 mod chat;
 pub(crate) mod hit;
 pub(crate) mod input;
-mod layout;
+pub(crate) mod layout;
 mod modal;
 mod models;
 mod pipeline;
@@ -13,6 +13,7 @@ mod prompt;
 mod robot;
 pub mod sidebar;
 mod status;
+pub use status::thinking_line;
 mod tasks;
 mod wires;
 
@@ -50,7 +51,7 @@ pub(crate) fn truncate(text: &str, width: usize) -> String {
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
-    let regions = layout::Regions::of(frame.area(), app.mode());
+    let regions = layout::Regions::of(frame.area(), app.mode(), app.orchestrator_is_thinking());
 
     render_title(frame, app, regions.title);
     render_main(frame, app, regions.main);
@@ -80,8 +81,12 @@ pub fn render(frame: &mut Frame, app: &App) {
 /// Public so the sidebar acceptance tests (`tests/sidebar.rs`) read the *same*
 /// geometry the renderer draws into, rather than recomputing the `24 | fill | 32`
 /// split by hand — which is what `docs/acceptance-sidebar.md` §3 requires.
+///
+/// The band heights here are the *resting* ones (no thinking indicator): the
+/// panels are the same height whether or not the root is mid-turn, which is the
+/// invariant the acceptance matrix pins.
 pub fn sidebar_area(size: (u16, u16)) -> Rect {
-    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster).main;
+    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster, false).main;
     layout::roster_areas(main)[0]
 }
 
@@ -91,14 +96,14 @@ pub fn sidebar_area(size: (u16, u16)) -> Rect {
 /// the panel the renderer draws into instead of recomputing the `24 | fill | 32`
 /// split.
 pub fn team_area(size: (u16, u16)) -> Rect {
-    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster).main;
+    let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster, false).main;
     layout::roster_areas(main)[1]
 }
 
 /// The roster prompt bar's rectangle for a terminal of `size` cells — the band
 /// between `main` and the log, where a goal is typed.
 pub fn prompt_area(size: (u16, u16)) -> Rect {
-    layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster).prompt
+    layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster, false).prompt
 }
 
 /// The employee cards on screen for a terminal of `size` cells, as

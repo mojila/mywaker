@@ -818,13 +818,13 @@ fn interrupt_clears_streaming_and_notes() {
     let (mut app, _rx) = make_app();
     open_chat(&mut app, 0);
     app.chats.get_mut(&0).unwrap().streaming_text = "partial".into();
-    app.chats.get_mut(&0).unwrap().reasoning_text = "think".into();
+    app.chats.get_mut(&0).unwrap().thinking.push("think");
 
     app.interrupt_current();
 
     let chat = &app.chats[&0];
     assert!(chat.streaming_text.is_empty());
-    assert!(chat.reasoning_text.is_empty());
+    assert!(chat.thinking.is_empty());
     assert!(
         chat.transcript
             .iter()
@@ -859,7 +859,277 @@ fn reasoning_deltas_accumulate() {
         serde_json::json!({"sessionID":"ses_1","delta":"king"}),
     ));
 
-    assert_eq!(app.reasoning_text(), "thinking");
+    assert_eq!(app.thinking_text(), "thinking");
+    assert_eq!(app.thinking_tail(), "thinking");
+}
+
+// --- thinking (the deliberation buffer and its indicator) ---
+
+/// Appending a fragment is O(1): the buffer stores fragments, not one growing
+/// string. The visible tail is still the newest text, in order.
+#[test]
+fn thinking_accumulates_fragments_in_order() {
+    let mut thinking = Thinking::default();
+    for fragment in ["Let me ", "check the ", "roster."] {
+        thinking.push(fragment);
+    }
+
+    assert_eq!(thinking.text(), "Let me check the roster.");
+    assert_eq!(thinking.tail(), "Let me check the roster.");
+    assert!(!thinking.is_empty());
+}
+
+/// A new assistant message starts a fresh buffer: reasoning from one message is
+/// not glued onto the next one's.
+#[test]
+fn a_new_message_key_starts_a_fresh_buffer() {
+    let mut thinking = Thinking::default();
+    thinking.begin(Some("msg_1".to_string()));
+    thinking.push("first message's reasoning");
+    assert_eq!(thinking.text(), "first message's reasoning");
+
+    thinking.begin(Some("msg_2".to_string()));
+    assert!(thinking.is_empty(), "a new message starts clean");
+    thinking.push("second");
+    assert_eq!(thinking.text(), "second");
+
+    // Re-beginning the *same* key keeps what was accumulated (a resumed stream).
+    thinking.begin(Some("msg_2".to_string()));
+    assert_eq!(thinking.text(), "second");
+}
+
+/// The tail is bounded: a long deliberation keeps only the newest
+/// [`Thinking::TAIL_BUDGET`] columns, so the indicator cannot grow with the turn.
+#[test]
+fn the_thinking_tail_is_bounded() {
+    let mut thinking = Thinking::default();
+    for _ in 0..200 {
+        thinking.push("a fairly long fragment of deliberation ");
+    }
+    let tail = thinking.tail();
+    assert!(
+        tail.chars().count() <= Thinking::TAIL_BUDGET,
+        "tail is {} columns",
+        tail.chars().count()
+    );
+    // It is the *newest* text: the last fragment is in there, the first is not.
+    assert!(tail.ends_with("deliberation"));
+    assert!(thinking.text().len() > tail.len(), "the buffer keeps more");
+}
+
+/// The buffer is capped too: a turn that reasons for a very long time drops the
+/// oldest fragments rather than growing without bound.
+#[test]
+fn the_thinking_buffer_is_capped() {
+    let mut thinking = Thinking::default();
+    for i in 0..Thinking::CAPACITY + 50 {
+        thinking.push(&format!("f{i} "));
+    }
+    assert_eq!(thinking.fragments.len(), Thinking::CAPACITY);
+    assert!(
+        thinking
+            .text()
+            .contains(&format!("f{}", Thinking::CAPACITY + 49))
+    );
+    assert!(
+        !thinking.text().contains("f0 "),
+        "the oldest fragment is gone"
+    );
+}
+
+/// The tail is one line: the provider's own line breaks and runs of whitespace
+/// collapse, because the indicator is a single row.
+#[test]
+fn the_thinking_tail_is_a_single_line() {
+    let mut thinking = Thinking::default();
+    thinking.push("first line\n\n  second   line\tthird");
+    let tail = thinking.tail();
+    assert!(!tail.contains('\n'));
+    assert_eq!(tail, "first line second line third");
+}
+
+/// `display_text` skips reasoning: a deliberation is not the answer, so it must
+/// not reach a fan-out aggregate or a `@user` deliverable. `reasoning_text`
+/// exposes it separately.
+#[test]
+fn display_text_skips_reasoning_parts() {
+    let message: crate::opencode::SessionMessage = serde_json::from_value(serde_json::json!({
+        "id": "m1",
+        "type": "assistant",
+        "content": [
+            {"type": "reasoning", "text": "the model's private scratchpad"},
+            {"type": "text", "text": "the actual answer"},
+            {"type": "reasoning", "text": "more deliberation"}
+        ],
+        "finish": "done"
+    }))
+    .unwrap();
+
+    let display = message.display_text();
+    assert_eq!(display, "the actual answer");
+    assert!(!display.contains("scratchpad"), "{display}");
+
+    // The reasoning is available, just not as the answer.
+    assert_eq!(
+        message.reasoning_text(),
+        "the model's private scratchpad\nmore deliberation"
+    );
+}
+
+/// The transcript never shows reasoning as an assistant line: it is not a
+/// message, it is the pinned indicator.
+#[test]
+fn reasoning_does_not_enter_the_transcript() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"go","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"reasoning","text":"hmm, let me think"},
+                    {"type":"text","text":"done"}],"finish":"done"}
+    ]))
+    .unwrap();
+    app.handle_transcript(0, messages);
+
+    let transcript = app.transcript();
+    assert!(
+        !transcript
+            .iter()
+            .any(|line| line.text.contains("let me think")),
+        "reasoning leaked into the transcript: {transcript:?}"
+    );
+    assert!(transcript.iter().any(|line| line.text == "done"));
+}
+
+/// The indicator is pinned to the chat's last row and survives scrolling back
+/// through history: it says the employee is busy *now*.
+#[test]
+fn the_thinking_indicator_is_pinned_below_the_scrollback() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.team.set_status(0, EmployeeStatus::Thinking);
+    app.chats
+        .get_mut(&0)
+        .unwrap()
+        .thinking
+        .push("pondering the goal");
+
+    let text = screen(&app, 120, 30);
+    assert!(text.contains("thinking"), "{text}");
+    assert!(text.contains("pondering the goal"), "{text}");
+
+    // Paging back through history does not scroll the indicator away.
+    app.scroll_transcript(-1);
+    let scrolled = screen(&app, 120, 30);
+    assert!(scrolled.contains("thinking"), "{scrolled}");
+}
+
+/// The indicator disappears the moment the employee stops thinking.
+#[test]
+fn the_indicator_disappears_when_the_turn_ends() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.team.set_status(0, EmployeeStatus::Thinking);
+    app.chats.get_mut(&0).unwrap().thinking.push("brief");
+    assert!(screen(&app, 120, 30).contains("thinking"));
+
+    app.team.set_status(0, EmployeeStatus::Working);
+    assert!(
+        !screen(&app, 120, 30).contains("thinking"),
+        "a working employee is not thinking"
+    );
+}
+
+/// `[ui] thinking = "hidden"` draws no indicator; `"full"` shows the whole
+/// deliberation rather than just the tail.
+#[test]
+fn the_thinking_mode_controls_how_much_is_shown() {
+    let mut chat_thinking = Thinking::default();
+    for _ in 0..40 {
+        chat_thinking.push("a long stretch of deliberation ");
+    }
+
+    // Indicator (the default): one bounded line.
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+    app.team.set_status(0, EmployeeStatus::Thinking);
+    app.chats.get_mut(&0).unwrap().thinking = chat_thinking.clone();
+    assert!(screen(&app, 120, 30).contains("thinking"));
+
+    // Hidden: no indicator row at all. The chat *title* still says `thinking` —
+    // hidden mode hides the deliberation, not the fact that the employee is busy.
+    let (mut hidden, _rx) = make_app();
+    hidden.config.ui.thinking = crate::config::ThinkingMode::Hidden;
+    open_chat(&mut hidden, 0);
+    hidden.team.set_status(0, EmployeeStatus::Thinking);
+    hidden.chats.get_mut(&0).unwrap().thinking = chat_thinking.clone();
+    let hidden_frame = screen(&hidden, 120, 30);
+    assert!(
+        !hidden_frame.contains("a long stretch"),
+        "hidden mode draws no deliberation: {hidden_frame}"
+    );
+    assert!(
+        hidden.thinking_line(120).is_none(),
+        "hidden mode yields no indicator row"
+    );
+
+    // Full: the deliberation is shown, not just its tail.
+    let (mut full, _rx) = make_app();
+    full.config.ui.thinking = crate::config::ThinkingMode::Full;
+    open_chat(&mut full, 0);
+    full.team.set_status(0, EmployeeStatus::Thinking);
+    full.chats.get_mut(&0).unwrap().thinking = chat_thinking;
+    let line = full.thinking_line(200).expect("full mode draws a row");
+    let drawn: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        drawn.chars().count() > Thinking::TAIL_BUDGET,
+        "full mode is longer than the tail budget"
+    );
+}
+
+/// The prompt band grows a row for the root's indicator, and the panels keep
+/// their resting geometry — the row comes from the log.
+#[test]
+fn the_prompt_band_grows_for_the_roots_thinking() {
+    let (mut app, _rx) = make_app();
+    app.update(Message::Resize(120, 40));
+    let panels = ui::team_area((120, 40));
+    let resting = ui::prompt_area((120, 40)).height;
+
+    let root = employee(&app, "orchestrator");
+    app.team.set_status(root, EmployeeStatus::Thinking);
+    app.chats.entry(root).or_default().thinking.push("planning");
+
+    let text = screen(&app, 120, 40);
+    assert!(
+        text.contains("thinking"),
+        "the bar shows the root's thinking"
+    );
+    assert_eq!(
+        ui::team_area((120, 40)),
+        panels,
+        "the panels never move for the indicator"
+    );
+
+    // The taller band is what the renderer used: the resting height plus the
+    // indicator row.
+    let taller = crate::ui::layout::Regions::of(
+        ratatui::layout::Rect::new(0, 0, 120, 40),
+        Mode::Roster,
+        true,
+    );
+    assert_eq!(taller.prompt.height, resting + 1);
+    assert_eq!(
+        taller.main,
+        crate::ui::layout::Regions::of(
+            ratatui::layout::Rect::new(0, 0, 120, 40),
+            Mode::Roster,
+            false
+        )
+        .main,
+        "the taller band still leaves main alone"
+    );
 }
 
 #[test]

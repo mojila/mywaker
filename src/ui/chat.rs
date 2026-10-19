@@ -28,6 +28,13 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
 
+    // The thinking indicator is a *pinned* row, not part of the transcript: it
+    // says the employee is busy right now, so it must stay visible while the user
+    // scrolls back through history (and it is not a message, so it must not enter
+    // the scrollback either).
+    let thinking = app.thinking_line(inner_width);
+    let body_height = inner_height.saturating_sub(usize::from(thinking.is_some()));
+
     let mut lines: Vec<Line> = Vec::new();
     for entry in app.transcript() {
         transcript_block(&mut lines, entry, inner_width);
@@ -46,25 +53,16 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
             inner_width,
         );
     }
-    let reasoning = app.reasoning_text();
-    if !reasoning.is_empty() {
-        tagged_block(
-            &mut lines,
-            "… ",
-            Style::default().fg(Color::DarkGray),
-            reasoning,
-            Style::default().fg(Color::DarkGray),
-            None,
-            inner_width,
-        );
-    }
 
     // Scroll to the visible window (stick to the live tail unless the user has
     // paged up to read back through history).
     let scroll = app.chat_scroll();
-    let max = lines.len().saturating_sub(inner_height);
+    let max = lines.len().saturating_sub(body_height);
     let start = max.saturating_sub(scroll).min(max);
-    let visible: Vec<Line> = lines.into_iter().skip(start).take(inner_height).collect();
+    let mut visible: Vec<Line> = lines.into_iter().skip(start).take(body_height).collect();
+    if let Some(thinking) = thinking {
+        visible.push(thinking);
+    }
 
     let title = match app.chat_employee_status() {
         Some(status) => format!(" chat · {name} · {} ", status.label()),

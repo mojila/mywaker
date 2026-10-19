@@ -14,10 +14,46 @@ pub struct Config {
     pub workdir: Option<PathBuf>,
     /// Optional Jev (System One) classifier settings.
     pub jev: JevConfig,
+    /// Presentation settings.
+    pub ui: UiConfig,
     /// Cron schedules for autonomous dispatch.
     pub schedules: Vec<Schedule>,
     /// File-change watch hooks for autonomous dispatch.
     pub watches: Vec<Watch>,
+}
+
+/// How much of an employee's reasoning to show while it thinks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    /// One dim line: a spinner and the tail of the deliberation. The default —
+    /// enough to see the employee is working on something, without pushing the
+    /// answer off the screen.
+    #[default]
+    Indicator,
+    /// No thinking at all: only the status glyph says the employee is busy.
+    Hidden,
+    /// The whole deliberation, as a dim block above the answer.
+    Full,
+}
+
+impl ThinkingMode {
+    /// The config spelling (`indicator`, `hidden`, `full`).
+    pub fn label(self) -> &'static str {
+        match self {
+            ThinkingMode::Indicator => "indicator",
+            ThinkingMode::Hidden => "hidden",
+            ThinkingMode::Full => "full",
+        }
+    }
+}
+
+/// Presentation settings (`[ui]`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    /// How much reasoning to show: `indicator` (default), `hidden`, or `full`.
+    pub thinking: ThinkingMode,
 }
 
 /// A cron schedule: fire `goal` at `employee` on a cron cadence.
@@ -83,6 +119,7 @@ impl Default for Config {
             tick_rate: Duration::from_millis(100),
             workdir: None,
             jev: JevConfig::default(),
+            ui: UiConfig::default(),
             schedules: Vec::new(),
             watches: Vec::new(),
         }
@@ -146,6 +183,40 @@ mod tests {
         assert!(cfg.jev.endpoint.is_none());
         assert!(cfg.jev.model.is_none());
         assert!(cfg.jev.api_key.is_none());
+    }
+
+    /// Thinking shows as a one-line indicator unless the user asks otherwise.
+    #[test]
+    fn thinking_defaults_to_the_indicator() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ui.thinking, ThinkingMode::Indicator);
+        assert_eq!(cfg.ui.thinking.label(), "indicator");
+    }
+
+    #[test]
+    fn deserializes_every_thinking_mode() {
+        for (spelling, expected) in [
+            ("indicator", ThinkingMode::Indicator),
+            ("hidden", ThinkingMode::Hidden),
+            ("full", ThinkingMode::Full),
+        ] {
+            let text = format!("[ui]\nthinking = \"{spelling}\"\n");
+            let cfg: Config = toml::from_str(&text).expect("parse config");
+            assert_eq!(cfg.ui.thinking, expected, "{spelling}");
+            assert_eq!(cfg.ui.thinking.label(), spelling);
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_thinking_mode() {
+        let text = "[ui]\nthinking = \"verbose\"\n";
+        assert!(toml::from_str::<Config>(text).is_err());
+    }
+
+    #[test]
+    fn rejects_an_unknown_ui_field() {
+        let text = "[ui]\nthink = \"full\"\n";
+        assert!(toml::from_str::<Config>(text).is_err());
     }
 
     #[test]

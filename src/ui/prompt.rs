@@ -66,6 +66,16 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             top,
         );
     }
+
+    // While the root is thinking, the band's last row says what about. It uses the
+    // same indicator as the chat transcript (and the same `[ui] thinking` setting),
+    // so the two screens cannot disagree about how much is shown.
+    if area.height > super::layout::PROMPT_HEIGHT
+        && let Some(thinking) = app.orchestrator_thinking_line(area.width as usize)
+    {
+        let row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+        frame.render_widget(Paragraph::new(thinking), row);
+    }
 }
 
 /// The left half of the border: `orchestrator · Otto · idle · model`, graded so

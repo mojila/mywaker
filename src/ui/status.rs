@@ -10,10 +10,12 @@
 //! UI dependency.
 
 use ratatui::style::Color;
-use ratatui::text::Span;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 
 use crate::task::TaskStatus;
 use crate::team::EmployeeStatus;
+use crate::ui::truncate;
 
 /// Braille spinner frames, indexed by the app tick (in sync with the avatar).
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -58,6 +60,57 @@ pub fn icon(status: EmployeeStatus, tick: u64) -> &'static str {
 /// [`icon`], styled in the status's [`color`].
 pub fn icon_span(status: EmployeeStatus, tick: u64) -> Span<'static> {
     Span::styled(icon(status, tick), color(status))
+}
+
+/// The "thinking" indicator: one dim line of spinner plus the tail of the
+/// employee's current reasoning.
+///
+/// A deliberation is not the answer, so it never joins the transcript. Instead
+/// one pinned row says *that* the employee is thinking and *what about*, which is
+/// enough to tell a working turn from a hung one without the scratchpad pushing
+/// the real output off the screen.
+///
+/// `tail` is [`Thinking::tail`](crate::app::Thinking::tail) — already collapsed to
+/// a single line and bounded — and is truncated here to `width` columns.
+pub fn thinking_line(tick: u64, tail: &str, width: usize) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            format!("{} ", spinner(tick)),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            "thinking",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    // The tail is the part that gives way: the spinner and the word must survive
+    // a narrow panel, because they are what says the employee is alive.
+    let used = 2 + "thinking".len();
+    if !tail.is_empty() && width > used + 3 {
+        let room = width - used - 1;
+        spans.push(Span::styled(" ", Style::default()));
+        spans.push(Span::styled(
+            truncate(tail, room),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The "thinking" indicator for an employee's status: `None` when there is
+/// nothing to show, so the caller can decide whether the row exists at all.
+#[cfg(test)]
+pub fn thinking_indicator(
+    status: EmployeeStatus,
+    tick: u64,
+    tail: &str,
+    width: usize,
+) -> Option<Line<'static>> {
+    (status == EmployeeStatus::Thinking).then(|| thinking_line(tick, tail, width))
 }
 
 /// The accent colour for a persisted task's status (the queue panel).
@@ -127,5 +180,64 @@ mod tests {
             task_color(TaskStatus::Running),
             task_color(TaskStatus::Succeeded)
         );
+    }
+
+    /// The indicator is one row: spinner, the word, then the tail — and the
+    /// spinner and word survive a narrow panel.
+    #[test]
+    fn thinking_line_is_spinner_word_then_tail() {
+        let line = thinking_line(0, "weighing the options", 80);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text,
+            format!("{} thinking weighing the options", SPINNER[0])
+        );
+
+        // The spinner is the live frame, so the row animates.
+        let later = thinking_line(1, "weighing the options", 80);
+        let later_text: String = later.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_ne!(text, later_text);
+    }
+
+    /// With no tail yet the row still says "thinking": that is the part that
+    /// tells a working turn from a hung one.
+    #[test]
+    fn an_empty_tail_still_shows_the_word() {
+        let line = thinking_line(0, "", 80);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, format!("{} thinking", SPINNER[0]));
+    }
+
+    /// A narrow panel drops the tail and keeps the indicator, rather than
+    /// truncating "thinking" itself.
+    #[test]
+    fn a_narrow_thinking_line_keeps_the_indicator() {
+        let line = thinking_line(0, "a very long deliberation indeed", 12);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("thinking"), "{text}");
+        assert!(text.chars().count() <= 12, "{text}");
+
+        // At an absurd width there is not even room for the tail; the word
+        // survives anyway.
+        let tiny = thinking_line(0, "tail", 4);
+        let tiny_text: String = tiny.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(tiny_text.contains("thinking"));
+    }
+
+    /// The indicator only exists while the employee is actually thinking.
+    #[test]
+    fn thinking_indicator_is_thinking_only() {
+        assert!(thinking_indicator(EmployeeStatus::Thinking, 0, "x", 40).is_some());
+        for status in [
+            EmployeeStatus::Idle,
+            EmployeeStatus::Working,
+            EmployeeStatus::Done,
+            EmployeeStatus::Error,
+        ] {
+            assert!(
+                thinking_indicator(status, 0, "x", 40).is_none(),
+                "{status:?}"
+            );
+        }
     }
 }

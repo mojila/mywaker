@@ -151,6 +151,22 @@ impl Event {
             .or_else(|| self.data.get("text").and_then(|v| v.as_str()))
     }
 
+    /// The assistant message a delta belongs to, when the stream names one
+    /// (`assistantMessageID`, or a nested `part.messageID`).
+    ///
+    /// Reasoning and text deltas are keyed on this so a turn that reasons,
+    /// answers, and reasons again starts a fresh buffer rather than merging
+    /// unrelated thinking into one block.
+    pub fn assistant_message_id(&self) -> Option<&str> {
+        if let Some(id) = self.data.get("assistantMessageID").and_then(|v| v.as_str()) {
+            return Some(id);
+        }
+        self.data
+            .get("part")
+            .and_then(|part| part.get("messageID"))
+            .and_then(|v| v.as_str())
+    }
+
     /// Full part snapshot, for `message.part.updated`.
     pub fn part(&self) -> Option<&serde_json::Value> {
         self.data.get("part")
@@ -357,6 +373,11 @@ impl SessionMessage {
     }
 
     /// Human-readable text: user body, else joined assistant text parts.
+    ///
+    /// `reasoning` parts are skipped: a deliberation is not the answer, and the
+    /// chat shows it separately (see [`Self::reasoning_text`]). Including it here
+    /// would put a model's scratchpad into the deliverable that a fan-out
+    /// aggregates or a `@user` hands back.
     pub fn display_text(&self) -> String {
         if let Some(text) = &self.text
             && !text.is_empty()
@@ -373,11 +394,23 @@ impl SessionMessage {
                 }
                 "tool" => parts.push(part_tool_label(part)),
                 "step" => parts.push("[step]".to_string()),
-                "reasoning" => parts.push("[thinking]".to_string()),
                 _ => {}
             }
         }
         parts.join("\n")
+    }
+
+    /// The message's reasoning, joined — the `thinking` parts only.
+    ///
+    /// Kept separate from [`Self::display_text`] so a transcript can show the
+    /// deliberation as thinking rather than as the answer.
+    pub fn reasoning_text(&self) -> String {
+        self.content
+            .iter()
+            .filter(|part| part.part_type == "reasoning")
+            .filter_map(|part| part.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// True if this assistant message never finished (still streaming or error).

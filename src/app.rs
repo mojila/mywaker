@@ -85,8 +85,9 @@ struct Chat {
     creating: bool,
     transcript: Vec<TranscriptLine>,
     streaming_text: String,
-    /// Live reasoning text (surfaced dim while the employee is thinking).
-    reasoning_text: String,
+    /// Live "thinking" output for this chat's current turn, accumulated per
+    /// assistant message. See [`Thinking`].
+    thinking: Thinking,
     /// Submitted prompts, oldest first — for Up/Down recall.
     history: Vec<String>,
     /// Current position in the history navigation, when recalling.
@@ -392,6 +393,106 @@ impl DelegationTrace {
     /// True once the packet has run its course and can be forgotten.
     pub fn is_expired(&self, frame: u64) -> bool {
         frame.saturating_sub(self.started) >= Self::TTL
+    }
+}
+
+/// Live "thinking" output for one turn, accumulated as the stream arrives.
+///
+/// Reasoning arrives as a *delta stream*, one token fragment at a time, and the
+/// chat shows only the tail of it. Keeping the fragments in a `Vec` (rather than
+/// appending to one `String`) is what makes that cheap: an append is `O(1)` and
+/// the visible tail is a bounded walk backwards, so a long deliberation does not
+/// turn every delta into a full re-copy of the text so far.
+///
+/// Fragments are keyed by the assistant message they belong to
+/// (`assistantMessageID`), so a turn that reasons, answers, and then reasons again
+/// (a tool round-trip) starts a fresh buffer instead of gluing unrelated
+/// thinking together.
+#[derive(Debug, Default, Clone)]
+pub struct Thinking {
+    /// The assistant message the fragments belong to, when the stream names one.
+    key: Option<String>,
+    /// The fragments, oldest first.
+    fragments: Vec<String>,
+}
+
+impl Thinking {
+    /// How many fragments the buffer keeps. A long turn can emit thousands; the
+    /// chat only ever shows the tail, so older ones are dropped rather than
+    /// growing the buffer without bound.
+    pub const CAPACITY: usize = 512;
+
+    /// How many display columns of thinking the tail renderer reads back through.
+    pub const TAIL_BUDGET: usize = 240;
+
+    /// Start (or continue) the buffer for assistant message `key`.
+    ///
+    /// A different key means a different message, so the buffer restarts: the new
+    /// message's thinking is not a continuation of the old one's.
+    pub fn begin(&mut self, key: Option<String>) {
+        if self.key != key {
+            self.key = key;
+            self.fragments.clear();
+        }
+    }
+
+    /// Append one fragment to the current message's buffer.
+    pub fn push(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.fragments.push(delta.to_string());
+        if self.fragments.len() > Self::CAPACITY {
+            let excess = self.fragments.len() - Self::CAPACITY;
+            self.fragments.drain(..excess);
+        }
+    }
+
+    /// True when nothing has been thought yet this turn.
+    pub fn is_empty(&self) -> bool {
+        self.fragments.is_empty()
+    }
+
+    /// The tail of the thinking, at most [`Self::TAIL_BUDGET`] columns, read back
+    /// from the newest fragment.
+    ///
+    /// Walks the fragments in reverse and stops as soon as it has enough columns,
+    /// so the cost is bounded by the budget rather than by the length of the
+    /// deliberation. Whitespace is collapsed, because reasoning arrives with the
+    /// provider's own line breaks and the chat shows one line.
+    pub fn tail(&self) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        let mut used = 0usize;
+        for fragment in self.fragments.iter().rev() {
+            if used >= Self::TAIL_BUDGET {
+                break;
+            }
+            used += fragment.chars().count();
+            out.push(fragment.as_str());
+        }
+        out.reverse();
+        let joined = out.concat();
+        let collapsed = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The last fragment read can overshoot the budget on its own, so the
+        // assembled line is trimmed to it: the bound is the promise, not an
+        // approximation of it.
+        if collapsed.chars().count() <= Self::TAIL_BUDGET {
+            collapsed
+        } else {
+            let skip = collapsed.chars().count() - Self::TAIL_BUDGET;
+            collapsed.chars().skip(skip).collect()
+        }
+    }
+
+    /// The whole buffer, joined — for the `full` thinking mode and for tests.
+    pub fn text(&self) -> String {
+        self.fragments.concat()
+    }
+
+    /// Forget the buffer and its key.
+    pub fn clear(&mut self) {
+        self.key = None;
+        self.fragments.clear();
     }
 }
 
@@ -1484,7 +1585,7 @@ impl App {
         };
         if let Some(chat) = self.chats.get_mut(&employee) {
             chat.streaming_text.clear();
-            chat.reasoning_text.clear();
+            chat.thinking.clear();
             chat.transcript.push(TranscriptLine::new(
                 TranscriptRole::Info,
                 "⏹ interrupted".to_string(),
@@ -1518,7 +1619,7 @@ impl App {
             chat.creating = false;
             chat.transcript.clear();
             chat.streaming_text.clear();
-            chat.reasoning_text.clear();
+            chat.thinking.clear();
             chat.scroll = 0;
             // Prompts queued against the old conversation don't carry over.
             chat.queue_running.clear();
@@ -1579,7 +1680,7 @@ impl App {
         if let Some(chat) = self.chats.get_mut(&employee) {
             chat.creating = true;
             chat.streaming_text.clear();
-            chat.reasoning_text.clear();
+            chat.thinking.clear();
         }
         self.team.set_status(employee, EmployeeStatus::Thinking);
 
@@ -1683,7 +1784,7 @@ impl App {
             chat.transcript
                 .push(TranscriptLine::new(TranscriptRole::User, text.clone()));
             chat.streaming_text.clear();
-            chat.reasoning_text.clear();
+            chat.thinking.clear();
             chat.scroll = 0;
             // Record history (dedup consecutive repeats), reset navigation.
             if chat.history.last() != Some(&text) {
@@ -1790,7 +1891,7 @@ impl App {
         };
         if let Some(chat) = self.chats.get_mut(&employee) {
             chat.streaming_text.clear();
-            chat.reasoning_text.clear();
+            chat.thinking.clear();
             chat.scroll = 0;
         }
         self.team.set_status(employee, EmployeeStatus::Thinking);
@@ -2082,7 +2183,7 @@ impl App {
         };
         chat.transcript = build_transcript(&messages);
         chat.streaming_text.clear();
-        chat.reasoning_text.clear();
+        chat.thinking.clear();
         chat.scroll = 0;
         // The hand-off "returned" (in some form), so stop tracking its deadline.
         chat.pending = None;
@@ -2123,15 +2224,16 @@ impl App {
         match event.event_type.as_str() {
             "session.reasoning.started" => {
                 self.team.set_status(employee, EmployeeStatus::Thinking);
+                let key = event.assistant_message_id().map(str::to_owned);
                 if let Some(chat) = self.chats.get_mut(&employee) {
-                    chat.reasoning_text.clear();
+                    chat.thinking.begin(key);
                 }
             }
             "session.reasoning.delta" => {
                 if let Some(delta) = event.text_delta()
                     && let Some(chat) = self.chats.get_mut(&employee)
                 {
-                    chat.reasoning_text.push_str(delta);
+                    chat.thinking.push(delta);
                 }
             }
             "session.execution.started" => self.team.set_status(employee, EmployeeStatus::Working),
@@ -3643,6 +3745,25 @@ impl App {
             .count()
     }
 
+    /// True while the orchestrator is thinking — the prompt band grows a row for
+    /// the indicator then.
+    pub fn orchestrator_is_thinking(&self) -> bool {
+        self.orchestrator_status() == Some(EmployeeStatus::Thinking)
+    }
+
+    /// The root's pinned thinking row for the prompt band, or `None` when it is
+    /// not thinking (or the `[ui] thinking` mode hides it).
+    pub fn orchestrator_thinking_line(&self, width: usize) -> Option<ratatui::text::Line<'static>> {
+        let orchestrator = self.orchestrator_index()?;
+        if self.team.employees().get(orchestrator)?.status != EmployeeStatus::Thinking {
+            return None;
+        }
+        // The root's thinking lives in its own chat, whether or not that chat is
+        // the one on screen — the prompt bar always speaks for the root.
+        let thinking = self.chats.get(&orchestrator).map(|chat| &chat.thinking);
+        self.thinking_line_for(thinking, width)
+    }
+
     /// The hand-offs still being drawn, oldest first.
     pub fn traces(&self) -> &[DelegationTrace] {
         &self.traces
@@ -3679,10 +3800,73 @@ impl App {
             .map_or("", |chat| chat.streaming_text.as_str())
     }
 
-    /// Live reasoning text for the current chat (surfaced dim while thinking).
-    pub fn reasoning_text(&self) -> &str {
-        self.current_chat()
-            .map_or("", |chat| chat.reasoning_text.as_str())
+    /// The current chat's live thinking buffer, when it has one.
+    pub fn thinking(&self) -> Option<&Thinking> {
+        self.current_chat().map(|chat| &chat.thinking)
+    }
+
+    /// The tail of the current chat's thinking — what the indicator line shows.
+    /// Empty when the employee is not thinking.
+    pub fn thinking_tail(&self) -> String {
+        self.thinking().map(Thinking::tail).unwrap_or_default()
+    }
+
+    /// The whole thinking buffer for the current chat (the `full` display mode).
+    pub fn thinking_text(&self) -> String {
+        self.thinking().map(Thinking::text).unwrap_or_default()
+    }
+
+    /// Whether the current chat has any thinking to show at all.
+    pub fn has_thinking(&self) -> bool {
+        self.thinking().is_some_and(|thinking| !thinking.is_empty())
+    }
+
+    /// The pinned "thinking" row for the current chat, or `None` when there is
+    /// nothing to draw.
+    ///
+    /// This is where the `[ui] thinking` setting is applied, so both surfaces that
+    /// show the indicator (the chat transcript and the roster prompt bar) obey it
+    /// from one place:
+    ///
+    /// - `indicator` (default) — one dim line: spinner, `thinking`, and the tail.
+    /// - `hidden` — nothing; the status glyph alone says the employee is busy.
+    /// - `full` — the whole deliberation, wrapped as a dim block.
+    pub fn thinking_line(&self, width: usize) -> Option<ratatui::text::Line<'static>> {
+        if self.chat_employee_status() != Some(EmployeeStatus::Thinking) {
+            return None;
+        }
+        self.thinking_line_for(self.thinking(), width)
+    }
+
+    /// The thinking row for a specific buffer, applying the `[ui] thinking` mode.
+    /// The one implementation both surfaces share.
+    fn thinking_line_for(
+        &self,
+        thinking: Option<&Thinking>,
+        width: usize,
+    ) -> Option<ratatui::text::Line<'static>> {
+        match self.config.ui.thinking {
+            crate::config::ThinkingMode::Hidden => None,
+            crate::config::ThinkingMode::Indicator => {
+                let tail = thinking.map(Thinking::tail).unwrap_or_default();
+                Some(crate::ui::thinking_line(self.frame, &tail, width))
+            }
+            crate::config::ThinkingMode::Full => {
+                let text = thinking.map(Thinking::text).unwrap_or_default();
+                let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if collapsed.is_empty() {
+                    return None;
+                }
+                // The full mode keeps the whole deliberation, so it wraps rather
+                // than truncating — it is what the user asked for.
+                Some(ratatui::text::Line::from(ratatui::text::Span::styled(
+                    collapsed,
+                    ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::DarkGray)
+                        .add_modifier(ratatui::style::Modifier::DIM),
+                )))
+            }
+        }
     }
 
     /// Transcript scroll offset: display lines scrolled up from the live tail

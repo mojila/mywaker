@@ -20,19 +20,26 @@ pub(crate) struct Regions {
     pub help: Rect,
 }
 
-/// The prompt band's height on the roster screen: two rows, one per line of the
-/// bordered bar (who you are talking to, then what you are typing).
+/// The prompt band's resting height on the roster screen: two rows, one per line
+/// of the bordered bar (who you are talking to, then what you are typing).
 pub(crate) const PROMPT_HEIGHT: u16 = 2;
+
+/// The prompt band's height while the orchestrator is thinking: the resting rows
+/// plus one for the thinking indicator.
+pub(crate) const PROMPT_THINKING_HEIGHT: u16 = 3;
 
 impl Regions {
     /// Split the whole terminal `area` into its bands for `mode`.
     ///
     /// The log is the band that gives way: the roster spends two of its rows on
     /// the prompt bar (and two fewer on the log), so `main` — the panels the user
-    /// reads — is exactly as tall as it was before the bar existed. Every other
-    /// screen keeps a six-row log and no prompt band.
-    pub(crate) fn of(area: Rect, mode: Mode) -> Self {
+    /// reads — is exactly as tall as it was before the bar existed. When
+    /// `thinking` is set the bar takes one more row, again from the log, for the
+    /// indicator; `main` never moves. Every other screen keeps a six-row log and
+    /// no prompt band.
+    pub(crate) fn of(area: Rect, mode: Mode, thinking: bool) -> Self {
         let (prompt_height, log_height) = match mode {
+            Mode::Roster if thinking => (PROMPT_THINKING_HEIGHT, 3),
             Mode::Roster => (PROMPT_HEIGHT, 4),
             Mode::Chat | Mode::Projects | Mode::Models => (0, 6),
         };
@@ -190,7 +197,7 @@ mod tests {
     /// sized against.
     #[test]
     fn regions_stack_the_frame() {
-        let regions = Regions::of(Rect::new(0, 0, 100, 40), Mode::Chat);
+        let regions = Regions::of(Rect::new(0, 0, 100, 40), Mode::Chat, false);
 
         assert_eq!(regions.title, Rect::new(0, 0, 100, 1));
         assert_eq!(regions.log, Rect::new(0, 33, 100, 6));
@@ -205,8 +212,8 @@ mod tests {
     #[test]
     fn the_roster_prompt_band_comes_out_of_the_log() {
         let area = Rect::new(0, 0, 100, 40);
-        let roster = Regions::of(area, Mode::Roster);
-        let chat = Regions::of(area, Mode::Chat);
+        let roster = Regions::of(area, Mode::Roster, false);
+        let chat = Regions::of(area, Mode::Chat, false);
 
         assert_eq!(roster.prompt.height, PROMPT_HEIGHT);
         assert_eq!(roster.prompt, Rect::new(0, 33, 100, PROMPT_HEIGHT));
@@ -239,7 +246,7 @@ mod tests {
     #[test]
     fn the_prompt_band_degrades_on_a_short_frame() {
         let area = Rect::new(0, 0, 40, 3);
-        let regions = Regions::of(area, Mode::Roster);
+        let regions = Regions::of(area, Mode::Roster, false);
 
         assert!(regions.prompt.height <= PROMPT_HEIGHT);
         assert_eq!(regions.help.bottom(), area.bottom(), "the hint bar stays");
