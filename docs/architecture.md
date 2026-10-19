@@ -298,6 +298,24 @@ recursive = true
 Employees without a `schedule` are manual/chat-only. Configuration is validated at
 load (serde `deny_unknown_fields`).
 
+### Cron field counts
+
+`scheduler::normalize` is the one place the expression's shape is decided, because
+the two parsers disagree about what field one means:
+
+| Fields | Meaning | Handling |
+|---|---|---|
+| 5 | `minute hour day-of-month month day-of-week` (standard crontab) | `"0 "` is prepended — seconds default to `0` |
+| 6 | `second minute hour day-of-month month day-of-week` | passed through unchanged |
+| 7 | six fields plus a trailing `year` | passed through unchanged |
+| any other | — | `None`; the schedule is skipped with a warning |
+
+This matters because `tokio-cron-scheduler` builds its parser with
+`croner::parser::Seconds::Required`: a raw 5-field expression does not parse at all,
+so before `normalize` existed every crontab-style schedule in the docs was silently
+dropped at startup. The 5-field form is the documented one; 6- and 7-field are
+accepted because the scheduler already speaks them.
+
 ---
 
 ## 7. Terminal safety

@@ -248,9 +248,15 @@ Employees can start on their own — no chat required. There are two triggers:
 
 ### Cron schedules
 
+`cron` takes the familiar 5-field crontab form — `minute hour day-of-month month
+day-of-week` — so `0 9 * * 1-5` means 09:00 Monday–Friday. Seconds are implicitly
+`0`. The scheduler parses seconds-first, so a 6-field expression (with a leading
+`second`) or a 7-field one (six fields plus a trailing `year`) also works and is
+used as written. Any other field count is skipped at startup with a warning.
+
 ```toml
 [[schedules]]
-cron = "0 9 * * 1-5"          # 09:00 Mon–Fri
+cron = "0 9 * * 1-5"          # 09:00 Mon–Fri (5-field: minutes first)
 employee = "planner"
 goal = "Summarize yesterday's commits into a morning briefing"
 

@@ -24,7 +24,12 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Schedule {
-    /// Cron expression (5-field, e.g. `0 9 * * 1-5`).
+    /// Cron expression. A 5-field crontab (`minute hour day-of-month month
+    /// day-of-week`, e.g. `0 9 * * 1-5`) is accepted; seconds default to `0`.
+    /// The scheduler itself parses seconds-first, so 6-field (`second minute
+    /// hour day-of-month month day-of-week`) and 7-field (plus a trailing
+    /// `year`) expressions are accepted too and passed through unchanged.
+    /// Anything else is skipped with a warning at startup.
     pub cron: String,
     /// The employee id to dispatch to.
     pub employee: String,
