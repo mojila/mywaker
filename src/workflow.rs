@@ -86,6 +86,44 @@ pub fn strip_directives(text: &str) -> String {
         .join("\n")
 }
 
+/// The brief handed to each worker in a parallel round.
+///
+/// A fan-out is not a delegation chain: every worker owes its *own* contribution
+/// and the aggregator owns the final answer. So the brief asks for the worker's
+/// part and forbids handing off. The app enforces the same rule structurally in
+/// `App::dispatch_delegations` — the brief is guidance for the model, not the
+/// only guard — but stating it up front keeps a well-behaved model from
+/// spawning side-chains it would only have to be stopped from.
+pub fn fanout_brief(goal: &str) -> String {
+    format!(
+        "Parallel round — contribute your own part of this goal, from your own role:\n\n\
+         GOAL: {goal}\n\n\
+         Reply with your contribution as plain text. Do NOT hand off this round: no \
+         @user, no @<teammate>, no @parallel. Another employee aggregates the team's \
+         contributions into the final answer."
+    )
+}
+
+/// A worker's contribution to a parallel round: its reply with directives
+/// stripped, or — when the reply is *only* a final directive — that directive's
+/// payload.
+///
+/// The second case matters because a worker told not to hand off may still
+/// answer `@user <answer>`; that answer is its contribution, not the team's
+/// result, and dropping it would lose the work entirely (the reply has no other
+/// text).
+pub fn contribution(text: &str) -> Option<String> {
+    let body = strip_directives(text);
+    if !body.is_empty() {
+        return Some(body);
+    }
+    parse_delegations(text)
+        .into_iter()
+        .filter(|delegation| is_final(&delegation.target))
+        .map(|delegation| delegation.message)
+        .find(|message| !message.is_empty())
+}
+
 /// The preamble injected into each employee's first prompt so every employee
 /// knows (a) who its teammates are, (b) the role boundaries that keep jobs with
 /// the right teammate, and (c) how to delegate to them.
@@ -191,6 +229,37 @@ mod tests {
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].target, "writer");
         assert_eq!(ds[0].message, "Draft it");
+    }
+
+    #[test]
+    fn fanout_brief_forbids_handing_off() {
+        let brief = fanout_brief("build the launch plan");
+        assert!(brief.contains("GOAL: build the launch plan"));
+        assert!(brief.contains("no @user"));
+        assert!(brief.contains("no @<teammate>"));
+        assert!(brief.contains("no @parallel"));
+    }
+
+    /// A worker's reply may be plain text, directives + text, or *only* a
+    /// directive. The first two contribute the text; the last contributes the
+    /// directive's payload rather than losing the work.
+    #[test]
+    fn contribution_keeps_plain_text_and_recovers_a_directive_only_reply() {
+        assert_eq!(
+            contribution("Market research findings.").as_deref(),
+            Some("Market research findings.")
+        );
+        assert_eq!(
+            contribution("Findings.\n@writer draft it").as_deref(),
+            Some("Findings.")
+        );
+        assert_eq!(
+            contribution("@user **Wake your team.**").as_deref(),
+            Some("**Wake your team.**")
+        );
+        // A bare non-final directive carries no deliverable.
+        assert_eq!(contribution("@writer"), None);
+        assert_eq!(contribution(""), None);
     }
 
     #[test]

@@ -54,11 +54,12 @@ Expected at the time of writing (`0.11.0` + the unreleased mouse feature):
 
 - `cargo test` — **190 pass, 0 fail, 3 ignored**: `src/lib.rs` 179,
   `tests/opencode_fake.rs` 5, `tests/render.rs` 5, `tests/watch_hook.rs` 1, plus
-  `src/main.rs` and doc-tests 0. The three ignored are the ones that need a live
-  OpenCode service (`opencode::tests::live_smoke_*`,
-  `tests/live_employees.rs` — the last also wants inference budget); they are run
-  by hand, not as part of a release. The counts grow every release — what has to
-  hold is **0 failed** and **only the live tests ignored**.
+  `src/main.rs` and doc-tests 0. The ignored live tests are the ones that need a
+  live OpenCode service (`opencode::tests::live_smoke_*`,
+  `tests/live_employees.rs`, `tests/live_fan_out.rs` — the last two also want
+  inference budget); they are run by hand, not as part of a release. The counts
+  grow every release — what has to hold is **0 failed** and **only the live tests
+  ignored**.
 - `cargo doc --no-deps` — **no warnings**. Three longstanding ones were cleared
   after `0.12.0`: a public `ensure_started` linked the private
   `START_READY_TIMEOUT`, and two `connect` links in `src/opencode/mod.rs` needed

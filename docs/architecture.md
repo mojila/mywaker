@@ -426,6 +426,18 @@ can hand the final result back to the user.
    synthesizes one deliverable and returns it with `@user`. The `/parallel
    <goal>` chat command drives the same fan-out directly from the user.
 
+   A round is not a delegation chain, and the app enforces that on both sides:
+   each worker is briefed with `workflow::fanout_brief` (contribute your own
+   part; no `@user`, no `@<teammate>`, no `@parallel`), and
+   `dispatch_delegations` does not dispatch a directive from an employee the
+   round is still awaiting (`fanouts_awaiting`). Without the guard a worker's
+   `@user` reached the user as a *partial* answer before the aggregator ran, and
+   its `@<teammate>` started a side-chain competing with the round. The
+   directive's text is not lost: `workflow::contribution` takes the reply's
+   plain text, or — when the reply was *only* a directive — that directive's
+   payload, so a worker that ignored the brief still has its work counted.
+   Once the round has aggregated, the employee delegates normally again.
+
 7. **Agent binding** — each employee's session is created with its OpenCode agent
    id (`Employee::agent_id()`, which defaults to the employee id, or an explicit
    `agent` override in `team.toml`). This is what gives an employee a

@@ -253,6 +253,135 @@ fn fan_out_aggregates_once_all_workers_finish() {
     assert!(outbox[0].contains("Draft copy for the launch"));
 }
 
+/// Workers are briefed as a parallel round, not handed the bare goal: the brief
+/// asks for their own contribution and forbids handing off.
+#[test]
+fn fan_out_briefs_each_worker_not_to_hand_off() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 3);
+    app.fan_out(3, "ship it".to_string());
+
+    for worker in [0usize, 1] {
+        let queued = app.chats[&worker].outbox.join("\n");
+        assert!(
+            queued.contains("Parallel round"),
+            "worker {worker}: {queued}"
+        );
+        assert!(queued.contains("GOAL: ship it"));
+        assert!(queued.contains("no @user"));
+    }
+}
+
+/// A worker's `@user` must not deliver a partial result to the user: the round
+/// collects the text and the aggregator owns the final answer. The worker's
+/// directives are logged, not dispatched.
+#[test]
+fn worker_final_directive_contributes_instead_of_delivering() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 3);
+    app.origin_of.insert(3, 3);
+    app.fan_out(3, "ship it".to_string());
+
+    let assistant = |id: &str, text: &str| -> Vec<SessionMessage> {
+        serde_json::from_value(serde_json::json!([
+            {"id": format!("{id}_u"), "time":{"created":1}, "text":"ship it","type":"user"},
+            {"id": id, "time":{"created":2,"completed":3},"type":"assistant",
+             "content":[{"type":"text","text": text}],"finish":"done"}
+        ]))
+        .unwrap()
+    };
+
+    // The writer answers with a final directive only — the failure mode seen
+    // live. It must not reach the origin chat, and its payload must be the
+    // contribution the aggregator receives.
+    app.handle_transcript(1, assistant("w", "@user **Wake your team.**"));
+    assert!(
+        !app.transcript()
+            .iter()
+            .any(|line| line.text.contains("Wake your team")),
+        "a worker's @user leaked into the origin chat"
+    );
+    assert_eq!(
+        app.delegation_count, 0,
+        "a worker's directive was dispatched"
+    );
+
+    // The round is still waiting on the researcher.
+    assert!(!app.fanouts.values().next().unwrap().aggregated);
+
+    app.handle_transcript(0, assistant("r", "Market research findings."));
+    let outbox = &app.chats[&2].outbox;
+    assert_eq!(outbox.len(), 1);
+    assert!(outbox[0].contains("Market research findings"));
+    assert!(
+        outbox[0].contains("**Wake your team.**"),
+        "the directive-only contribution was lost: {}",
+        outbox[0]
+    );
+}
+
+/// A worker's `@<teammate>` does not spawn a side-chain during a round; the
+/// target never receives the instruction, and the round still aggregates.
+#[test]
+fn worker_delegation_does_not_spawn_a_side_chain() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 3);
+    app.fan_out(3, "ship it".to_string());
+
+    let messages: Vec<SessionMessage> = serde_json::from_value(serde_json::json!([
+        {"id":"m1","time":{"created":1},"text":"ship it","type":"user"},
+        {"id":"m2","time":{"created":2,"completed":3},"type":"assistant",
+         "content":[{"type":"text","text":"Copy is prose.\n@writer write it"}],"finish":"done"}
+    ]))
+    .unwrap();
+
+    app.handle_transcript(1, messages);
+
+    assert_eq!(app.delegation_count, 0, "worker hand-off was dispatched");
+    // Nothing was relayed to anyone: the only outbox entries are the fan-out
+    // briefs every worker received, and no new one appeared.
+    for worker in [0usize, 1] {
+        assert_eq!(
+            app.chats[&worker].outbox.len(),
+            1,
+            "worker {worker} received an extra hand-off: {:?}",
+            app.chats[&worker].outbox
+        );
+    }
+    // The round recorded its text as a contribution.
+    let fanout = app.fanouts.values().next().unwrap();
+    assert_eq!(fanout.outputs[&1], "Copy is prose.");
+}
+
+/// Once a round is over, the same employee is an ordinary delegator again.
+#[test]
+fn a_finished_worker_may_delegate_again() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 3);
+    app.fan_out(3, "ship it".to_string());
+
+    // Both workers contribute, so the round aggregates and stops awaiting them.
+    let assistant = |id: &str, text: &str| -> Vec<SessionMessage> {
+        serde_json::from_value(serde_json::json!([
+            {"id": format!("{id}_u"), "time":{"created":1}, "text":"ship it","type":"user"},
+            {"id": id, "time":{"created":2,"completed":3},"type":"assistant",
+             "content":[{"type":"text","text": text}],"finish":"done"}
+        ]))
+        .unwrap()
+    };
+    app.handle_transcript(0, assistant("r", "Findings."));
+    app.handle_transcript(1, assistant("w", "Copy."));
+    assert!(app.fanouts.values().next().unwrap().aggregated);
+
+    // A later reply from that employee delegates normally again.
+    app.handle_transcript(
+        1,
+        assistant("w2", "Next task.\n@researcher gather more sources"),
+    );
+    assert_eq!(app.delegation_count, 1);
+    assert!(!app.chats[&0].outbox.is_empty());
+}
+
 /// A file watch fires the same autonomous path a cron schedule does: a task is
 /// recorded for the named employee, the roster reflects it, and the log names
 /// the watch hook as the trigger.

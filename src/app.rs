@@ -25,7 +25,8 @@ use crate::tui::Tui;
 use crate::ui;
 use crate::usage::{ProcessMetrics, Usage};
 use crate::workflow::{
-    Delegation, is_final, is_jev, is_parallel, parse_delegations, strip_directives, team_context,
+    self, Delegation, is_final, is_jev, is_parallel, parse_delegations, strip_directives,
+    team_context,
 };
 
 /// Maximum number of retained status-log lines.
@@ -2036,7 +2037,16 @@ impl App {
 
     /// Scan a freshly loaded transcript for finished assistant replies carrying
     /// hand-off directives and dispatch each one (once, by message id).
+    ///
+    /// A worker in an *active* parallel round is the one exception: its
+    /// directives are not dispatched. The round collects its contribution and
+    /// the aggregator owns the final answer, so a worker's `@user` must not
+    /// deliver a partial result to the user, and its `@<teammate>` must not
+    /// spawn a side-chain that competes with the round. The directive's own text
+    /// still reaches the aggregator through `note_fanout_result`.
     fn dispatch_delegations(&mut self, employee: usize, messages: &[SessionMessage]) {
+        let is_worker = !self.fanouts_awaiting(employee).is_empty();
+
         let new_delegations = {
             let Some(chat) = self.chats.get_mut(&employee) else {
                 return;
@@ -2053,6 +2063,16 @@ impl App {
             }
             found
         };
+
+        if is_worker && !new_delegations.is_empty() {
+            self.push_log(format!(
+                "fan-out: {} contributed instead of handing off",
+                self.team
+                    .name_at(employee)
+                    .unwrap_or_else(|| employee.to_string())
+            ));
+            return;
+        }
 
         for delegation in new_delegations {
             if self.delegation_count >= harness::DELEGATION_TOTAL_LIMIT {
@@ -2195,7 +2215,10 @@ impl App {
         );
 
         for worker in workers {
-            self.send_to_employee(worker, goal.clone());
+            // Each worker gets the parallel-round brief, not the bare goal, so it
+            // contributes its own part instead of handing off or answering as if
+            // it owned the final deliverable.
+            self.send_to_employee(worker, workflow::fanout_brief(&goal));
         }
     }
 
@@ -2207,6 +2230,9 @@ impl App {
         let affected = self.fanouts_awaiting(employee);
 
         if !affected.is_empty() {
+            // `contribution` keeps a worker's plain text and recovers the
+            // payload when the reply was *only* a directive — a worker that
+            // ignored the brief still has its work counted.
             let output = last_assistant_output(messages).unwrap_or_default();
             let output = if output.is_empty() {
                 // No text at all still counts as a contribution, so a fan-out
@@ -3441,13 +3467,16 @@ fn completion_status(messages: &[SessionMessage]) -> EmployeeStatus {
 
 /// The deliverable text of the last completed assistant reply — delegation
 /// directives stripped — used as a worker's contribution during aggregation.
+///
+/// [`workflow::contribution`] handles the reply whose only text *was* a final
+/// directive, so a worker that answered `@user <answer>` still contributes the
+/// answer instead of an empty string.
 fn last_assistant_output(messages: &[SessionMessage]) -> Option<String> {
     messages
         .iter()
         .rev()
         .find(|message| message.role() == "assistant" && !message.is_incomplete())
-        .map(|message| strip_directives(&message.display_text()))
-        .filter(|text| !text.is_empty())
+        .and_then(|message| workflow::contribution(&message.display_text()))
 }
 
 /// Run one scheduled-task attempt: create a session, prompt (with a retry or
