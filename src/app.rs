@@ -428,7 +428,12 @@ impl App {
         Self::with_team(config, tx, Team::starter())
     }
 
-    pub fn with_team(config: Config, tx: Sender<Message>, team: Team) -> Self {
+    pub fn with_team(config: Config, tx: Sender<Message>, mut team: Team) -> Self {
+        // The orchestrator is a roster invariant, not a starter-roster detail:
+        // every app has one, whether it was loaded, built by a fixture, or
+        // handed in by a test. In memory only — `ensure_orchestrator` never
+        // writes the file.
+        team.ensure_orchestrator();
         Self {
             config,
             tx,

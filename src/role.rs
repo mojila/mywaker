@@ -11,6 +11,7 @@
 /// A team workflow role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    Orchestrator,
     Planner,
     Researcher,
     Engineer,
@@ -20,11 +21,13 @@ pub enum Role {
 }
 
 impl Role {
-    /// Parse a role from an employee/agent id (`"planner"`, `"researcher"`,
-    /// `"coder"`/`"engineer"`/`"developer"`/`"software-engineer"`, `"writer"`,
-    /// `"reviewer"`). Unknown ids map to [`Role::General`].
+    /// Parse a role from an employee/agent id (`"orchestrator"`/`"lead"`/`"root"`,
+    /// `"planner"`, `"researcher"`, `"coder"`/`"engineer"`/`"developer"`/
+    /// `"software-engineer"`, `"writer"`, `"reviewer"`). Unknown ids map to
+    /// [`Role::General`].
     pub fn from_label(label: &str) -> Role {
         match label {
+            "orchestrator" | "lead" | "root" => Role::Orchestrator,
             "planner" => Role::Planner,
             "researcher" => Role::Researcher,
             "engineer" | "coder" | "developer" | "dev" | "software-engineer" => Role::Engineer,
@@ -37,6 +40,7 @@ impl Role {
     /// The canonical stage label for this role.
     pub fn label(self) -> &'static str {
         match self {
+            Role::Orchestrator => "orchestrator",
             Role::Planner => "planner",
             Role::Researcher => "researcher",
             Role::Engineer => "engineer",
@@ -46,16 +50,18 @@ impl Role {
         }
     }
 
-    /// Position in the canonical plan → research → implement → write → review
-    /// workflow, used to order the team as a grid in the UI.
+    /// Position in the canonical orchestrator → plan → research → implement →
+    /// write → review workflow, used to order the team as a grid in the UI. The
+    /// orchestrator sits at the root, above the pipeline stages it directs.
     pub fn order(self) -> u8 {
         match self {
-            Role::Planner => 0,
-            Role::Researcher => 1,
-            Role::Engineer => 2,
-            Role::Writer => 3,
-            Role::Reviewer => 4,
-            Role::General => 5,
+            Role::Orchestrator => 0,
+            Role::Planner => 1,
+            Role::Researcher => 2,
+            Role::Engineer => 3,
+            Role::Writer => 4,
+            Role::Reviewer => 5,
+            Role::General => 6,
         }
     }
 }
@@ -75,6 +81,16 @@ mod tests {
         assert_eq!(Role::from_label("bogus"), Role::General);
     }
 
+    /// The root employee is reachable by its id and by the two words people use
+    /// for it, so a hand-written roster can name it either way.
+    #[test]
+    fn recognizes_the_orchestrator_and_its_aliases() {
+        assert_eq!(Role::from_label("orchestrator"), Role::Orchestrator);
+        assert_eq!(Role::from_label("lead"), Role::Orchestrator);
+        assert_eq!(Role::from_label("root"), Role::Orchestrator);
+        assert_eq!(Role::Orchestrator.label(), "orchestrator");
+    }
+
     #[test]
     fn labels_round_trip() {
         assert_eq!(Role::Engineer.label(), "engineer");
@@ -84,6 +100,7 @@ mod tests {
 
     #[test]
     fn workflow_order_is_canonical() {
+        assert!(Role::Orchestrator.order() < Role::Planner.order());
         assert!(Role::Planner.order() < Role::Researcher.order());
         assert!(Role::Researcher.order() < Role::Engineer.order());
         assert!(Role::Engineer.order() < Role::Writer.order());

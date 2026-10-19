@@ -171,7 +171,14 @@ pub(crate) fn shape(area: Rect, count: usize) -> Shape {
     let header = Rect::new(area.x, area.y + title_height, area.width, header_height);
 
     let available = below_title.saturating_sub(header_height);
-    let visible_rows = rows_in(available);
+    // A zero-width panel draws no cards at all (see [`grid`]), so it also has no
+    // rows to scroll: `visible_rows` and `max_offset` must agree with what is
+    // drawn, or the wheel would accept notches over an empty viewport.
+    let visible_rows = if cell_width == 0 {
+        0
+    } else {
+        rows_in(available)
+    };
 
     Shape {
         cols,
@@ -605,6 +612,21 @@ mod tests {
             "nothing on screen means nowhere to scroll to"
         );
         assert!(grid(Rect::new(0, 1, 64, 6), &order(4), 0).cells.is_empty());
+    }
+
+    /// A zero-width panel draws no cards, so it must not offer scroll either: at
+    /// 40×24 the team panel collapses and the old geometry still reported ten
+    /// rows of scroll over an empty viewport.
+    #[test]
+    fn a_zero_width_panel_has_no_rows_and_no_scroll() {
+        let empty = shape(Rect::new(0, 1, 0, 23), 12);
+        assert_eq!(empty.cell_width, 0);
+        assert_eq!(empty.visible_rows, 0, "nothing is drawn, so nothing fits");
+        assert_eq!(empty.max_offset, 0, "an empty viewport cannot scroll");
+
+        let grid = grid(Rect::new(0, 1, 0, 23), &order(12), 5);
+        assert!(grid.cells.is_empty());
+        assert_eq!(grid.offset, 0, "the offset clamps back to the top");
     }
 
     /// A one-row panel keeps the title and nothing else; a zero-row panel draws

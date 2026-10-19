@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::opencode::{AgentInfo, DEFAULT_PROVIDER, ModelRef};
 use crate::role::Role;
 
+/// The stable id of the root employee. The orchestrator is always first in the
+/// roster and can't be removed; see [`Team::ensure_orchestrator`].
+pub const ORCHESTRATOR_ID: &str = "orchestrator";
+
 /// Lifecycle status of an employee; drives the robot avatar and roster UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmployeeStatus {
@@ -146,8 +150,12 @@ pub struct Team {
 
 impl Team {
     /// The built-in starter roster until project-defined agents are loaded.
+    ///
+    /// The orchestrator is first: it is the root of the delegation tree, so a
+    /// freshly hired team already has one and the roster never starts flat.
     pub fn starter() -> Self {
         let roster = [
+            (ORCHESTRATOR_ID, "Otto", "Orchestrator"),
             ("researcher", "Aria", "Research lead"),
             ("writer", "Bruno", "Writer"),
             ("reviewer", "Cleo", "Reviewer"),
@@ -159,6 +167,28 @@ impl Team {
                 .map(|(id, name, role)| Employee::new(id, name, role))
                 .collect(),
         }
+    }
+
+    /// Guarantee the roster has an orchestrator, inserting one at index 0 when it
+    /// is missing. Returns `true` when one was added.
+    ///
+    /// This is a **migration**, and it is deliberately in-memory only: a roster
+    /// loaded from an older `team.toml` gains the orchestrator for this run, and
+    /// the file is left exactly as the user wrote it. Nothing is written unless
+    /// the roster is saved for another reason (hiring, a model change), so
+    /// launching mywaker never rewrites a config the user did not ask it to
+    /// touch. Every launch re-applies it, so the invariant holds regardless.
+    ///
+    /// Called by [`Team::starter`] and [`Team::load_or_starter`], and again by
+    /// `App::with_team` so a fixture built from `Team::default()` also satisfies
+    /// it.
+    pub fn ensure_orchestrator(&mut self) -> bool {
+        if self.employee(ORCHESTRATOR_ID).is_some() {
+            return false;
+        }
+        self.employees
+            .insert(0, Employee::new(ORCHESTRATOR_ID, "Otto", "Orchestrator"));
+        true
     }
 
     #[allow(dead_code)]
@@ -250,7 +280,14 @@ impl Team {
     }
 
     /// Remove an employee by id; true if anything was removed.
+    ///
+    /// The orchestrator is the root of the delegation tree and is never removed:
+    /// the roster would be left with no one to route a goal to. Ask for it by id
+    /// and nothing happens (`false`), so a caller cannot accidentally delete it.
     pub fn remove_employee(&mut self, id: &str) -> bool {
+        if id == ORCHESTRATOR_ID {
+            return false;
+        }
         let before = self.employees.len();
         self.employees.retain(|e| e.id != id);
         self.employees.len() != before
@@ -308,11 +345,15 @@ impl Team {
         std::fs::write(path, text).wrap_err_with(|| format!("writing {}", path.display()))
     }
 
-    /// Load the persisted team, falling back to the starter roster.
+    /// Load the persisted team, falling back to the starter roster. A roster
+    /// written before the orchestrator existed gains one for this run (in memory
+    /// only — see [`Team::ensure_orchestrator`]).
     pub fn load_or_starter() -> Self {
-        Self::default_path()
+        let mut team = Self::default_path()
             .and_then(|path| Self::load(&path).ok())
-            .unwrap_or_else(Self::starter)
+            .unwrap_or_else(Self::starter);
+        team.ensure_orchestrator();
+        team
     }
 }
 
@@ -423,6 +464,12 @@ mod tests {
             team.employee("researcher").unwrap().workflow_role(),
             crate::role::Role::Researcher
         );
+        let orchestrator = team.employee(ORCHESTRATOR_ID).unwrap();
+        assert_eq!(
+            orchestrator.workflow_role(),
+            crate::role::Role::Orchestrator
+        );
+        assert_eq!(orchestrator.stage_label(), "ORCHESTRATOR");
 
         // An id with no known role is `General`, not an error.
         let stranger = Employee::new("qa", "Quinn", "Tester");
@@ -450,11 +497,11 @@ mod tests {
     #[test]
     fn add_remove_employee_rejects_duplicates() {
         let mut team = Team::starter();
-        assert_eq!(team.len(), 4);
+        assert_eq!(team.len(), 5);
 
         team.add_employee(Employee::new("qa", "Quinn", "Tester"))
             .unwrap();
-        assert_eq!(team.len(), 5);
+        assert_eq!(team.len(), 6);
         assert!(team.employee("qa").is_some());
 
         // Duplicate id is rejected.
@@ -465,7 +512,90 @@ mod tests {
 
         assert!(team.remove_employee("qa"));
         assert!(!team.remove_employee("qa"));
-        assert_eq!(team.len(), 4);
+        assert_eq!(team.len(), 5);
+    }
+
+    /// The root of the delegation tree is not removable: the roster would be
+    /// left with nobody to route a goal to.
+    #[test]
+    fn the_orchestrator_cannot_be_removed() {
+        let mut team = Team::starter();
+        assert!(!team.remove_employee(ORCHESTRATOR_ID));
+        assert!(team.employee(ORCHESTRATOR_ID).is_some());
+        assert_eq!(team.len(), 5);
+    }
+
+    /// The starter roster is rooted: the orchestrator is first, then the four
+    /// pipeline roles.
+    #[test]
+    fn starter_roster_is_rooted_at_the_orchestrator() {
+        let team = Team::starter();
+        let ids: Vec<&str> = team.employees().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                ORCHESTRATOR_ID,
+                "researcher",
+                "writer",
+                "reviewer",
+                "planner"
+            ]
+        );
+        assert_eq!(team.employees()[0].name, "Otto");
+        assert_eq!(
+            team.employees()[0].workflow_role(),
+            crate::role::Role::Orchestrator
+        );
+    }
+
+    /// Migration: a roster written before the orchestrator existed gains one at
+    /// index 0, and the file is not touched — `ensure_orchestrator` is in-memory
+    /// only, so launching never rewrites a config the user did not edit.
+    #[test]
+    fn ensure_orchestrator_migrates_a_flat_roster_in_memory() {
+        let mut team = Team::default();
+        team.add_employee(Employee::new("researcher", "Aria", "Research lead"))
+            .unwrap();
+        team.add_employee(Employee::new("writer", "Bruno", "Writer"))
+            .unwrap();
+        assert_eq!(team.len(), 2);
+
+        assert!(team.ensure_orchestrator(), "a flat roster gains one");
+        assert_eq!(team.len(), 3);
+        assert_eq!(team.employees()[0].id, ORCHESTRATOR_ID);
+        assert_eq!(team.employees()[1].id, "researcher");
+
+        // Idempotent: a roster that already has one is left alone.
+        assert!(!team.ensure_orchestrator());
+        assert_eq!(team.len(), 3);
+    }
+
+    /// The migration is not persisted: serializing the migrated team does not
+    /// invent a `team.toml` entry the user never wrote... but the orchestrator is
+    /// a real employee, so it *does* appear when the roster is saved for another
+    /// reason. What must not happen is `ensure_orchestrator` itself writing.
+    #[test]
+    fn ensure_orchestrator_does_not_write_the_roster_file() {
+        let dir = std::env::temp_dir().join(format!("mywaker-team-migrate-{}", std::process::id()));
+        let path = dir.join("team.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A legacy roster on disk, with no orchestrator.
+        let mut legacy = Team::default();
+        legacy
+            .add_employee(Employee::new("writer", "Bruno", "Writer"))
+            .unwrap();
+        legacy.save(&path).expect("write the legacy roster");
+        let before = std::fs::read_to_string(&path).expect("read it back");
+
+        let mut loaded = Team::load(&path).expect("load the legacy roster");
+        assert!(loaded.ensure_orchestrator());
+
+        let after = std::fs::read_to_string(&path).expect("read it back");
+        assert_eq!(before, after, "the migration must not rewrite the file");
+        assert!(!after.contains(ORCHESTRATOR_ID));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -489,13 +619,18 @@ mod tests {
     #[test]
     fn set_last_task_updates_and_clears() {
         let mut team = Team::starter();
-        team.set_last_task(1, Some("draft the intro".to_string()));
+        let writer = team
+            .employees()
+            .iter()
+            .position(|e| e.id == "writer")
+            .expect("the starter roster has a writer");
+        team.set_last_task(writer, Some("draft the intro".to_string()));
         assert_eq!(
             team.employee("writer").and_then(|e| e.last_task.as_deref()),
             Some("draft the intro")
         );
 
-        team.set_last_task(1, None);
+        team.set_last_task(writer, None);
         assert!(
             team.employee("writer")
                 .and_then(|e| e.last_task.as_deref())
@@ -520,7 +655,7 @@ mod tests {
         assert!(!text.contains("last_task"));
 
         let loaded: Team = toml::from_str(&text).unwrap();
-        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded.len(), 5);
         let writer = loaded.employee("writer").unwrap();
         assert_eq!(writer.skills, vec!["copywriting".to_string()]);
         assert_eq!(writer.model.as_deref(), Some("openai/gpt-6-luna-pro"));
@@ -564,8 +699,9 @@ mod tests {
     #[test]
     fn name_at_indexes_the_roster() {
         let team = Team::starter();
-        assert_eq!(team.name_at(0).as_deref(), Some("Aria"));
-        assert_eq!(team.name_at(1).as_deref(), Some("Bruno"));
+        assert_eq!(team.name_at(0).as_deref(), Some("Otto"));
+        assert_eq!(team.name_at(1).as_deref(), Some("Aria"));
+        assert_eq!(team.name_at(2).as_deref(), Some("Bruno"));
         assert_eq!(team.name_at(99), None); // out of range, not a panic
     }
 }

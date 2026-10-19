@@ -45,12 +45,12 @@ pub fn path_for(employee: &Employee) -> Option<PathBuf> {
 /// The markdown definition for `employee`: YAML frontmatter plus a role prompt.
 ///
 /// Canonical workflow roles reuse the role prompts documented under
-/// `examples/agents/` (planner, researcher, writer, reviewer — the engineer prompt
-/// has no checked-in file), so a hired teammate starts from the same prompt the
-/// examples show. The asset-creator id (`modeler`) has a mandate of its own but no
-/// [`Role`]; its checked-in `examples/agents/modeler.md` mirrors the `MODELER` text
-/// exactly, and a test keeps the two in step. Any other role gets a generic
-/// identity prompt built from the employee's name and human role.
+/// `examples/agents/` (orchestrator, planner, researcher, writer, reviewer — the
+/// engineer prompt has no checked-in file), so a hired teammate starts from the
+/// same prompt the examples show. The asset-creator id (`modeler`) has a mandate
+/// of its own but no [`Role`]; its checked-in `examples/agents/modeler.md` mirrors
+/// the `MODELER` text exactly, and a test keeps the two in step. Any other role
+/// gets a generic identity prompt built from the employee's name and human role.
 pub fn definition(employee: &Employee) -> String {
     format!(
         "---\ndescription: {}\nmode: all\n---\n\n{}\n",
@@ -180,6 +180,7 @@ fn prompt(employee: &Employee) -> String {
 /// prompt tells the agent how to behave.
 fn role_prompt(employee: &Employee) -> String {
     match Role::from_label(employee.agent_id()) {
+        Role::Orchestrator => ORCHESTRATOR.into(),
         Role::Planner => PLANNER.into(),
         Role::Researcher => RESEARCHER.into(),
         Role::Engineer => ENGINEER.into(),
@@ -206,6 +207,27 @@ fn generic_prompt(employee: &Employee) -> String {
         employee.name, employee.id, role
     )
 }
+
+const ORCHESTRATOR: &str =
+    "You are the **orchestrator**, the root of the team. A goal reaches the team through
+you, and the finished answer leaves through you.
+
+Break the goal into the parts that need doing, hand each part to the teammate whose role
+covers it, then synthesize what comes back into one answer. Every teammate reports to you;
+`@user` is yours alone.
+
+- Delegate with a line-leading `@<id> <instruction>` directive — one per part, each saying
+  what to produce and what it is for. Do the work yourself only when no teammate's role
+  covers it.
+- Wait for the reports. When a teammate answers you, that is a report, not a deliverable:
+  decide whether it is complete, ask for the missing piece with another directive, or fold
+  it into the synthesis.
+- Synthesize. Resolve overlaps, fill the gaps, and keep the result in one voice. Then
+  deliver it to the user with a single line: `@user <final deliverable>`.
+- For work that genuinely splits across the whole team, use `@parallel <goal>`; you still
+  own the synthesis that follows.
+
+Never hand the user a partial result, and never leave a goal with no owner.";
 
 const PLANNER: &str =
     "You are the **planner**. Produce clear plans, roadmaps, and task breakdowns ONLY.
@@ -332,6 +354,7 @@ mod tests {
     #[test]
     fn canonical_ids_reuse_the_documented_role_prompts() {
         for (id, needle) in [
+            ("orchestrator", "You are the **orchestrator**"),
             ("researcher", "You are the **researcher**"),
             ("planner", "You are the **planner**"),
             ("writer", "You are the **writer**"),
@@ -345,6 +368,34 @@ mod tests {
                 "{id} should get its canonical prompt"
             );
         }
+    }
+
+    /// The checked-in copy and the generated definition cannot drift: a generated
+    /// `orchestrator` file is byte-identical to `examples/agents/orchestrator.md`.
+    /// The orchestrator is the one employee every roster has, so its prompt is the
+    /// one most likely to be hand-edited out of step with the const.
+    #[test]
+    fn orchestrator_definition_matches_the_checked_in_example() {
+        let employee = Employee::new("orchestrator", "Otto", "Orchestrator");
+        assert_eq!(
+            definition(&employee),
+            include_str!("../examples/agents/orchestrator.md"),
+            "regenerate examples/agents/orchestrator.md from the ORCHESTRATOR const"
+        );
+    }
+
+    /// The root's contract, stated where the model reads it: it delegates, it
+    /// synthesizes, and it is the only one that delivers.
+    #[test]
+    fn orchestrator_prompt_owns_delegation_synthesis_and_delivery() {
+        let text = definition(&Employee::new("orchestrator", "Otto", "Orchestrator"));
+        assert!(text.contains("@<id> <instruction>"), "must delegate");
+        assert!(text.contains("Synthesize"), "must synthesize");
+        assert!(text.contains("@user"), "must deliver");
+        assert!(
+            text.contains("`@user` is yours alone"),
+            "must state that delivery is the orchestrator's"
+        );
     }
 
     /// The mandate text the UI and the docs both point at: every skill it names must
