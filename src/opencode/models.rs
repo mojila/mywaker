@@ -55,11 +55,15 @@ pub struct PermissionRule {
 }
 
 /// Envelope for list endpoints: `{ "location": {...}, "data": [...] }`.
+///
+/// `location` is optional because the session list (`GET /api/session`) omits it
+/// while the agent/model/MCP lists include it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListResponse<T> {
     #[allow(dead_code)]
-    pub location: Location,
+    #[serde(default)]
+    pub location: Option<Location>,
     pub data: Vec<T>,
 }
 
@@ -1065,6 +1069,29 @@ mod tests {
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].id, "build");
         assert_eq!(resp.data[0].name.as_deref(), Some("Build"));
+        assert_eq!(resp.location.as_ref().unwrap().directory, "/x");
+    }
+
+    #[test]
+    fn deserializes_session_list_without_location() {
+        // The live `GET /api/session` envelope omits the top-level `location`
+        // (it is present on /api/agent, /api/model, /api/mcp but not here).
+        let raw = r#"{"data":[
+            {"id":"ses_1","agent":"writer","model":{"id":"m","providerID":"p","variant":"default"},
+             "cost":0,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},
+             "time":{"created":1792511435072,"updated":1792511435072},
+             "location":{"directory":"/Users/ajilaksono/Projects/NUHS"}},
+            {"id":"ses_2","projectID":"p1","parentID":"ses_1","agent":"researcher",
+             "outcome":"interrupted","time":{"created":1792511356772,"updated":1792511429333,
+             "idle":1792511429335,"viewed":1792511429335},
+             "title":"Fact sheet","location":{"directory":"/Users/ajilaksono/Projects/NUHS"}}
+        ]}"#;
+        let resp: ListResponse<SessionInfo> = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.data[0].id, "ses_1");
+        assert_eq!(resp.data[0].agent.as_deref(), Some("writer"));
+        assert_eq!(resp.data[1].parent_id.as_deref(), Some("ses_1"));
+        assert_eq!(resp.data[1].title.as_deref(), Some("Fact sheet"));
     }
 
     #[test]

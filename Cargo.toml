@@ -43,7 +43,8 @@ opt-level = 0
 debug = true
 
 [profile.dev.package."*"]
-opt-level = 3
+opt-level = 0
+debug = false
 
 [dev-dependencies]
 axum = "0.8.9"
