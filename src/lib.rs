@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod app;
+pub mod clipboard;
 pub mod config;
 pub mod event;
 pub mod harness;
@@ -23,6 +24,7 @@ pub mod scheduler;
 pub mod skills;
 pub mod task;
 pub mod team;
+pub mod trace;
 pub mod tui;
 pub mod ui;
 pub mod usage;

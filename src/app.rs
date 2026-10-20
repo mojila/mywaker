@@ -289,6 +289,18 @@ const CHAT_COMMANDS: &[CommandOption] = &[
         description: "fan the goal out to the whole team",
         menu: false,
     },
+    CommandOption {
+        command: "/trace",
+        args: "[all]",
+        description: "show the orchestration trace",
+        menu: true,
+    },
+    CommandOption {
+        command: "/copy",
+        args: "[trace|all]",
+        description: "copy the error log (or a trace) to the clipboard",
+        menu: true,
+    },
 ];
 
 /// The `/help` body: every command in the table, each with the argument it takes
@@ -663,6 +675,19 @@ pub struct App {
     /// Recent hand-offs, for the delegation wires. Capped at
     /// [`App::TRACE_LIMIT`] and pruned by [`App::tick_traces`].
     traces: Vec<DelegationTrace>,
+    /// Orchestration traces: one per goal, carrying every hop it caused. This is
+    /// the *diagnostic* record (ids, offsets, routes) rather than the wires'
+    /// animation state, so a stuck chain can be named and pasted into a report.
+    orchestration: crate::trace::Traces,
+    /// The trace the current user-initiated work belongs to, when there is one.
+    /// A hop is recorded under this id so unrelated background traffic does not
+    /// attach itself to the goal the user is watching.
+    active_trace: Option<crate::trace::TraceId>,
+    /// A clipboard escape sequence waiting to be written to the terminal. The
+    /// renderer owns stdout, so a copy queues the bytes here and [`App::draw`]
+    /// flushes them right after the frame — writing mid-frame would race
+    /// ratatui's own cursor positioning.
+    pending_clipboard: Option<String>,
 }
 
 impl App {
@@ -737,6 +762,9 @@ impl App {
             started_at: Instant::now(),
             pulse: Pulse::default(),
             traces: Vec::new(),
+            orchestration: crate::trace::Traces::default(),
+            active_trace: None,
+            pending_clipboard: None,
         }
     }
 
@@ -791,6 +819,15 @@ impl App {
             ui::render(frame, self);
         })?;
         self.last_size = size;
+        // A copy requested during the last update hands its escape sequence to
+        // the terminal now, after the frame: the terminal must see the sequence
+        // outside ratatui's own cursor work, or the screen is left mispositioned.
+        if let Some(sequence) = self.pending_clipboard.take() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(sequence.as_bytes());
+            let _ = out.flush();
+        }
         Ok(())
     }
 
@@ -935,6 +972,18 @@ impl App {
         // `?` opens the help overlay from any non-chat screen.
         if key.code == KeyCode::Char('?') && self.mode != Mode::Chat {
             self.show_help = true;
+            return;
+        }
+
+        // `y` copies the error log from any screen: the log band is drawn on the
+        // roster too, so the failure a user is looking at must be copyable
+        // without first opening a chat. (`Ctrl-Y` is free here — `Ctrl-Y` is not
+        // bound to anything else, and a bare `y` would collide with the roster's
+        // single-letter shortcuts only if it were one, which it is not.)
+        if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let text = self.error_log_text();
+            let note = self.copy_to_clipboard("error-log", &text);
+            self.push_log(note);
             return;
         }
 
@@ -1626,6 +1675,9 @@ impl App {
         self.team.set_last_task(employee, Some(task_summary(&text)));
         self.origin_of.insert(employee, employee);
         self.depth_of.insert(employee, 0);
+        // A goal from the user starts a new trace: everything it causes is
+        // recorded under this id so the run can be named in a bug report.
+        self.begin_trace(&text, Some(employee));
         self.push_log(format!("◆ goal → orchestrator: {}", task_summary(&text)));
 
         if !self.can_prompt(employee) {
@@ -1882,6 +1934,10 @@ impl App {
         // origin is this very chat, so a later `@user` delivers back here.
         self.origin_of.insert(employee, employee);
         self.depth_of.insert(employee, 0);
+        // A fresh user prompt starts a new run, so it gets its own trace: the
+        // hops that follow are attributable to *this* prompt rather than to
+        // whatever the employee was doing before.
+        self.begin_trace(&text, Some(employee));
 
         // If the employee is mid-turn (or their session isn't ready yet), the
         // prompt is queued and sent once they're idle — see `pump_employee_queue`.
@@ -2125,7 +2181,107 @@ impl App {
             return true;
         }
 
+        // `/trace` — print the active trace, or `/trace all` for every retained
+        // one, into the transcript so it can be read (and copied) in place.
+        if rest == "trace" || rest == "trace all" {
+            self.push_command_line(format!("⚡ {text}"));
+            let text = if rest == "trace all" {
+                self.orchestration.describe_all()
+            } else {
+                match self
+                    .active_trace
+                    .and_then(|id| self.orchestration.describe(id))
+                {
+                    Some(block) => block,
+                    None => "no active trace — start a goal first".to_string(),
+                }
+            };
+            for line in text.lines() {
+                self.push_command_line(line.to_string());
+            }
+            return true;
+        }
+
+        // `/copy` — put the error log (or `/copy trace`) on the clipboard.
+        if rest == "copy" || rest == "copy trace" || rest == "copy all" {
+            let (label, text) = match rest {
+                "copy trace" => (
+                    "trace".to_string(),
+                    match self
+                        .active_trace
+                        .and_then(|id| self.orchestration.describe(id))
+                    {
+                        Some(block) => block,
+                        None => "no active trace — start a goal first".to_string(),
+                    },
+                ),
+                "copy all" => ("error-log".to_string(), self.full_log_text()),
+                _ => ("error-log".to_string(), self.error_log_text()),
+            };
+            let note = self.copy_to_clipboard(&label, &text);
+            // The note goes to the log *and* the transcript: the log band is
+            // drawn on every screen (so the roster shows it too), while the
+            // transcript keeps it next to the command that caused it.
+            self.push_log(note.clone());
+            self.push_command_line(note);
+            return true;
+        }
+
         false
+    }
+
+    /// The error lines currently in the log, oldest first, as one block.
+    ///
+    /// This is what "copy the error log" means: the failures, with their trace
+    /// ids, and nothing else. A user reporting a bug wants the red lines, not
+    /// every "connected to OpenCode" notice above them.
+    pub fn error_log_text(&self) -> String {
+        let lines: Vec<&str> = self
+            .log
+            .iter()
+            .filter(|line| line.error)
+            .map(|line| line.text.as_str())
+            .collect();
+        if lines.is_empty() {
+            return "no errors logged".to_string();
+        }
+        lines.join("\n")
+    }
+
+    /// The whole log, oldest first, as one block — the fuller context for a
+    /// report that needs the successes leading up to the failure.
+    pub fn full_log_text(&self) -> String {
+        self.log
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Hand `text` to the clipboard and report what happened, in one line the
+    /// caller can push into the transcript.
+    ///
+    /// The file is always written, OSC 52 is always queued for the terminal, and
+    /// a native tool is used when one exists. The returned line names the file
+    /// path, so even when the clipboards fail the text is reachable.
+    fn copy_to_clipboard(&mut self, label: &str, text: &str) -> String {
+        let file = crate::clipboard::write_file(label, text).ok();
+        let native = crate::clipboard::to_native(text);
+        // Queue the terminal route regardless: it is what makes the copy work
+        // over SSH, and it is harmless where the native tool already succeeded.
+        self.pending_clipboard = Some(crate::clipboard::osc52(text));
+
+        let mut note = if native {
+            format!("📋 copied {label} to the clipboard")
+        } else {
+            format!("📋 {label} sent to the terminal clipboard (OSC 52)")
+        };
+        if let Some(path) = &file {
+            note.push_str(&format!(" — also saved to {}", path.display()));
+        } else {
+            note.push_str(" — could not write the fallback file");
+        }
+        note
     }
 
     /// The employee a slash command acts on: the chat being viewed, else the
@@ -2358,6 +2514,12 @@ impl App {
                 .team
                 .name_at(employee)
                 .unwrap_or_else(|| employee.to_string());
+            self.trace_hop(
+                crate::trace::Kind::Failed,
+                Some(employee),
+                None,
+                format!("{name}: {reason}"),
+            );
             self.push_error_log(format!("{name} failed: {reason}"));
         }
 
@@ -2727,6 +2889,12 @@ impl App {
         }
         self.inherit_chain(source, target);
         self.trace(source, target, TraceKind::Out);
+        self.trace_hop(
+            crate::trace::Kind::Delegation,
+            Some(source),
+            Some(target),
+            task_summary(&delegation.message),
+        );
         self.send_to_employee(target, delegation.message, harness::PromptKind::Delegation);
     }
 
@@ -2778,6 +2946,12 @@ impl App {
         // right chat).
         self.inherit_chain(source, orchestrator);
         self.trace(source, orchestrator, TraceKind::Report);
+        self.trace_hop(
+            crate::trace::Kind::Report,
+            Some(source),
+            Some(orchestrator),
+            task_summary(&message),
+        );
         self.send_to_employee(
             orchestrator,
             format!("Report from {name}:\n\n{message}"),
@@ -2804,6 +2978,12 @@ impl App {
             .copied()
             .or(self.chat_employee)
             .unwrap_or(source);
+        self.trace_hop(
+            crate::trace::Kind::Deliver,
+            Some(source),
+            None,
+            task_summary(&message),
+        );
         self.push_to_chat(origin, TranscriptRole::Assistant, message);
         self.team.set_status(origin, EmployeeStatus::Done);
     }
@@ -3069,14 +3249,14 @@ impl App {
         // Bump the stored attempt count and re-send the original instruction. The
         // follow-on `flush_outbox` preserves `attempts` and prepends the retry
         // preamble, so a repeatedly-silent worker can't loop forever.
-        let instruction = match self
+        let (instruction, attempts) = match self
             .chats
             .get_mut(&employee)
             .and_then(|c| c.pending.as_mut())
         {
             Some(pending) => {
                 pending.bump();
-                pending.instruction.clone()
+                (pending.instruction.clone(), pending.attempts)
             }
             None => return,
         };
@@ -3085,6 +3265,12 @@ impl App {
             employee,
             TranscriptRole::Info,
             format!("🔁 retrying ({reason})"),
+        );
+        self.trace_hop(
+            crate::trace::Kind::Retry,
+            None,
+            Some(employee),
+            format!("attempt {attempts} of {} — {reason}", harness::MAX_ATTEMPTS),
         );
         self.send_to_employee(employee, instruction, harness::PromptKind::Retry);
     }
@@ -3099,6 +3285,12 @@ impl App {
         let note = harness::abandon_note(&name, Some(reason));
         self.push_to_chat(employee, TranscriptRole::Error, note.clone());
         self.team.set_status(employee, EmployeeStatus::Error);
+        self.trace_hop(
+            crate::trace::Kind::Abandon,
+            None,
+            Some(employee),
+            format!("{name}: {reason}"),
+        );
 
         // Surface the failure at the chain origin so the user sees it. A chain with
         // no origin recorded, or whose origin is this very employee, has no other
@@ -3147,6 +3339,12 @@ impl App {
         self.push_to_chat(
             target,
             TranscriptRole::Error,
+            format!("delivery failed: {reason}"),
+        );
+        self.trace_hop(
+            crate::trace::Kind::Failed,
+            None,
+            Some(target),
             format!("delivery failed: {reason}"),
         );
         self.push_error_log(format!("delivery to {name} failed: {reason}"));
@@ -3886,6 +4084,7 @@ impl App {
     }
 
     fn push_log(&mut self, line: String) {
+        let line = self.traced(line);
         self.log.push(LogLine::info(line));
         if self.log.len() > LOG_LIMIT {
             let excess = self.log.len() - LOG_LIMIT;
@@ -3897,11 +4096,87 @@ impl App {
     /// it in the error colour, and the log panel leads with the latest error
     /// rather than burying it behind the telemetry lines.
     fn push_error_log(&mut self, line: String) {
+        let line = self.traced(line);
         self.log.push(LogLine::error(line));
         if self.log.len() > LOG_LIMIT {
             let excess = self.log.len() - LOG_LIMIT;
             self.log.drain(..excess);
         }
+    }
+
+    /// Prefix `line` with the active trace id, when there is one.
+    ///
+    /// Every log line the orchestration produces is stamped, so a line pasted
+    /// out of the panel names the run it came from. Lines emitted before any
+    /// goal exists (connection chatter) stay unprefixed — there is no trace to
+    /// attribute them to, and inventing one would make the id meaningless.
+    fn traced(&self, line: String) -> String {
+        match self.active_trace {
+            Some(id) if self.orchestration.get(id).is_some() => format!("t{id} · {line}"),
+            _ => line,
+        }
+    }
+
+    // --- orchestration tracing ---
+
+    /// Start a trace for a new goal and make it the active one.
+    ///
+    /// The goal hop is recorded here rather than by the caller so it can never
+    /// be recorded twice: the trace's first span is the goal entering the team,
+    /// with the employee it was routed to.
+    fn begin_trace(&mut self, goal: &str, to: Option<usize>) -> crate::trace::TraceId {
+        let id = self.orchestration.begin(task_summary(goal));
+        self.active_trace = Some(id);
+        let label = to.and_then(|index| self.employee_label(index));
+        self.orchestration.record(
+            id,
+            crate::trace::Kind::Goal,
+            None,
+            label,
+            task_summary(goal),
+        );
+        id
+    }
+
+    /// Record one hop under the active trace, if there is one.
+    ///
+    /// An untraced hop (background traffic before any goal, or a chain whose
+    /// trace has aged out of the window) is silently skipped rather than
+    /// resurrecting a pruned record.
+    fn trace_hop(
+        &mut self,
+        kind: crate::trace::Kind,
+        from: Option<usize>,
+        to: Option<usize>,
+        detail: impl Into<String>,
+    ) {
+        let Some(id) = self.active_trace else {
+            return;
+        };
+        let from = from.and_then(|index| self.employee_label(index));
+        let to = to.and_then(|index| self.employee_label(index));
+        self.orchestration.record(id, kind, from, to, detail);
+    }
+
+    /// The name an employee is known by in a trace: its id (the thing a
+    /// delegation directive names), falling back to its index when the roster
+    /// has no such entry.
+    fn employee_label(&self, index: usize) -> Option<String> {
+        self.team
+            .employees()
+            .get(index)
+            .map(|employee| employee.id.clone())
+            .or_else(|| Some(index.to_string()))
+    }
+
+    /// The orchestration traces, for the UI and for tests.
+    pub fn orchestration(&self) -> &crate::trace::Traces {
+        &self.orchestration
+    }
+
+    /// The active trace id, when a goal is being traced.
+    pub fn active_trace(&self) -> Option<crate::trace::TraceId> {
+        self.active_trace
     }
 
     // --- accessors for the UI ---

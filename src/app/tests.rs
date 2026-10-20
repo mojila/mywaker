@@ -959,10 +959,10 @@ fn slash_menu_filters_navigates_and_completes() {
     let (mut app, _rx) = make_app();
     open_chat(&mut app, 0);
 
-    // Typing '/' opens the menu with all seven commands.
+    // Typing '/' opens the menu with every menu-visible command.
     app.handle_chat_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     let (options, selected) = app.command_options().expect("menu open");
-    assert_eq!(options.len(), 7);
+    assert_eq!(options.len(), 9);
     assert_eq!(options[selected].command, "/help");
 
     // Typing 's' narrows to the four '/s*' commands.
@@ -4637,4 +4637,253 @@ fn uptime_advances() {
     // A live app is under a minute old, which is exactly the `Ns` branch the
     // runtime row prints in a real session.
     assert!(app.uptime() < std::time::Duration::from_secs(60));
+}
+
+// --- orchestration tracing + copyable logs ---
+
+/// A goal typed on the roster starts a trace, and the trace names the goal and
+/// the root it went to.
+#[test]
+fn a_goal_starts_a_trace_naming_the_root() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+
+    app.input = "ship the release".to_string();
+    app.submit_goal();
+
+    let id = app.active_trace().expect("a goal opens a trace");
+    let trace = app.orchestration().get(id).expect("trace is retained");
+    assert_eq!(trace.goal, "ship the release");
+    let hop = trace.spans.first().expect("the goal is recorded");
+    assert_eq!(hop.kind, crate::trace::Kind::Goal);
+    assert_eq!(hop.to.as_deref(), Some("orchestrator"));
+    assert_eq!(root, employee(&app, "orchestrator"));
+}
+
+/// A delegation and the report it produces are both recorded, with the route
+/// between the two employees spelled out.
+#[test]
+fn a_delegation_and_its_report_are_traced_with_the_route() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, root);
+    app.input = "write the changelog".to_string();
+    app.submit_goal();
+
+    // The orchestrator hands the work to the writer.
+    app.dispatch_delegation(
+        root,
+        crate::workflow::Delegation {
+            target: "writer".into(),
+            message: "draft the changelog".into(),
+        },
+    );
+    // The writer reports back.
+    app.deliver_or_report(writer, "changelog drafted".to_string());
+
+    let id = app.active_trace().unwrap();
+    let trace = app.orchestration().get(id).unwrap();
+    let routes: Vec<String> = trace.spans.iter().map(|span| span.route()).collect();
+
+    assert!(
+        routes.contains(&"orchestrator → writer".to_string()),
+        "the delegation is traced: {routes:?}"
+    );
+    assert!(
+        routes.contains(&"writer → orchestrator".to_string()),
+        "the report is traced: {routes:?}"
+    );
+    assert!(
+        trace
+            .spans
+            .iter()
+            .any(|span| span.kind == crate::trace::Kind::Delegation),
+        "the hop is tagged as a delegation"
+    );
+}
+
+/// A failed turn is traced, so the failure is attributable to the run rather
+/// than floating free in the log.
+#[test]
+fn a_failed_delivery_is_traced() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+    app.input = "do the thing".to_string();
+    app.send_prompt();
+
+    app.handle_delivery_failed(writer, "connection reset".to_string());
+
+    let id = app.active_trace().unwrap();
+    let trace = app.orchestration().get(id).unwrap();
+    let failure = trace
+        .spans
+        .iter()
+        .find(|span| span.kind == crate::trace::Kind::Failed)
+        .expect("the failure is traced");
+    assert!(
+        failure.detail.contains("connection reset"),
+        "{:?}",
+        failure.detail
+    );
+}
+
+/// Every log line emitted while a trace is active carries its id, which is what
+/// lets a pasted line be tied back to the run.
+#[test]
+fn log_lines_are_prefixed_with_the_active_trace_id() {
+    let (mut app, _rx) = make_app();
+    app.input = "trace me".to_string();
+    app.submit_goal();
+
+    let id = app.active_trace().unwrap();
+    app.push_error_log("something broke".to_string());
+
+    let last = app.log().last().expect("a line was pushed");
+    assert_eq!(last.text, format!("t{id} · something broke"));
+    assert!(last.error, "it is still an error line");
+}
+
+/// Lines emitted before any goal have no trace to name, so they are left alone
+/// rather than given a fabricated id.
+#[test]
+fn log_lines_before_any_goal_have_no_trace_prefix() {
+    let (mut app, _rx) = make_app();
+    assert!(app.active_trace().is_none());
+    app.push_log("connecting".to_string());
+    assert_eq!(app.log().last().unwrap().text, "connecting");
+}
+
+/// The copyable text is the error lines, with their trace ids, and nothing else.
+#[test]
+fn the_copyable_error_log_holds_only_failures() {
+    let (mut app, _rx) = make_app();
+    app.input = "a goal".to_string();
+    app.submit_goal();
+
+    app.push_log("ordinary progress".to_string());
+    app.push_error_log("first failure".to_string());
+    app.push_error_log("second failure".to_string());
+
+    let text = app.error_log_text();
+    assert!(text.contains("first failure"), "{text}");
+    assert!(text.contains("second failure"), "{text}");
+    assert!(
+        !text.contains("ordinary progress"),
+        "progress lines are not errors: {text}"
+    );
+    // Two lines, one per failure.
+    assert_eq!(text.lines().count(), 2, "{text}");
+
+    // The full log keeps everything, for a report that wants context.
+    let full = app.full_log_text();
+    assert!(full.contains("ordinary progress"), "{full}");
+    assert!(full.contains("first failure"), "{full}");
+}
+
+#[test]
+fn an_empty_error_log_says_so() {
+    let (app, _rx) = make_app();
+    assert_eq!(app.error_log_text(), "no errors logged");
+}
+
+/// `/copy` queues an OSC 52 sequence for the terminal and reports where the
+/// text also landed, so a copy never happens silently.
+#[test]
+fn copy_queues_a_clipboard_sequence_and_reports_the_file() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    open_chat(&mut app, root);
+    app.push_error_log("boom".to_string());
+
+    assert!(app.pending_clipboard.is_none());
+    assert!(app.dispatch_chat_command("/copy"));
+
+    let sequence = app.pending_clipboard.as_ref().expect("a copy was queued");
+    assert!(sequence.starts_with("\x1b]52;c;"), "{sequence:?}");
+    // The transcript reports what happened, including the fallback path.
+    let transcript = app.transcript();
+    let note = transcript.last().expect("a note was pushed");
+    assert!(note.text.contains("error-log"), "{}", note.text);
+    // …and so does the log, which is drawn on every screen.
+    assert!(
+        app.log().iter().any(|line| line.contains("error-log")),
+        "the log reports the copy too"
+    );
+}
+
+/// `/trace` prints the active trace into the transcript; with no goal it says
+/// so instead of printing an empty block.
+#[test]
+fn the_trace_command_prints_the_active_trace() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    open_chat(&mut app, root);
+
+    assert!(app.dispatch_chat_command("/trace"));
+    let text: String = app
+        .transcript()
+        .iter()
+        .map(|line| line.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("no active trace"), "{text}");
+
+    app.input = "a real goal".to_string();
+    app.submit_goal();
+    assert!(app.dispatch_chat_command("/trace"));
+
+    let id = app.active_trace().unwrap();
+    let text: String = app
+        .transcript()
+        .iter()
+        .map(|line| line.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains(&format!("trace t{id}")), "{text}");
+    assert!(text.contains("goal: a real goal"), "{text}");
+}
+
+/// `/copy trace` copies the trace block rather than the error log.
+#[test]
+fn copying_the_trace_targets_the_trace_block() {
+    let (mut app, _rx) = make_app();
+    let root = employee(&app, "orchestrator");
+    open_chat(&mut app, root);
+    app.input = "traced goal".to_string();
+    app.submit_goal();
+
+    assert!(app.dispatch_chat_command("/copy trace"));
+    assert!(app.pending_clipboard.is_some());
+
+    let text: String = app
+        .transcript()
+        .iter()
+        .map(|line| line.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("trace t"), "{text}");
+    assert!(text.contains("traced goal"), "{text}");
+}
+
+/// Ctrl-Y copies the error log from the roster, where the log band is drawn —
+/// the failure the user is looking at must be copyable without opening a chat.
+#[test]
+fn ctrl_y_copies_the_error_log_from_the_roster() {
+    let (mut app, _rx) = make_app();
+    app.mode = Mode::Roster;
+    app.push_error_log("roster failure".to_string());
+
+    app.update(Message::Key(KeyEvent::new(
+        KeyCode::Char('y'),
+        KeyModifiers::CONTROL,
+    )));
+
+    assert!(
+        app.pending_clipboard.is_some(),
+        "the copy queued a clipboard sequence"
+    );
+    let last = app.log().last().unwrap();
+    assert!(last.text.contains("error-log"), "{}", last.text);
 }
