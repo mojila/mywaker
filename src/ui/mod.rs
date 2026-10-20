@@ -227,10 +227,49 @@ fn render_main(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_log(frame: &mut Frame, app: &App, area: Rect) {
-    let mut text: Vec<Line> = vec![stream_stats(app), telemetry_stats(app)];
+    // The band's content rows (the two border rows are not content).
+    let content_rows = area.height.saturating_sub(2) as usize;
+    let mut text: Vec<Line> = Vec::with_capacity(content_rows.max(2));
 
-    for line in app.log().iter().rev().take(3) {
-        text.push(Line::from(Span::styled(line.clone(), Color::DarkGray)));
+    // The latest error leads the panel: a failed turn must never be invisible
+    // because the roster's log has room for little else, so it is surfaced here
+    // in the error colour rather than buried in the dim progress lines.
+    let latest_error = app.log().iter().rev().find(|line| line.error).cloned();
+    if let Some(error) = &latest_error {
+        text.push(Line::from(vec![
+            Span::styled(
+                "✕ ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(error.text.clone(), Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    // Telemetry follows; it is dropped off the bottom on a short band once the
+    // error and the recent messages have filled it.
+    text.push(stream_stats(app));
+    text.push(telemetry_stats(app));
+
+    // Then the remaining recent log lines, newest first, errors in red. The
+    // first error this sweep meets is the latest one — already drawn at the top —
+    // so it is skipped rather than drawn twice.
+    let mut budget = content_rows.saturating_sub(text.len());
+    let mut skipped_error = false;
+    for line in app.log().iter().rev() {
+        if budget == 0 {
+            break;
+        }
+        if !skipped_error && line.error {
+            skipped_error = true;
+            continue;
+        }
+        let style = if line.error {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        text.push(Line::from(Span::styled(line.text.clone(), style)));
+        budget -= 1;
     }
 
     let block = Block::default()

@@ -15,7 +15,8 @@ use crate::harness::{self, PendingDelivery};
 use crate::jev::{FALLBACK_VERDICT, JevClient, answer_field_or_default, answer_text_or_default};
 use crate::message::Message;
 use crate::opencode::{
-    AgentInfo, Event, ModelRef, OpenCode, ProviderModel, ServerInfo, SessionMessage, pick_provider,
+    AgentInfo, Event, MessageError, ModelRef, OpenCode, ProviderModel, ServerInfo, SessionMessage,
+    pick_provider,
 };
 use crate::persistence::Store;
 use crate::projects::{self, Project};
@@ -28,8 +29,45 @@ use crate::workflow::{
     self, Delegation, is_final, is_jev, is_parallel, parse_delegations, strip_directives,
 };
 
-/// Maximum number of retained status-log lines.
-const LOG_LIMIT: usize = 64;
+/// Maximum number of retained status-log lines. Deliberately generous: the log
+/// panel reads back more than the oldest few lines it draws, and a long session
+/// of autonomous work (cron/watches) otherwise pushes failures out of reach.
+const LOG_LIMIT: usize = 256;
+
+/// One retained status-log line, tagged so the panel can render failures in the
+/// error colour instead of the same dim grey as ordinary progress.
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub text: String,
+    pub error: bool,
+}
+
+impl LogLine {
+    fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            error: false,
+        }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            error: true,
+        }
+    }
+}
+
+/// The log lines read as plain strings (`.contains`, `.strip_prefix`, …), so the
+/// renderer and the tests address the text the same way whether a line is an
+/// error or ordinary progress.
+impl std::ops::Deref for LogLine {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
 
 /// The graceful-shutdown overlay lingers for a few animation frames so the
 /// user sees the app shut down cleanly rather than the screen vanishing.
@@ -386,7 +424,7 @@ impl TraceKind {
 /// One hand-off, drawn as a packet travelling the wires between two employees.
 ///
 /// A trace is a *display* record: it is created when a hand-off is dispatched and
-/// forgotten a moment later ([`App::tick_traces`]), so the UI can animate work
+/// forgotten a moment later (`App::tick_traces`), so the UI can animate work
 /// moving through the tree without keeping a history nobody asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegationTrace {
@@ -531,7 +569,7 @@ pub struct App {
     connection_error: Option<String>,
     event_count: u64,
     last_event: Option<String>,
-    log: Vec<String>,
+    log: Vec<LogLine>,
     frame: u64,
     /// True once quit is requested: the app renders a brief "shutting down"
     /// overlay (with a spinner), flushes state, then exits.
@@ -655,7 +693,7 @@ impl App {
             connection_error: None,
             event_count: 0,
             last_event: None,
-            log: vec!["connecting to OpenCode…".into()],
+            log: vec![LogLine::info("connecting to OpenCode…")],
             frame: 0,
             shutting_down: false,
             shutdown_frame: 0,
@@ -804,7 +842,7 @@ impl App {
             }
             Message::ConnectionFailed(reason) => {
                 self.connection_error = Some(reason.clone());
-                self.push_log(format!("OpenCode unavailable: {reason}"));
+                self.push_error_log(format!("OpenCode unavailable: {reason}"));
             }
             Message::AgentsLoaded(agents) => {
                 self.push_log(format!("{} agents available", agents.len()));
@@ -858,6 +896,7 @@ impl App {
                 self.note_task_attempt(task_id, session_id);
             }
             Message::Log(line) => self.push_log(line),
+            Message::LogError(line) => self.push_error_log(line),
             Message::Quit => self.initiate_shutdown(),
         }
     }
@@ -1633,7 +1672,7 @@ impl App {
             tokio::spawn(async move {
                 if let Err(err) = client.interrupt(&session_id).await {
                     let _ = tx
-                        .send(Message::Log(format!("interrupt failed: {err}")))
+                        .send(Message::LogError(format!("interrupt failed: {err}")))
                         .await;
                 }
             });
@@ -1783,7 +1822,7 @@ impl App {
             }
             Err(err) => {
                 self.team.set_status(employee, EmployeeStatus::Error);
-                self.push_log(format!("session failed: {err}"));
+                self.push_error_log(format!("session failed: {err}"));
                 if let Some(chat) = self.chats.get_mut(&employee) {
                     chat.creating = false;
                     chat.pending = None;
@@ -2298,6 +2337,20 @@ impl App {
         let final_status = completion_status(&messages);
         self.team.set_status(employee, final_status);
 
+        // A failed turn is never silent: the roster prompt's goal has no chat
+        // transcript on screen, so the log is the only place the user can read
+        // *why* it failed. The reason is the provider's error (type · message ·
+        // status) when the transcript carries one.
+        if final_status == EmployeeStatus::Error
+            && let Some(reason) = failed_turn_reason(&messages)
+        {
+            let name = self
+                .team
+                .name_at(employee)
+                .unwrap_or_else(|| employee.to_string());
+            self.push_error_log(format!("{name} failed: {reason}"));
+        }
+
         // Hand off any directives in the freshly completed assistant reply.
         let before = self.delegation_count;
         self.dispatch_delegations(employee, &messages);
@@ -2403,9 +2456,14 @@ impl App {
             }
             "session.execution.failed" | "session.step.failed" => {
                 self.team.set_status(employee, EmployeeStatus::Error);
-                if let Some(reason) = event.error_message() {
-                    self.push_log(reason.to_string());
-                }
+                // Always log *something*: a failed event without an embedded
+                // `data.error.message` still names the event that failed, so the
+                // user is never left staring at a silent red card.
+                let reason = event
+                    .error_message()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{} (no error detail)", event.event_type));
+                self.push_error_log(reason);
                 self.load_transcript(employee, session_id.to_string());
             }
             _ => {}
@@ -2433,7 +2491,7 @@ impl App {
                 }
                 Err(err) => {
                     let _ = tx
-                        .send(Message::Log(format!("transcript load failed: {err}")))
+                        .send(Message::LogError(format!("transcript load failed: {err}")))
                         .await;
                 }
             }
@@ -3080,7 +3138,7 @@ impl App {
             TranscriptRole::Error,
             format!("delivery failed: {reason}"),
         );
-        self.push_log(format!("delivery to {name} failed: {reason}"));
+        self.push_error_log(format!("delivery to {name} failed: {reason}"));
 
         // Retry only autonomous (delegated) hand-offs, which carry a pending
         // delivery; a direct user prompt just surfaces the error for a manual retry.
@@ -3496,7 +3554,7 @@ impl App {
             return;
         };
         if let Err(err) = self.store.save(path) {
-            self.push_log(format!("store save failed: {err}"));
+            self.push_error_log(format!("store save failed: {err}"));
         }
     }
 
@@ -3527,7 +3585,7 @@ impl App {
                 }
                 Err(err) => {
                     let _ = tx
-                        .send(Message::Log(format!("model list failed: {err}")))
+                        .send(Message::LogError(format!("model list failed: {err}")))
                         .await;
                 }
             }
@@ -3606,7 +3664,7 @@ impl App {
         if let Some(path) = Team::default_path()
             && let Err(err) = self.team.save(&path)
         {
-            self.push_log(format!("could not save team: {err}"));
+            self.push_error_log(format!("could not save team: {err}"));
         }
         self.mode = Mode::Roster;
     }
@@ -3632,7 +3690,7 @@ impl App {
             && let Some(path) = Team::default_path()
             && let Err(err) = self.team.save(&path)
         {
-            self.push_log(format!("could not save team: {err}"));
+            self.push_error_log(format!("could not save team: {err}"));
         }
     }
 
@@ -3817,7 +3875,18 @@ impl App {
     }
 
     fn push_log(&mut self, line: String) {
-        self.log.push(line);
+        self.log.push(LogLine::info(line));
+        if self.log.len() > LOG_LIMIT {
+            let excess = self.log.len() - LOG_LIMIT;
+            self.log.drain(..excess);
+        }
+    }
+
+    /// [`Self::push_log`] for a failure: the line is tagged so the panel renders
+    /// it in the error colour, and the log panel leads with the latest error
+    /// rather than burying it behind the telemetry lines.
+    fn push_error_log(&mut self, line: String) {
+        self.log.push(LogLine::error(line));
         if self.log.len() > LOG_LIMIT {
             let excess = self.log.len() - LOG_LIMIT;
             self.log.drain(..excess);
@@ -4145,7 +4214,7 @@ impl App {
         self.last_event.as_deref()
     }
 
-    pub fn log(&self) -> &[String] {
+    pub fn log(&self) -> &[LogLine] {
         &self.log
     }
 
@@ -4321,6 +4390,42 @@ fn completion_status(messages: &[SessionMessage]) -> EmployeeStatus {
             }
         })
         .unwrap_or(EmployeeStatus::Idle)
+}
+
+/// The failure reason of a completed turn's transcript, for the log. `None` when
+/// the last assistant/idle message did not fail. The reason is the provider's
+/// error rendered with the detail a debugger needs — type, message, and HTTP
+/// status — or the `finish` marker when there is no structured error.
+fn failed_turn_reason(messages: &[SessionMessage]) -> Option<String> {
+    let failed = messages.iter().rev().find(|m| {
+        (m.role() == "assistant" || m.role() == "idle")
+            && (m.error.is_some() || m.finish.as_deref() == Some("error"))
+    })?;
+    Some(match &failed.error {
+        Some(error) => format_message_error(error),
+        None => format!("finish: {}", failed.finish.as_deref().unwrap_or("error")),
+    })
+}
+
+/// A [`MessageError`] formatted with every field the provider reported, so a
+/// failure in the log names the type, the message, and the status rather than
+/// collapsing them into one vague line.
+fn format_message_error(error: &MessageError) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(error_type) = error.error_type.as_deref().filter(|t| !t.is_empty()) {
+        parts.push(error_type.to_string());
+    }
+    if let Some(message) = error.message.as_deref().filter(|m| !m.is_empty()) {
+        parts.push(message.to_string());
+    }
+    if let Some(status) = error.status {
+        parts.push(format!("status {status}"));
+    }
+    if parts.is_empty() {
+        "execution failed".to_string()
+    } else {
+        parts.join(" · ")
+    }
 }
 
 /// The deliverable text of the last completed assistant reply — delegation

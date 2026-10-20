@@ -67,6 +67,8 @@ pub enum Message {
     },
     /// A free-form line for the status log.
     Log(String),
+    /// A free-form error line for the status log, rendered in the error colour.
+    LogError(String),
     /// Quit the application.
     Quit,
 }
