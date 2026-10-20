@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem as WidgetListItem, ListState, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -202,15 +202,20 @@ fn role_mapping(role: TranscriptRole, name: Option<&str>) -> (String, Style, Sty
 fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_code = false;
+    let mut list_indent: Option<usize> = None;
+    let marker_style = Style::default().fg(Color::Cyan);
 
     for raw in text.lines() {
         let trimmed = raw.trim_start();
+
+        // Fence toggle ends any open list run.
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code = !in_code;
             out.push(Line::from(Span::styled(
                 raw.to_string(),
                 Style::default().fg(Color::DarkGray),
             )));
+            list_indent = None;
             continue;
         }
         if in_code {
@@ -222,6 +227,12 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
             }
             continue;
         }
+        // A blank line ends a list item/run.
+        if raw.trim().is_empty() {
+            out.push(Line::default());
+            list_indent = None;
+            continue;
+        }
         if let Some(heading) = heading_text(raw) {
             for seg in wrap_text(heading, width) {
                 out.push(Line::from(Span::styled(
@@ -229,25 +240,109 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
                     base.add_modifier(Modifier::BOLD),
                 )));
             }
+            list_indent = None;
             continue;
         }
-        let (style, body) = if raw.trim_start().starts_with('>') {
-            (
-                base.add_modifier(Modifier::DIM),
-                raw.trim_start()
-                    .strip_prefix('>')
-                    .unwrap_or(raw)
-                    .trim_start(),
-            )
-        } else {
-            (base, raw)
-        };
-        for seg in wrap_text(body, width) {
-            out.push(inline_line(&seg, style));
+        // A list item: hang the marker, align wrapped continuations under the
+        // first word, and remember the indent for subsequent prose lines.
+        if let Some(item) = list_item(trimmed) {
+            let indent = item.width;
+            let content_width = width.saturating_sub(indent);
+            let segments = wrap_text(item.content, content_width);
+            if let Some((first, rest)) = segments.split_first() {
+                let mut spans = vec![Span::styled(item.marker.clone(), marker_style)];
+                spans.extend(inline_line(first, base).spans);
+                out.push(Line::from(spans));
+                for seg in rest {
+                    let mut spans = vec![Span::raw(" ".repeat(indent))];
+                    spans.extend(inline_line(seg, base).spans);
+                    out.push(Line::from(spans));
+                }
+            } else {
+                out.push(Line::from(Span::styled(item.marker, marker_style)));
+            }
+            list_indent = Some(indent);
+            continue;
+        }
+        // Blockquotes are never list items.
+        if trimmed.starts_with('>') {
+            let body = trimmed.strip_prefix('>').unwrap_or(trimmed).trim_start();
+            for seg in wrap_text(body, width) {
+                out.push(inline_line(&seg, base.add_modifier(Modifier::DIM)));
+            }
+            list_indent = None;
+            continue;
+        }
+        // A non-empty prose line immediately after a list item is a continuation
+        // of that item, kept at the item indent.
+        if let Some(indent) = list_indent {
+            for seg in wrap_text(raw, width.saturating_sub(indent)) {
+                let mut spans = vec![Span::raw(" ".repeat(indent))];
+                spans.extend(inline_line(&seg, base).spans);
+                out.push(Line::from(spans));
+            }
+            continue;
+        }
+        // Plain prose.
+        for seg in wrap_text(raw, width) {
+            out.push(inline_line(&seg, base));
         }
     }
 
     out
+}
+
+/// A single Markdown list item: the rendered marker (with one trailing space)
+/// plus the text that follows it.
+struct ListItem<'a> {
+    marker: String,
+    content: &'a str,
+    width: usize,
+}
+
+/// Detect a Markdown list item on an already-left-trimmed line, or `None`.
+///
+/// Unordered items start with `- `, `* `, or `+ `; ordered items start with one
+/// or more digits then `. ` or `) `. The marker must be followed by whitespace,
+/// so `---`, `***`, `snake_case`, and URLs are never misread as lists.
+fn list_item(trimmed: &str) -> Option<ListItem<'_>> {
+    let bytes = trimmed.as_bytes();
+    let first = *bytes.first()?;
+
+    // Unordered: `-`, `*`, or `+` followed by whitespace.
+    if matches!(first, b'-' | b'*' | b'+') {
+        let next = trimmed[1..].chars().next();
+        if !next.is_some_and(|c| c.is_whitespace()) {
+            return None;
+        }
+        let marker = format!("{} ", first as char);
+        return Some(ListItem {
+            width: marker.width(),
+            marker,
+            content: trimmed[1..].trim_start(),
+        });
+    }
+
+    // Ordered: one or more digits followed by `.` or `)`, then whitespace.
+    if first.is_ascii_digit() {
+        let digit_len = bytes.iter().take_while(|&&b| b.is_ascii_digit()).count();
+        let delim = bytes.get(digit_len).copied()?;
+        if !matches!(delim, b'.' | b')') {
+            return None;
+        }
+        let after = trimmed.get(digit_len + 1..)?;
+        if !after.chars().next().is_some_and(|c| c.is_whitespace()) {
+            return None;
+        }
+        let marker = format!("{}{} ", &trimmed[..digit_len], delim as char);
+        return Some(ListItem {
+            width: marker.width(),
+            marker,
+            content: after.trim_start(),
+        });
+    }
+
+    None
 }
 
 /// The text of a Markdown heading (`# ` … `###### `), or `None`.
@@ -538,10 +633,10 @@ fn render_command_menu(frame: &mut Frame, app: &App, area: Rect) {
         height,
     };
 
-    let items: Vec<ListItem> = options
+    let items: Vec<WidgetListItem> = options
         .iter()
         .map(|opt| {
-            ListItem::new(Line::from(vec![
+            WidgetListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{:<12}", opt.command),
                     Style::default()
@@ -769,5 +864,128 @@ mod tests {
         let decomposed = "e\u{301}e\u{301}e\u{301}";
         let out = chunk_lines(decomposed, 2);
         assert_eq!(out, vec!["e\u{301}e\u{301}", "e\u{301}"]);
+    }
+
+    fn span_texts(line: &Line) -> Vec<String> {
+        line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn list_item_parses_bullets_and_numbers() {
+        let item = list_item("- first").unwrap();
+        assert_eq!(item.marker, "- ");
+        assert_eq!(item.content, "first");
+        assert_eq!(item.width, 2);
+
+        let item = list_item("* star").unwrap();
+        assert_eq!(item.marker, "* ");
+        assert_eq!(item.content, "star");
+
+        let item = list_item("+ plus").unwrap();
+        assert_eq!(item.marker, "+ ");
+
+        let item = list_item("10. step").unwrap();
+        assert_eq!(item.marker, "10. ");
+        assert_eq!(item.content, "step");
+        assert_eq!(item.width, 4);
+
+        let item = list_item("7) step").unwrap();
+        assert_eq!(item.marker, "7) ");
+        assert_eq!(item.width, 3);
+    }
+
+    #[test]
+    fn list_item_rejects_rules_and_prose_constructs() {
+        for input in [
+            "---",
+            "***",
+            "*emphasis*",
+            "snake_case",
+            "https://example.com",
+        ] {
+            assert!(
+                list_item(input).is_none(),
+                "misread {input:?} as a list item"
+            );
+        }
+        // Ordered markers need trailing whitespace after the delimiter.
+        assert!(list_item("1.2").is_none());
+        assert!(list_item("1)item").is_none());
+        // A delimiter without a separator is not a bullet.
+        assert!(list_item("-").is_none());
+        assert!(list_item("1.").is_none());
+    }
+
+    #[test]
+    fn markdown_lines_unordered_item_wraps_with_hanging_indent() {
+        let lines = markdown_lines("- one two three", 8, Style::default());
+        let texts: Vec<Vec<String>> = lines.iter().map(span_texts).collect();
+        assert_eq!(
+            texts,
+            vec![
+                vec!["- ".to_string(), "one".to_string()],
+                vec!["  ".to_string(), "two".to_string()],
+                vec!["  ".to_string(), "three".to_string()],
+            ]
+        );
+        // The bullet is cyan; the continuation indent is unstyled.
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(lines[1].spans[0].style, Style::default());
+    }
+
+    #[test]
+    fn markdown_lines_ordered_items_indent_by_marker_width() {
+        let lines = markdown_lines("1. alpha beta\n2. gamma delta", 12, Style::default());
+        let texts: Vec<Vec<String>> = lines.iter().map(span_texts).collect();
+        assert_eq!(
+            texts,
+            vec![
+                vec!["1. ".to_string(), "alpha".to_string()],
+                vec!["   ".to_string(), "beta".to_string()],
+                vec!["2. ".to_string(), "gamma".to_string()],
+                vec!["   ".to_string(), "delta".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_lines_double_digit_marker_indents_by_its_width() {
+        let lines = markdown_lines("10. alpha beta", 12, Style::default());
+        let texts: Vec<Vec<String>> = lines.iter().map(span_texts).collect();
+        // `10. ` is four columns wide, so continuations indent by four.
+        assert_eq!(
+            texts,
+            vec![
+                vec!["10. ".to_string(), "alpha".to_string()],
+                vec!["    ".to_string(), "beta".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_lines_continuation_line_joins_list_item() {
+        let lines = markdown_lines("- one\n continued words here", 30, Style::default());
+        let texts: Vec<Vec<String>> = lines.iter().map(span_texts).collect();
+        assert_eq!(
+            texts,
+            vec![
+                vec!["- ".to_string(), "one".to_string()],
+                vec!["  ".to_string(), "continued words here".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_lines_blank_line_ends_list() {
+        let lines = markdown_lines("- one\n\nnext prose", 20, Style::default());
+        let texts: Vec<Vec<String>> = lines.iter().map(span_texts).collect();
+        assert_eq!(
+            texts,
+            vec![
+                vec!["- ".to_string(), "one".to_string()],
+                vec![],
+                vec!["next prose".to_string()],
+            ]
+        );
     }
 }
