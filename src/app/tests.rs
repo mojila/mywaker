@@ -2425,6 +2425,86 @@ fn combining_char_insert_tracks_merged_cluster() {
     assert_eq!(app.input_cursor(), 0);
 }
 
+// --- backspace sent as ^H (`0x08`) ---
+
+/// Some terminals send backspace as `^H` (`0x08`) rather than the DEL byte
+/// (`0x7F`). Crossterm reports `0x08` as `Char('h')` + `CONTROL`, which the generic
+/// `Char` arm would otherwise insert as a literal `h`. The chat input must treat it
+/// as backspace instead.
+#[test]
+fn ctrl_h_backspaces_in_the_chat_input() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+
+    for c in "abc".chars() {
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert_eq!(app.input, "abc");
+
+    app.handle_chat_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(app.input, "ab", "^H must delete, not insert an 'h'");
+
+    // A second backspace deletes again — it must never produce "hh".
+    app.handle_chat_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(app.input, "a");
+}
+
+/// The roster prompt shares the input buffer and must treat `^H` identically.
+#[test]
+fn ctrl_h_backspaces_in_the_roster_prompt() {
+    let (mut app, _rx) = make_app();
+    app.focus_prompt();
+
+    for c in "abc".chars() {
+        app.handle_prompt_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert_eq!(app.input, "abc");
+
+    app.handle_prompt_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.input, "ab",
+        "^H must delete in the prompt, not insert an 'h'"
+    );
+}
+
+/// The model picker's search filter must treat `^H` as backspace too, not type
+/// an 'h' into the query.
+#[test]
+fn ctrl_h_backspaces_in_the_model_filter() {
+    let (mut app, _rx) = make_app();
+    app.mode = Mode::Models; // open_models needs a client; the filter path does not
+
+    for c in "opus".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    assert_eq!(app.model_filter, "opus");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.model_filter, "opu",
+        "^H must shrink the filter, not add 'h'"
+    );
+    assert_eq!(app.model_selected, 0, "the highlight resets on edit");
+}
+
+/// A control letter with no bound editing action is dropped rather than inserted
+/// as text: `^B` must not put a `b` into the buffer.
+#[test]
+fn unbound_control_letters_are_not_inserted() {
+    let (mut app, _rx) = make_app();
+    open_chat(&mut app, 0);
+
+    app.handle_chat_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.input, "",
+        "^B has no bound action and must not insert 'b'"
+    );
+
+    // A plain 'b' still types.
+    app.handle_chat_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert_eq!(app.input, "b");
+}
+
 // --- input horizontal scroll ---
 
 #[test]

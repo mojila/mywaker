@@ -1022,7 +1022,14 @@ impl App {
                     self.model_filter.clear();
                     self.model_selected = 0;
                 }
-                KeyCode::Char(c) => self.edit_model_filter(Some(c)),
+                // Some terminals send backspace as `^H`, which crossterm reports
+                // as `Char('h')` + CONTROL; delete with it, never type an 'h'.
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.edit_model_filter(None)
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.edit_model_filter(Some(c))
+                }
                 _ => {}
             },
             Mode::Chat => self.handle_chat_key(key),
@@ -1073,9 +1080,11 @@ impl App {
             KeyCode::Char('u') if ctrl => self.input_delete_to_start(),
             KeyCode::Char('a') if ctrl => self.cursor_home(),
             KeyCode::Char('e') if ctrl => self.cursor_end(),
+            // As in chat: `^H` is backspace on terminals that don't emit DEL.
+            KeyCode::Char('h') if ctrl => self.input_delete_backward(),
             KeyCode::Backspace => self.input_delete_backward(),
             KeyCode::Tab => self.blur_prompt(),
-            KeyCode::Char(c) => self.input_insert(c),
+            KeyCode::Char(c) if !ctrl => self.input_insert(c),
             _ => {}
         }
     }
@@ -1204,6 +1213,10 @@ impl App {
             KeyCode::Char('u') if ctrl => self.input_delete_to_start(),
             KeyCode::Char('a') if ctrl => self.cursor_home(),
             KeyCode::Char('e') if ctrl => self.cursor_end(),
+            // Some terminals send backspace as `^H` (`\x08`), which crossterm
+            // reports as `Char('h')` + CONTROL rather than `Backspace`. Treat it
+            // as backspace so it never leaks a stray 'h' into the input.
+            KeyCode::Char('h') if ctrl => self.input_delete_backward(),
             KeyCode::Up => {
                 if menu_open {
                     self.move_command_menu(-1);
@@ -1244,7 +1257,7 @@ impl App {
                     self.complete_command();
                 }
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !ctrl => {
                 self.input_insert(c);
                 self.sync_command_menu();
             }
