@@ -15,8 +15,8 @@ use crate::harness::{self, PendingDelivery};
 use crate::jev::{FALLBACK_VERDICT, JevClient, answer_field_or_default, answer_text_or_default};
 use crate::message::Message;
 use crate::opencode::{
-    AgentInfo, Event, MessageError, ModelRef, OpenCode, ProviderModel, ServerInfo, SessionMessage,
-    pick_provider,
+    AgentInfo, Event, MessageError, ModelRef, OpenCode, ProviderModel, ServerInfo, SessionInfo,
+    SessionMessage, pick_provider,
 };
 use crate::persistence::Store;
 use crate::projects::{self, Project};
@@ -193,6 +193,30 @@ impl Chat {
     /// when [`App::begin_session`] has nothing left to do.
     fn started_or_starting(&self) -> bool {
         self.session_id.is_some() || self.creating
+    }
+}
+
+/// The resume picker for one employee: the previous sessions found for their
+/// agent, plus which row the cursor is on. Row `0` is always "start fresh"; the
+/// rows after it are the previous sessions, newest first.
+struct SessionPicker {
+    employee: usize,
+    sessions: Vec<SessionInfo>,
+    selected: usize,
+}
+
+impl SessionPicker {
+    /// The highlighted session, if the cursor is on one (not on "start fresh").
+    fn selected_session(&self) -> Option<&SessionInfo> {
+        self.sessions.get(self.selected.checked_sub(1)?)
+    }
+
+    /// Move the cursor by `delta`, clamped to the rows that exist. The first
+    /// row is "start fresh", so the range is `0..=sessions.len()`.
+    fn move_selection(&mut self, delta: isize) {
+        let last = self.sessions.len();
+        let next = self.selected as isize + delta;
+        self.selected = next.clamp(0, last as isize) as usize;
     }
 }
 
@@ -605,6 +629,9 @@ pub struct App {
     project_selected: usize,
     /// Models available through OpenCode's providers, for the model picker.
     models: Vec<ProviderModel>,
+    /// MCP servers and their connection status, shown in the sidebar's runtime
+    /// row. Loaded at connect (and on reconnect), never refreshed mid-run.
+    mcp_servers: Vec<crate::opencode::McpServer>,
     /// Selection index in the model picker list (indexed into
     /// [`Self::filtered_models`]).
     model_selected: usize,
@@ -642,6 +669,10 @@ pub struct App {
     /// Selected index in the slash-command autocomplete menu, when it is open
     /// (i.e. the input starts with `/` and matches one or more commands).
     command_menu: Option<usize>,
+    /// The resume picker: an employee's previous sessions awaiting the user's
+    /// continue-or-fresh decision, plus the highlighted row. Set by
+    /// `start_chat` when the employee has no live session yet.
+    session_picker: Option<SessionPicker>,
     /// Total hand-offs dispatched this run, guarding against runaway cycles.
     delegation_count: u64,
     /// Per-employee delegation-chain origin: the chat `@user`/`@deliver` should
@@ -721,6 +752,7 @@ impl App {
             active_project: None,
             project_selected: 0,
             models: Vec::new(),
+            mcp_servers: Vec::new(),
             model_selected: 0,
             model_filter: String::new(),
             mode: Mode::Roster,
@@ -736,6 +768,7 @@ impl App {
             roster_scroll: 0,
             chats: HashMap::new(),
             command_menu: None,
+            session_picker: None,
             delegation_count: 0,
             origin_of: HashMap::new(),
             depth_of: HashMap::new(),
@@ -888,6 +921,9 @@ impl App {
                 self.last_event = Some(event.event_type.clone());
                 self.handle_stream_event(&event);
             }
+            Message::PreviousSessionsLoaded { employee, sessions } => {
+                self.open_session_picker(employee, sessions);
+            }
             Message::SessionCreated { employee, result } => {
                 self.handle_session_created(employee, result);
             }
@@ -899,6 +935,14 @@ impl App {
             }
             Message::SkillInstallDone { employee, result } => {
                 self.handle_skill_install_done(employee, result);
+            }
+            Message::McpLoaded(servers) => {
+                let connected = servers.iter().filter(|s| s.is_connected()).count();
+                self.push_log(format!(
+                    "{connected}/{0} mcp servers connected",
+                    servers.len()
+                ));
+                self.mcp_servers = servers;
             }
             Message::ModelsLoaded(models) => {
                 self.push_log(format!("{} models available", models.len()));
@@ -937,6 +981,13 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // The resume picker is drawn above the chat, so it takes the key before
+        // anything else when open.
+        if self.session_picker.is_some() {
+            self.handle_session_picker_key(key);
+            return;
+        }
+
         // The reopen prompt is drawn above everything, so it takes the key
         // before the help overlay's dismiss and the global `q`/`Ctrl-C` quit
         // bindings.
@@ -1275,6 +1326,46 @@ impl App {
             .filter(|opt| opt.menu && opt.command.starts_with(input))
             .copied()
             .collect()
+    }
+
+    /// The MCP servers' connection summary: `(connected, total)`, or `None`
+    /// before the first successful load. The sidebar turns this into its
+    /// green/yellow `mcp n/n` runtime row.
+    pub fn mcp_summary(&self) -> Option<(usize, usize)> {
+        if self.mcp_servers.is_empty() {
+            return None;
+        }
+        let total = self.mcp_servers.len();
+        let up = self.mcp_servers.iter().filter(|s| s.is_connected()).count();
+        Some((up, total))
+    }
+
+    /// Test seam: replace the loaded MCP server list. Tests in other modules
+    /// cannot reach the private field, and going through the `Message` loop
+    /// would couple them to the background client.
+    #[cfg(test)]
+    pub(crate) fn set_mcp_servers_for_tests(&mut self, servers: Vec<crate::opencode::McpServer>) {
+        self.mcp_servers = servers;
+    }
+
+    /// The open resume picker: the employee's previous sessions plus the
+    /// highlighted row, or `None` when no picker is showing.
+    pub fn session_picker(&self) -> Option<(&[SessionInfo], usize)> {
+        let picker = self.session_picker.as_ref()?;
+        Some((picker.sessions.as_slice(), picker.selected))
+    }
+
+    /// The title of the picker row at `index` — row 0 is "start fresh", the rest
+    /// are the previous sessions (title or id).
+    pub fn session_picker_row(&self, index: usize) -> String {
+        if index == 0 {
+            return "Start a fresh session".to_string();
+        }
+        self.session_picker
+            .as_ref()
+            .and_then(|p| p.sessions.get(index - 1))
+            .map(|s| s.title.clone().unwrap_or_else(|| s.id.clone()))
+            .unwrap_or_default()
     }
 
     /// The open command menu: matching options plus the selected index, or
@@ -1812,7 +1903,134 @@ impl App {
             return;
         }
 
-        self.begin_session(employee);
+        // Ask the service what this employee has done here before, and let the
+        // user pick: continue where that left off, or start fresh. Employees
+        // with no history skip the picker and begin a session directly.
+        self.offer_previous_sessions(employee);
+    }
+
+    /// Fetch `employee`'s previous sessions in the current workdir and open the
+    /// resume picker. With no history the picker is skipped and a fresh session
+    /// begins, exactly as before.
+    fn offer_previous_sessions(&mut self, employee: usize) {
+        let Some(client) = self.client.clone() else {
+            self.begin_session(employee);
+            return;
+        };
+        let directory = self.workdir();
+        let agent = self
+            .team
+            .employees()
+            .get(employee)
+            .map(|e| e.agent_id().to_owned());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let sessions = match client.list_sessions(&directory).await {
+                Ok(all) => all
+                    .into_iter()
+                    .filter(|session| {
+                        session
+                            .agent
+                            .as_deref()
+                            .is_some_and(|a| Some(a) == agent.as_deref())
+                    })
+                    .collect(),
+                Err(err) => {
+                    let _ = tx
+                        .send(Message::LogError(format!(
+                            "previous sessions unavailable: {err}"
+                        )))
+                        .await;
+                    Vec::new()
+                }
+            };
+            let _ = tx
+                .send(Message::PreviousSessionsLoaded { employee, sessions })
+                .await;
+        });
+    }
+
+    /// Show the resume picker for `employee`, or begin a fresh session when
+    /// they have no previous ones. Called from `PreviousSessionsLoaded`.
+    fn open_session_picker(&mut self, employee: usize, sessions: Vec<SessionInfo>) {
+        // The user may have left the chat (or switched employees) while the
+        // fetch was in flight — only answer when the chat is still theirs.
+        if self.chat_employee != Some(employee) || self.mode != Mode::Chat {
+            return;
+        }
+        if sessions.is_empty() {
+            self.begin_session(employee);
+            return;
+        }
+        let count = sessions.len();
+        self.session_picker = Some(SessionPicker {
+            employee,
+            sessions,
+            selected: 0,
+        });
+        self.team.set_status(employee, EmployeeStatus::Idle);
+        self.push_log(format!(
+            "{} previous session{} found — pick one to continue, or start fresh",
+            count,
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Handle a key while the resume picker is open. `Up`/`Down` move, `Enter`
+    /// commits (start fresh on row 0, resume the highlighted session
+    /// otherwise), `n` forces fresh, and `Esc` closes the chat untouched.
+    fn handle_session_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        let employee = picker.employee;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => picker.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => picker.move_selection(1),
+            KeyCode::Esc => {
+                self.session_picker = None;
+                self.close_chat();
+            }
+            KeyCode::Char('n') => {
+                self.session_picker = None;
+                self.begin_session(employee);
+            }
+            KeyCode::Enter => {
+                let chosen = picker.selected_session().cloned();
+                self.session_picker = None;
+                match chosen {
+                    Some(session) => self.resume_session(employee, session),
+                    None => self.begin_session(employee),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Bind `employee`'s chat to a previous `session` and load its transcript.
+    ///
+    /// The bootstrapping preamble is deliberately skipped — the session already
+    /// carries the team context from when it ran — and the transcript load goes
+    /// through the same `TranscriptLoaded` path a live reload would, so
+    /// delegation scanning (`handled_message_ids`) and usage tallying behave
+    /// identically to a resumed live session.
+    fn resume_session(&mut self, employee: usize, session: SessionInfo) {
+        let id = session.id.clone();
+        if let Some(chat) = self.chats.get_mut(&employee) {
+            chat.session_id = Some(id.clone());
+            chat.creating = false;
+            chat.scroll = 0;
+        }
+        self.team.set_status(employee, EmployeeStatus::Idle);
+        let title = session.title.clone().unwrap_or_else(|| id.clone());
+        self.push_log(format!("resumed {title}"));
+        if let Some(chat) = self.chats.get_mut(&employee) {
+            chat.transcript.push(TranscriptLine::new(
+                TranscriptRole::Info,
+                format!("resumed session {title} — type a task and press Enter"),
+            ));
+        }
+        self.load_transcript(employee, id);
     }
 
     /// Create the OpenCode session backing `employee`'s chat. A no-op when one
@@ -4845,6 +5063,12 @@ pub async fn opencode_background(tx: Sender<Message>, jev: Option<JevClient>) {
     // provider without the user opening the picker first.
     if let Ok(models) = client.models().await {
         let _ = tx.send(Message::ModelsLoaded(models)).await;
+    }
+
+    // Pre-load the MCP server status so the sidebar can show it from the first
+    // frame; refreshed on reconnect.
+    if let Ok(servers) = client.mcp_status().await {
+        let _ = tx.send(Message::McpLoaded(servers)).await;
     }
 
     let Some(events) = client.events().ok() else {

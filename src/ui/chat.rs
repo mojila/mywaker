@@ -14,6 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, TranscriptLine, TranscriptRole};
+use crate::ui::truncate;
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let [transcript_area, input_area] = super::layout::chat_areas(area);
@@ -21,6 +22,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     render_transcript(frame, app, transcript_area);
     render_input(frame, app, input_area);
     render_command_menu(frame, app, area);
+    render_session_picker(frame, app, area);
 }
 
 // --- transcript ---
@@ -195,35 +197,60 @@ fn role_mapping(role: TranscriptRole, name: Option<&str>) -> (String, Style, Sty
     }
 }
 
-/// Lightweight markdown: fenced code blocks (cyan/dim), headings (bold),
-/// blockquotes (dim), and inline styling — `` `code` ``, `**bold**`, `*italic*`,
-/// `~~strike~~`, and `[text](url)` links. Everything word-wraps to `width`;
-/// code lines are chunked without collapsing indentation.
+/// Lightweight markdown: fenced code blocks (cyan/dim, with the language tag
+/// as a header line), headings (bold, sized by level), blockquotes (a dim `▌ `
+/// gutter), horizontal rules (a dim line), tables (styled gutters), and inline
+/// styling — `` `code` ``, `**bold**`, `*italic*`, `~~strike~~`, and
+/// `[text](url)` links. Everything word-wraps to `width`; code lines are
+/// chunked without collapsing indentation.
 fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_code = false;
     let mut list_indent: Option<usize> = None;
     let marker_style = Style::default().fg(Color::Cyan);
+    let gutter = Style::default().fg(Color::DarkGray);
 
     for raw in text.lines() {
         let trimmed = raw.trim_start();
 
-        // Fence toggle ends any open list run.
+        // Fence toggle ends any open list run. The opening fence names the
+        // language when one is given — that tag tells the reader *what* the
+        // block is before they parse its contents.
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let opening = !in_code;
             in_code = !in_code;
-            out.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
             list_indent = None;
+            if opening {
+                let lang = trimmed.trim_start_matches(['`', '~']).trim();
+                if !lang.is_empty() {
+                    out.push(Line::from(Span::styled(
+                        format!("─ {lang} "),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                }
+                out.push(Line::from(Span::styled(
+                    "┌".to_string() + &"─".repeat(width.saturating_sub(1)),
+                    gutter,
+                )));
+            } else {
+                out.push(Line::from(Span::styled(
+                    "└".to_string() + &"─".repeat(width.saturating_sub(1)),
+                    gutter,
+                )));
+            }
             continue;
         }
         if in_code {
-            for seg in chunk_lines(raw, width) {
-                out.push(Line::from(Span::styled(
-                    seg,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-                )));
+            for seg in chunk_lines(raw, width.saturating_sub(2)) {
+                out.push(Line::from(vec![
+                    Span::styled("│ ", gutter),
+                    Span::styled(
+                        seg,
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                    ),
+                ]));
             }
             continue;
         }
@@ -233,13 +260,63 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
             list_indent = None;
             continue;
         }
+        // A horizontal rule reads as a visual separator, not three dashes.
+        if trimmed.len() >= 3
+            && trimmed
+                .chars()
+                .all(|c| c == '-' || c == '_' || c == '*' || c == ' ')
+        {
+            out.push(Line::from(Span::styled(
+                "─".repeat(width),
+                Style::default().fg(Color::DarkGray),
+            )));
+            list_indent = None;
+            continue;
+        }
+        // Headings are bold; level 1–2 additionally underline, so the document
+        // structure survives even a fast scroll.
         if let Some(heading) = heading_text(raw) {
-            for seg in wrap_text(heading, width) {
-                out.push(Line::from(Span::styled(
-                    seg,
-                    base.add_modifier(Modifier::BOLD),
-                )));
+            let level = trimmed.chars().take_while(|&c| c == '#').count();
+            let mut style = base.add_modifier(Modifier::BOLD);
+            if level <= 2 {
+                style = style.add_modifier(Modifier::UNDERLINED);
             }
+            for seg in wrap_text(heading, width) {
+                out.push(Line::from(Span::styled(seg, style)));
+            }
+            list_indent = None;
+            continue;
+        }
+        // A table row (the header row or a divider): render with gutter bars so
+        // the columns read as a grid rather than a run of pipes in prose.
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            let cells: Vec<&str> = trimmed[1..trimmed.len() - 1].split('|').collect();
+            let divider = cells
+                .iter()
+                .all(|c| c.trim().chars().all(|ch| ch == ':' || ch == '-'));
+            let style = if divider {
+                gutter
+            } else {
+                base.add_modifier(Modifier::BOLD)
+            };
+            let mut spans: Vec<Span> = vec![Span::styled("│ ", gutter)];
+            let cell_width = width.saturating_sub(2) / cells.len().max(1);
+            for (i, cell) in cells.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled("│ ", gutter));
+                }
+                let last = i + 1 == cells.len();
+                let available = if last {
+                    width.saturating_sub(2 + i * (cell_width + 2))
+                } else {
+                    cell_width
+                };
+                spans.push(Span::styled(
+                    truncate(&pad_cell(cell.trim(), available), available),
+                    style,
+                ));
+            }
+            out.push(Line::from(spans));
             list_indent = None;
             continue;
         }
@@ -264,11 +341,14 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
             list_indent = Some(indent);
             continue;
         }
-        // Blockquotes are never list items.
+        // Blockquotes get a dim gutter bar: the quote's extent is visible even
+        // across wrapped lines.
         if trimmed.starts_with('>') {
             let body = trimmed.strip_prefix('>').unwrap_or(trimmed).trim_start();
-            for seg in wrap_text(body, width) {
-                out.push(inline_line(&seg, base.add_modifier(Modifier::DIM)));
+            for seg in wrap_text(body, width.saturating_sub(2)) {
+                let mut spans = vec![Span::styled("▌ ", Style::default().fg(Color::Cyan))];
+                spans.extend(inline_line(&seg, base.add_modifier(Modifier::DIM)).spans);
+                out.push(Line::from(spans));
             }
             list_indent = None;
             continue;
@@ -289,7 +369,26 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
         }
     }
 
+    // A code block left open at the end of the message (a truncated stream)
+    // still gets its closing rule, so the transcript never ends inside a box.
+    if in_code {
+        out.push(Line::from(Span::styled(
+            "└".to_string() + &"─".repeat(width.saturating_sub(1)),
+            gutter,
+        )));
+    }
+
     out
+}
+
+/// Pad a table cell to `width` columns (space-right) for aligned columns.
+fn pad_cell(cell: &str, width: usize) -> String {
+    let len = cell.width();
+    if len >= width {
+        cell.to_string()
+    } else {
+        format!("{cell}{}", " ".repeat(width - len))
+    }
 }
 
 /// A single Markdown list item: the rendered marker (with one trailing space)
@@ -674,6 +773,89 @@ fn render_command_menu(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, menu_rect, &mut state);
 }
 
+/// Render the resume picker as a centred modal over the chat: row 0 is "start
+/// a fresh session", the rows below it are the employee's previous sessions,
+/// newest first. Shown only while `app.session_picker()` is `Some`.
+fn render_session_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let Some((sessions, selected)) = app.session_picker() else {
+        return;
+    };
+
+    let rows = sessions.len() + 1;
+    // Two border rows plus the hint row.
+    let height = (rows as u16 + 3).min(area.height.saturating_sub(2));
+    let width = 64.min(area.width.saturating_sub(2));
+    let [_, vertical_center, _] = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Fill(1),
+        ratatui::layout::Constraint::Length(height),
+        ratatui::layout::Constraint::Fill(1),
+    ])
+    .areas(area);
+    let [_, popup, _] = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Fill(1),
+        ratatui::layout::Constraint::Length(width),
+        ratatui::layout::Constraint::Fill(1),
+    ])
+    .areas(vertical_center);
+
+    let mut items: Vec<WidgetListItem> = Vec::with_capacity(rows);
+    for (index, label) in std::iter::once("Start a fresh session".to_string())
+        .chain(
+            sessions
+                .iter()
+                .map(|s| s.title.clone().unwrap_or_else(|| s.id.clone())),
+        )
+        .enumerate()
+    {
+        let fresh = index == 0;
+        items.push(WidgetListItem::new(Line::from(vec![
+            Span::styled(
+                if fresh { "✚ " } else { "↺ " },
+                Style::default().fg(if fresh { Color::Green } else { Color::Cyan }),
+            ),
+            Span::styled(label, Style::default().fg(Color::White)),
+        ])));
+    }
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Color::Cyan)
+                .title(" previous sessions ")
+                .title_style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("» ");
+
+    let hints = super::key_hint("↑/↓ move · Enter open · n fresh · Esc back", "")
+        .style(Style::default().fg(Color::DarkGray));
+
+    frame.render_widget(Clear, popup);
+    // The hint sits inside the border: render the list into the full popup, then
+    // draw the hint over its last inner row (Clear would erase the border, so
+    // the hint line simply overwrites the text area).
+    frame.render_stateful_widget(list, popup, &mut state);
+    let hint_rect = Rect {
+        x: popup.x + 1,
+        y: popup.y + popup.height.saturating_sub(2),
+        width: popup.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(hints, hint_rect);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +1096,109 @@ mod tests {
         // A delimiter without a separator is not a bullet.
         assert!(list_item("-").is_none());
         assert!(list_item("1.").is_none());
+    }
+
+    #[test]
+    /// Code blocks render inside a drawn box: an opening rule (with the
+    /// language tag when the fence names one), `│ `-prefixed content lines, and
+    /// a closing rule. The raw fence lines never reach the transcript.
+    #[test]
+    fn code_blocks_render_inside_a_boxed_rule() {
+        let lines = markdown_lines("```rust\nlet x = 1;\n```", 20, Style::default());
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert_eq!(text.len(), 4, "{text:?}");
+        assert!(text[0].contains("rust"), "language tag: {text:?}");
+        assert!(text[1].starts_with('┌'), "opening rule: {text:?}");
+        assert!(
+            text[2].contains("│ ") && text[2].contains("let x = 1;"),
+            "{text:?}"
+        );
+        assert!(text[3].starts_with('└'), "closing rule: {text:?}");
+    }
+
+    /// Headings are bold; levels 1–2 are also underlined so structure survives
+    /// a scroll, and the `#` markers themselves are stripped.
+    #[test]
+    fn headings_bold_and_top_level_underlined() {
+        let lines = markdown_lines("# Title\n### Detail", 30, Style::default());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].content, "Title");
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert_eq!(lines[1].spans[0].content, "Detail");
+        assert!(
+            !lines[1].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+    }
+
+    /// Blockquotes carry a cyan `▌ ` gutter on every wrapped line, so the
+    /// quote's extent is visible.
+    #[test]
+    fn blockquotes_get_a_gutter_bar() {
+        let lines = markdown_lines("> quoted thought", 30, Style::default());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].spans[0].content, "▌ ");
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("quoted")));
+    }
+
+    /// A line of only dashes/underscores/asterisks is a horizontal rule, not
+    /// prose — rendered as a full-width dim line.
+    #[test]
+    fn horizontal_rules_render_as_a_line() {
+        let lines = markdown_lines("---", 12, Style::default());
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "─".repeat(12));
+    }
+
+    /// Table rows render as gutter-separated columns: bold cells for data rows,
+    /// dim for the `---` divider, all inside the card's width.
+    #[test]
+    fn tables_render_with_gutters_and_a_dim_divider() {
+        let md = "| name | qty |\n|---|---|\n| bolt | 4 |";
+        let lines = markdown_lines(md, 24, Style::default());
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert_eq!(lines.len(), 3, "{text:?}");
+        assert!(
+            text[0].contains("name") && text[0].contains("qty"),
+            "{text:?}"
+        );
+        assert!(text[1].contains('-'), "divider row: {text:?}");
+        assert!(
+            text[2].contains("bolt") && text[2].contains("4"),
+            "{text:?}"
+        );
+    }
+
+    /// A message whose code block never closes (a truncated stream) still gets
+    /// its closing rule — the transcript never ends inside an open box.
+    #[test]
+    fn an_unclosed_code_block_still_closes() {
+        let lines = markdown_lines("```py\nprint(1)", 20, Style::default());
+        let last = lines.last().unwrap();
+        let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with('└'), "{text:?}");
     }
 
     #[test]

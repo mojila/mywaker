@@ -133,11 +133,41 @@ async fn wait(Path(_id): Path<String>) -> Json<Value> {
     Json(json!({}))
 }
 
+/// `GET /api/session?directory=…` — the previous-sessions list, shaped like the
+/// live service: sessions across agents, each carrying `agent` and `time`.
+async fn list_sessions() -> Json<Value> {
+    Json(json!({
+        "location": { "directory": "/work" },
+        "data": [
+            { "id": "ses_old_writer", "title": "draft the release notes", "agent": "writer",
+              "time": { "created": 100, "updated": 300 } },
+            { "id": "ses_old_orchestrator", "title": "run the pipeline", "agent": "orchestrator",
+              "time": { "created": 200, "updated": 400 } },
+            { "id": "ses_older_writer", "title": "earlier writer work", "agent": "writer",
+              "time": { "created": 10, "updated": 50 } }
+        ]
+    }))
+}
+
+/// `GET /api/mcp` — one connected and one (deliberately) disconnected server,
+/// so the summary has something to count on both sides.
+async fn mcp() -> Json<Value> {
+    Json(json!({
+        "location": { "directory": "/work" },
+        "data": [
+            { "name": "filesystem", "status": { "status": "connected" } },
+            { "name": "browser", "status": { "status": "disconnected" } },
+            { "name": "gateway", "status": { "status": "connected" } }
+        ]
+    }))
+}
+
 fn router(state: FakeState) -> Router {
     Router::new()
         .route("/api/info", get(info))
         .route("/api/agent", get(agents))
-        .route("/api/session", post(create_session))
+        .route("/api/session", post(create_session).get(list_sessions))
+        .route("/api/mcp", get(mcp))
         .route("/api/session/{id}/prompt", post(prompt))
         .route("/api/session/{id}/message", get(messages))
         .route("/api/experimental/session/{id}/wait", post(wait))
@@ -320,4 +350,41 @@ async fn a_harness_admission_id_is_accepted_by_the_service_contract() {
     }
 
     assert_eq!(state.received.lock().unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn previous_sessions_list_sorted_newest_first() {
+    let (client, _state) = start_server().await;
+
+    let sessions = client.list_sessions("/work").await.unwrap();
+    // Every session the fake serves, regardless of agent.
+    assert_eq!(sessions.len(), 3);
+    // Most recently updated first — the order the resume picker shows.
+    let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["ses_old_orchestrator", "ses_old_writer", "ses_older_writer"]
+    );
+
+    // The fields the app filters and displays on.
+    let writer = sessions.iter().find(|s| s.id == "ses_old_writer").unwrap();
+    assert_eq!(writer.agent.as_deref(), Some("writer"));
+    assert_eq!(writer.title.as_deref(), Some("draft the release notes"));
+    assert_eq!(writer.time.as_ref().and_then(|t| t.updated), Some(300));
+}
+
+#[tokio::test]
+async fn mcp_status_reports_connection_counts() {
+    let (client, _state) = start_server().await;
+
+    let servers = client.mcp_status().await.unwrap();
+    assert_eq!(servers.len(), 3);
+
+    // 2 of 3 connected: the summary the sidebar's `mcp n/n` row renders.
+    let up = servers.iter().filter(|s| s.is_connected()).count();
+    assert_eq!(up, 2);
+
+    // The disconnected one is identifiable by name, for the log line.
+    let down = servers.iter().find(|s| !s.is_connected()).unwrap();
+    assert_eq!(down.name, "browser");
 }

@@ -70,7 +70,44 @@ pub struct DataEnvelope<T> {
     pub data: T,
 }
 
-/// A session returned by `POST /api/session`.
+/// Creation/update timestamps of a session (epoch millis).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTime {
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub updated: Option<u64>,
+}
+
+/// One MCP server and its connection state, from `GET /api/mcp`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    pub name: String,
+    #[serde(default)]
+    pub status: Option<McpStatus>,
+}
+
+impl McpServer {
+    /// True when the server reports itself connected (or reports nothing —
+    /// an unknown state is not treated as down).
+    pub fn is_connected(&self) -> bool {
+        self.status
+            .as_ref()
+            .map(|s| s.status.as_deref() != Some("disconnected"))
+            .unwrap_or(true)
+    }
+}
+
+/// The nested connection state of an [`McpServer`] (`{ "status": "connected" }`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpStatus {
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// A session returned by `POST /api/session` or `GET /api/session`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
@@ -83,6 +120,13 @@ pub struct SessionInfo {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub location: Option<Location>,
+    /// The agent the session was created under (`"orchestrator"`, `"writer"`,
+    /// …) — how previous sessions are matched back to an employee.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Creation/update timestamps (epoch millis), when the service reports them.
+    #[serde(default)]
+    pub time: Option<SessionTime>,
 }
 
 /// What kind of capability a tool call exercised.

@@ -30,6 +30,12 @@ pub enum Message {
         employee: usize,
         result: Result<SessionInfo, String>,
     },
+    /// The employee's previous sessions (for the resume/new picker), most
+    /// recently updated first and already filtered to that employee's agent.
+    PreviousSessionsLoaded {
+        employee: usize,
+        sessions: Vec<SessionInfo>,
+    },
     /// A session transcript finished loading.
     TranscriptLoaded {
         employee: usize,
@@ -46,6 +52,8 @@ pub enum Message {
     },
     /// The models available through OpenCode's providers, for the model picker.
     ModelsLoaded(Vec<crate::opencode::ProviderModel>),
+    /// The MCP servers and their connection status, for the sidebar's runtime row.
+    McpLoaded(Vec<crate::opencode::McpServer>),
     /// Jev answered a delegated `@jev` question (for `employee`, who asked).
     JevAnswer { employee: usize, answer: String },
     /// A cron schedule fired, handing `goal` to `employee` (autonomous dispatch).

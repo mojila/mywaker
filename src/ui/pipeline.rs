@@ -29,7 +29,7 @@ use ratatui::{
 
 use crate::app::App;
 use crate::opencode::{ToolClass, ToolUse};
-use crate::team::Employee;
+use crate::team::{Employee, EmployeeStatus};
 use crate::ui::{status, truncate, wires};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
@@ -768,7 +768,7 @@ fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, s
             truncate(&employee.role, width),
             Color::DarkGray,
         )),
-        Line::from(Span::styled(employee.status.label(), accent)),
+        activity_line(employee.status, tick, width, accent),
         model_line(employee.model.as_deref(), width, Color::Cyan),
         tool_line(employee.last_tool.as_ref(), width),
     ];
@@ -809,6 +809,53 @@ fn node_head(glyph: Span<'static>, name: &str, inner_width: usize) -> Line<'stat
             truncate(name, inner_width.saturating_sub(2)),
             Style::default().add_modifier(Modifier::BOLD),
         ),
+    ])
+}
+
+/// A card's activity row: a progress-style bar plus the status word, in the
+/// status's accent colour.
+///
+/// The bar is what makes "who is busy" readable at a glance — a row of blocks
+/// animating (for active states) or settling (for terminal ones) is parsed
+/// faster than a word. Animate by swapping the bar's phase with the tick, so a
+/// working card visibly *moves* while a done/idle/error card sits still:
+/// `- idle` a dim solid bar, `▶ working` blocks marching, `✓ done` full bar.
+fn activity_line(
+    status: EmployeeStatus,
+    tick: u64,
+    inner_width: usize,
+    accent: Color,
+) -> Line<'static> {
+    // Bar cells available: the label + a gap must still fit.
+    let label = status.label();
+    let bar_width = inner_width.saturating_sub(label.len() + 3).max(2);
+    let fill = match status {
+        EmployeeStatus::Idle => 0.0,
+        EmployeeStatus::Thinking => {
+            // A breathing pulse — no false promise of progress.
+            let phase = (tick % 16) as f32 / 16.0;
+            0.25 + 0.2 * (2.0 * std::f32::consts::PI * phase).sin().abs()
+        }
+        EmployeeStatus::Working => {
+            // Marching blocks: the filled window slides, reading as motion.
+            let phase = (tick % bar_width.max(1) as u64) as usize;
+            let base = 0.5 + 0.4 * (phase as f32 / bar_width.max(1) as f32);
+            base.min(0.9)
+        }
+        EmployeeStatus::Done => 1.0,
+        EmployeeStatus::Error => 1.0,
+    };
+
+    let filled = (fill * bar_width as f32).round() as usize;
+    let mut bar = String::with_capacity(bar_width * 3);
+    for index in 0..bar_width {
+        bar.push(if index < filled { '█' } else { '░' });
+    }
+
+    Line::from(vec![
+        Span::styled(bar, Style::default().fg(accent)),
+        Span::raw(" "),
+        Span::styled(label, Style::default().fg(accent)),
     ])
 }
 
@@ -1394,6 +1441,77 @@ mod tests {
             reveal(tall, &sections, 1, 0) > 0,
             "the idle card scrolls past the headings"
         );
+    }
+
+    /// The activity row replaces the bare status word: a bar plus the label.
+    /// Its width is bounded by the card's inner width, the label is the status
+    /// word, and each state reads differently — idle dim/empty, done full,
+    /// working partially filled.
+    #[test]
+    fn activity_row_is_a_bounded_bar_plus_label() {
+        use super::activity_line;
+        use crate::team::EmployeeStatus;
+
+        let width = 30;
+        let done = activity_line(EmployeeStatus::Done, 0, width, Color::Green);
+        let text: String = done.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("done"), "{text}");
+        assert!(text.contains('█'), "a done card's bar is full: {text}");
+        // Bar cells + label + a gap: 23 + 4 + 1 at this width.
+        assert_eq!(text.chars().count(), 28, "the row fills the card: {text}");
+
+        let idle = activity_line(EmployeeStatus::Idle, 0, width, Color::DarkGray);
+        let text: String = idle.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("idle"), "{text}");
+        assert!(
+            text.contains('░'),
+            "an idle bar shows an empty track: {text}"
+        );
+
+        // Working is mid-fill and animates with the tick: two different ticks
+        // produce different bars, so the card visibly moves.
+        let a = activity_line(EmployeeStatus::Working, 2, width, Color::Cyan);
+        let b = activity_line(EmployeeStatus::Working, 7, width, Color::Cyan);
+        let a_text: String = a.spans.iter().map(|s| s.content.as_ref()).collect();
+        let b_text: String = b.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_ne!(a_text, b_text, "working bars should animate");
+
+        // Narrow cards keep the label; the bar shrinks to what remains.
+        // `bar_width = 12 - len("working") - 3 = 2` (the `.max(2)` floor), so the
+        // row is bar + gap + label = 2 + 1 + 7 = 10 columns.
+        let narrow = activity_line(EmployeeStatus::Working, 0, 12, Color::Cyan);
+        let text: String = narrow.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("working"), "{text}");
+        assert_eq!(text.chars().count(), 10, "{text}");
+        assert!(text.chars().count() <= 12, "must fit the card: {text}");
+    }
+
+    /// The MCP summary counts connected servers; `None` before any load.
+    #[test]
+    fn mcp_summary_counts_connected_servers() {
+        use crate::config::Config;
+        use crate::message::Message;
+        use crate::team::Team;
+        use serde_json::json;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+        let mut app = App::with_team(Config::default(), tx, Team::starter());
+        assert!(app.mcp_summary().is_none(), "nothing loaded yet");
+
+        fn server(name: &str, state: &str) -> crate::opencode::McpServer {
+            serde_json::from_value(json!({
+                "name": name,
+                "status": { "status": state }
+            }))
+            .unwrap()
+        }
+
+        app.set_mcp_servers_for_tests(vec![
+            server("filesystem", "connected"),
+            server("browser", "disconnected"),
+            server("gateway", "connected"),
+        ]);
+        assert_eq!(app.mcp_summary(), Some((2, 3)));
     }
 
     /// The model row carries the assigned id — truncated to the box's inner

@@ -530,6 +530,17 @@ fn inspector(app: &App) -> Vec<Row> {
         live.push_str(&format!(" · {} queued", app.queued_prompts()));
     }
 
+    // What the employee is actually doing: their latched task summary, or a
+    // muted placeholder. This is the row that answers "what is Bruno up to?"
+    // without opening the chat.
+    let doing = (
+        employee
+            .last_task
+            .clone()
+            .unwrap_or_else(|| "no active task".to_string()),
+        Style::default().fg(status::text_color(employee.status)),
+    );
+
     vec![
         vec![
             ("who ".to_string(), Style::default().fg(Color::DarkGray)),
@@ -546,6 +557,10 @@ fn inspector(app: &App) -> Vec<Row> {
             ),
         ],
         vec![(employee.role.clone(), Style::default().fg(Color::DarkGray))],
+        vec![
+            ("doing ".to_string(), Style::default().fg(Color::DarkGray)),
+            doing,
+        ],
         vec![(
             employee.model.clone().unwrap_or_else(|| "none".to_string()),
             Style::default().fg(Color::Cyan),
@@ -602,24 +617,59 @@ fn vitals(app: &App, _width: usize) -> Vec<Row> {
     };
 
     // The finished work as a success bar: filled share = succeeded / finished.
+    // Green fill on a dim track, so health reads at a glance without counting
+    // the ✓/✕ numbers (which stay for precision).
     let finished = stats.finished();
     let done = if finished == 0 {
-        "no finished work".to_string()
+        DoneRow::Plain("no finished work".to_string())
     } else {
         let ratio = stats.succeeded as f32 / finished as f32;
-        format!("{} {}✓ {}✕", bar(ratio, 4), stats.succeeded, stats.failed)
+        let track = bar(ratio, 8);
+        DoneRow::Rich(vec![
+            ("health ".to_string(), Style::default().fg(Color::DarkGray)),
+            (track, Style::default().fg(Color::Green)),
+            (
+                format!(" {}✓", stats.succeeded),
+                Style::default().fg(Color::Green),
+            ),
+            (
+                format!(" {}✕", stats.failed),
+                Style::default().fg(if stats.failed > 0 {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+        ])
     };
 
-    vec![
-        vec![
-            ("vitals ".to_string(), Style::default().fg(Color::DarkGray)),
-            (in_flight, Style::default().fg(Color::Gray)),
-        ],
-        vec![(done, Style::default().fg(Color::Gray))],
-    ]
+    vec![vec![
+        ("vitals ".to_string(), Style::default().fg(Color::DarkGray)),
+        (in_flight, Style::default().fg(Color::Gray)),
+    ]]
+    .into_iter()
+    .chain(
+        // `done` is either one row (no finished work) or a rich coloured row.
+        match done {
+            DoneRow::Plain(text) => vec![vec![(text, Style::default().fg(Color::Gray))]],
+            DoneRow::Rich(row) => vec![row],
+        },
+    )
+    .collect()
+}
+
+/// The second vitals row: either a placeholder string or a pre-styled row.
+enum DoneRow {
+    Plain(String),
+    Rich(Row),
 }
 
 /// P5: uptime, plus Jev's state and model.
+/// P5: uptime, Jev's state, and the connected MCP servers.
+///
+/// The MCP row is why an employee's tools answer — when it reads `mcp 5/5` all
+/// the integrations (filesystem, browser, Blender, …) are up; a red `mcp 3/5`
+/// says two are down and which to check.
 fn runtime(app: &App, _width: usize) -> Vec<Row> {
     let uptime = fmt_uptime(app.uptime());
     let jev = match app.jev_model() {
@@ -628,13 +678,27 @@ fn runtime(app: &App, _width: usize) -> Vec<Row> {
         _ => "jev off".to_string(),
     };
 
-    vec![
+    let mut rows = vec![
         vec![
             ("uptime ".to_string(), Style::default().fg(Color::DarkGray)),
             (uptime, Style::default().fg(Color::Gray)),
         ],
         vec![(jev, Style::default().fg(Color::Gray))],
-    ]
+    ];
+    if let Some((up, total)) = app.mcp_summary() {
+        rows.push(vec![
+            ("mcp ".to_string(), Style::default().fg(Color::DarkGray)),
+            (
+                format!("{up}/{total}"),
+                Style::default().fg(if up == total {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
+        ]);
+    }
+    rows
 }
 
 /// P6: what is broken, two rows — a failed task and the connection state.

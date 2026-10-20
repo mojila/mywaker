@@ -9,9 +9,9 @@ use reqwest::Url;
 use serde::de::DeserializeOwned;
 
 pub use models::{
-    AgentInfo, DEFAULT_PROVIDER, Event, FormField, FormOption, FormRequest, Location, MessageError,
-    ModelRef, Part, ProviderModel, ServerInfo, SessionInfo, SessionMessage, ToolClass, ToolUse,
-    pick_provider,
+    AgentInfo, DEFAULT_PROVIDER, Event, FormField, FormOption, FormRequest, Location, McpServer,
+    MessageError, ModelRef, Part, ProviderModel, ServerInfo, SessionInfo, SessionMessage,
+    SessionTime, ToolClass, ToolUse, pick_provider,
 };
 
 /// The fixed username OpenCode's local server expects in its `Basic` auth.
@@ -177,6 +177,39 @@ impl OpenCode {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// List MCP servers and their connection status (`GET /api/mcp`).
+    ///
+    /// Employees reach the outside world through these — filesystem, browser,
+    /// Blender, the LLM gateway — so a disconnected server is the first thing
+    /// to suspect when a tool "does nothing".
+    pub async fn mcp_status(&self) -> Result<Vec<McpServer>> {
+        let response: models::ListResponse<McpServer> = self.get_json("/api/mcp").await?;
+        Ok(response.data)
+    }
+
+    /// List sessions previously run in `directory`, most recently updated first
+    /// (`GET /api/session?directory=…`).
+    ///
+    /// This is what lets an employee resume a previous conversation instead of
+    /// always starting a fresh one: the caller filters the result by `agent`
+    /// (each employee binds 1:1 to an agent) and offers the rest as a picker.
+    pub async fn list_sessions(&self, directory: &str) -> Result<Vec<SessionInfo>> {
+        let mut url = self.url("/api/session")?;
+        url.query_pairs_mut().append_pair("directory", directory);
+        let response: models::ListResponse<SessionInfo> = self.get_json_url(url).await?;
+        let mut sessions = response.data;
+        sessions.sort_by_key(|session| {
+            std::cmp::Reverse(
+                session
+                    .time
+                    .as_ref()
+                    .and_then(|t| t.updated.or(t.created))
+                    .unwrap_or(0),
+            )
+        });
+        Ok(sessions)
     }
 
     /// Fetch the full transcript of a session.
