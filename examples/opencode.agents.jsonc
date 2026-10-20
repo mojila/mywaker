@@ -11,7 +11,8 @@
   //
   // The `system` strings are what keep roles honest: the planner is told to plan
   // only and delegate implementation away; the software engineer / writer owns
-  // the code and prose.
+  // the code and prose; the designer owns the visual spec and hands the build to
+  // the writer.
   "$schema": "https://opencode.ai/config.json",
   "agents": {
     "planner": {
@@ -33,6 +34,11 @@
       "description": "Checks, critiques, and verifies others' work.",
       "mode": "all",
       "system": "You are the reviewer. Check, critique, and verify others' work for correctness and completeness. Report findings; do not take over implementation."
+    },
+    "designer": {
+      "description": "UI/UX designer — layout, hierarchy, and design specs.",
+      "mode": "all",
+      "system": "You are the designer, the team's UI/UX designer. You own layout, visual hierarchy, colour and type scales, component specs, and the interaction/empty/loading/error states — as specs and reviews, not code. Audit against `unslop-ui` and name concrete defects; write the fix as tokens, states, and hex values. Hand implementation to the writer with a line-leading @<id> directive, and deliver the finished spec with @user."
     }
   }
 }

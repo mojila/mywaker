@@ -165,9 +165,11 @@ new employee never hits `Agent not found`. The write goes to OpenCode's *global*
 agents dir — `$XDG_CONFIG_HOME/opencode/agents/`, else `~/.config/opencode/agents/`
 — which matches the global roster in `team.toml`. Canonical ids
 (`planner`/`researcher`/`writer`/`reviewer`/`engineer`) get the documented role
-prompt, and the `modeler` asset creator gets its own 3D mandate. Every other id
-gets a generic identity prompt you can edit — `image` included, deliberately: 2D
-asset work sits outside the 3D mandate.
+prompt, and two ids carry a mandate of their own: the `modeler` asset creator gets
+the 3D one, and the `designer` gets the UI/UX one (specs and reviews — layout,
+hierarchy, colour and type scales — with implementation handed to the writer).
+Every other id gets a generic identity prompt you can edit — `image` included,
+deliberately: 2D asset work sits outside both mandates.
 
 ```bash
 mywaker employee add qa -n Quinn -r Tester   # writes ~/.config/opencode/agents/qa.md
@@ -179,13 +181,14 @@ Ready-to-copy definitions are also checked in under [`examples/`](examples/) if 
 prefer to write your own:
 
 - [`examples/opencode.agents.jsonc`](examples/opencode.agents.jsonc) — the
-  `planner` / `researcher` / `writer` / `reviewer` agents as an `opencode.jsonc`
-  `agents` block you can drop in or merge.
+  `planner` / `researcher` / `writer` / `reviewer` / `designer` agents as an
+  `opencode.jsonc` `agents` block you can drop in or merge.
 - [`examples/agents/*.md`](examples/agents) — the same roles as individual
-  markdown agent files, plus the `modeler` asset-creator mandate. Copy them into
-  `~/.config/opencode/agents/` (global, available in every project) or a project's
-  `.opencode/agents/` (project-local). The `modeler` file is byte-identical to the
-  mandate baked into `mywaker` (`src/agent.rs`), and a unit test keeps it that way.
+  markdown agent files, plus the `modeler` asset-creator mandate and the
+  `designer` UI/UX mandate. Copy them into `~/.config/opencode/agents/` (global,
+  available in every project) or a project's `.opencode/agents/` (project-local).
+  The `modeler` and `designer` files are byte-identical to the mandates baked into
+  `mywaker` (`src/agent.rs`), and a unit test keeps each pair that way.
 
 If an employee's agent id still isn't defined anywhere, the employee starts a
 session anyway — it falls back to OpenCode's default agent (with a note in the log)

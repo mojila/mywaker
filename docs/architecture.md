@@ -34,7 +34,7 @@ mywaker/
     ├── config.rs             load ~/.config/mywaker/config.toml (tick_rate)
     ├── logging.rs            tracing → file
     ├── team.rs               Employee/roster model (maps to OpenCode agents)
-    ├── agent.rs              OpenCode agent definitions — write a starter on hire
+    ├── agent.rs              OpenCode agent definitions — role prompts + the modeler/designer mandates
     ├── workflow.rs           delegation protocol (parse `@id` directives, team preamble)
     ├── jev.rs                Jev (System One) client — answers `@jev` + `form.created`
     ├── role.rs               Role enum — workflow stage order/labels for the grid
@@ -326,6 +326,12 @@ role = "Research lead"
 agent_id = "researcher"
 model = "anthropic/claude-sonnet-4-5"
 
+[[employees]]
+id = "designer"
+name = "Juno"
+role = "UI/UX designer"
+model = "deepseek-v4-1-flash"
+
 [[schedules]]                  # cron triggers for autonomous start
 cron = "0 9 * * 1-5"
 employee = "planner"
@@ -508,9 +514,14 @@ any employee can hand its finished result to the user.
    role-specific system prompt — e.g. a `planner` agent that only plans — rather
    than everyone running on OpenCode's default agent. The agents themselves are
    defined in the target project's OpenCode config (`agents` in
-   `opencode.json(c)`; see `examples/opencode.agents.jsonc`). `team_context()`
-   additionally inlines the role boundaries so the planner is explicitly told to
-   delegate implementation (code/prose) to the software engineer / writer.
+   `opencode.json(c)`; see `examples/opencode.agents.jsonc`), or written by
+   `agent::ensure` on hire into OpenCode's global agents dir. Canonical ids get
+   the documented role prompt; `modeler` and `designer` get a mandate of their
+   own (3D assets; UI/UX specs and reviews) instead of a `Role`, because both sit
+   outside the plan → research → implement → write → review chain. `team_context()`
+   additionally inlines the role boundaries, so the planner is told to delegate
+   implementation (code/prose) to the software engineer / writer, and the designer
+   to hand the build of a screen to the same teammate.
 
 ## 11. Reliability (timeouts, retry, fan-out completion)
 

@@ -47,10 +47,12 @@ pub fn path_for(employee: &Employee) -> Option<PathBuf> {
 /// Canonical workflow roles reuse the role prompts documented under
 /// `examples/agents/` (planner, researcher, writer, reviewer — the engineer
 /// prompt has no checked-in file), so a hired teammate starts from the same
-/// prompt the examples show. The asset-creator id (`modeler`) has a mandate
-/// of its own but no [`Role`]; its checked-in `examples/agents/modeler.md` mirrors
-/// the `MODELER` text exactly, and a test keeps the two in step. Any other role
-/// gets a generic identity prompt built from the employee's name and human role.
+/// prompt the examples show. Two ids sit outside that chain and carry a mandate
+/// of their own instead of a [`Role`]: the asset creator (`modeler`) and the
+/// UI/UX designer (`designer`). Their checked-in `examples/agents/{modeler,
+/// designer}.md` mirror the `MODELER` / `DESIGNER` text exactly, and a test keeps
+/// each pair in step. Any other role gets a generic identity prompt built from
+/// the employee's name and human role.
 pub fn definition(employee: &Employee) -> String {
     format!(
         "---\ndescription: {}\nmode: all\n---\n\n{}\n",
@@ -79,6 +81,9 @@ fn description(employee: &Employee) -> String {
     }
     if agent_id == MODELER_ID {
         return MODELER_DESCRIPTION.to_string();
+    }
+    if agent_id == DESIGNER_ID {
+        return DESIGNER_DESCRIPTION.to_string();
     }
 
     let role = employee.role.trim();
@@ -150,14 +155,16 @@ fn yaml_scalar(value: &str) -> String {
 
 /// The system-prompt body for `employee`.
 ///
-/// Both branches key on the same thing — [`Employee::agent_id`], the id of the
-/// OpenCode agent that will actually run the prompt. The asset-creator mandate is
+/// Every arm keys on the same thing — [`Employee::agent_id`], the id of the
+/// OpenCode agent that will actually run the prompt. The mandate arms are
 /// selected by id rather than a [`Role`]: roles order the plan → research →
-/// implement → write → review pipeline, and an asset creator sits outside that
-/// chain (its id resolves to [`Role::General`], like any other non-workflow id).
+/// implement → write → review pipeline, and the asset creator and the UI/UX
+/// designer both sit outside that chain (their ids resolve to [`Role::General`],
+/// like any other non-workflow id).
 fn prompt(employee: &Employee) -> String {
     match employee.agent_id() {
         MODELER_ID => MODELER.into(),
+        DESIGNER_ID => DESIGNER.into(),
         _ => role_prompt(employee),
     }
 }
@@ -309,6 +316,67 @@ box and seat them on the ground before assessing a composition.
 check a deliverable and `@tester` to verify a pipeline. Deliver the finished asset and
 where it lives with `@user <summary>`.";
 
+/// The canonical id of the UI/UX-designer mandate — the one string both [`prompt`]
+/// and [`description`] key on.
+const DESIGNER_ID: &str = "designer";
+
+/// The frontmatter description that pairs with [`DESIGNER`], and the one written
+/// into `examples/agents/designer.md`.
+const DESIGNER_DESCRIPTION: &str = "UI/UX designer";
+
+/// The UI/UX-designer mandate, mirrored in `examples/agents/designer.md`.
+///
+/// **Keyed on the effective agent id**, exactly like [`MODELER`]: `agent = "designer"`
+/// selects this mandate for any employee, while an employee whose own id is
+/// `designer` but whose `agent` override names something else does not get it.
+///
+/// The one skill it names is `unslop-ui`, and it has to be installed in a scope
+/// OpenCode actually reads (`~/.agents/skills/unslop-ui` or
+/// `~/.config/opencode/skills/unslop-ui`). A copy that lives only in another
+/// editor's scope is invisible to the session, so naming it would be a phantom.
+///
+/// The mandate is deliberately about **specs and reviews**, never code: the
+/// designer decides how a screen looks and behaves, and `@writer` builds it.
+const DESIGNER: &str = "You are the **designer**, the team's UI/UX designer.
+
+Work within your own role and leave work that belongs to a teammate to them: hand it off
+with a line-leading `@<id> <instruction>` directive. Deliver your finished result back to
+the user with `@user <summary>`.
+
+## UI/UX mandate
+
+You own the design remit end to end: how a screen looks, reads, and behaves — its layout,
+hierarchy, colour and type scales, component specs, and its states — is yours to decide,
+and nothing outside it is. You deliver **specs and reviews, not code**.
+
+**The pipeline.** Work in stages, and say which stage you are in:
+
+1. **Brief** — read the target screen or component and the user's goal. Name the audience
+   and the one thing the screen has to make obvious.
+2. **Audit** — judge what is there against `unslop-ui`, and name the concrete defects: a
+   homogenous palette, an icon in a rounded square, emoji standing in for icons,
+   glassmorphism, a gratuitous gradient or shadow, a broken hierarchy. \"It looks off\" is
+   not a finding; the offending element and the rule it breaks is.
+3. **Spec** — write the fix as numbers and tokens: a spacing scale, a type ramp, a colour
+   set with hex values, the component's states (default, hover, focus, active, disabled,
+   empty, loading, error), and what it must not do. Give the contrast ratio for any
+   text/background pair that is close to the line.
+4. **Hand-off** — `@writer` implements the spec; you do not. Ask `@tester` to check the
+   built screen against the spec in a browser, and `@reviewer` for a second opinion on a
+   deliverable.
+5. **Critique** — compare the implemented screen with the spec, stage by stage, and hand
+   every gap back to `@writer` with the specific correction.
+
+**Restraint.** Less is more: every visual element has to earn its place. Prefer whitespace
+and alignment over borders, one accent over a palette of tints, and a solid neutral
+background over a gradient. Name the rule a recommendation follows, so a reader can check
+it rather than take it on taste.
+
+**Boundaries.** You do not write application code or tests, documentation, or 2D/3D
+assets; hand those to `@writer`, `@tester`, `@image`, or `@modeler` with a line-leading
+directive. Deliver the finished spec or critique, and where it lives, with
+`@user <summary>`.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +406,7 @@ mod tests {
             ("reviewer", "You are the **reviewer**"),
             ("engineer", "You are the **engineer**"),
             ("modeler", "You are the **modeler**"),
+            ("designer", "You are the **designer**"),
         ] {
             let employee = Employee::new(id, "N", "Role");
             assert!(
@@ -359,6 +428,7 @@ mod tests {
             ("researcher", "Aria", "Research lead", RESEARCHER_EXAMPLE),
             ("writer", "Bruno", "Writer", WRITER_EXAMPLE),
             ("reviewer", "Cleo", "Reviewer", REVIEWER_EXAMPLE),
+            ("designer", "Juno", "UI/UX designer", DESIGNER_EXAMPLE),
         ] {
             assert_eq!(
                 definition(&Employee::new(id, name, role)),
@@ -373,13 +443,21 @@ mod tests {
     const RESEARCHER_EXAMPLE: &str = include_str!("../examples/agents/researcher.md");
     const WRITER_EXAMPLE: &str = include_str!("../examples/agents/writer.md");
     const REVIEWER_EXAMPLE: &str = include_str!("../examples/agents/reviewer.md");
+    const DESIGNER_EXAMPLE: &str = include_str!("../examples/agents/designer.md");
 
     /// Every role prompt lets the employee finish its own work: there is no root
     /// above it to report to any more, so each one delivers with `@user` and
     /// knows how to hand a sub-task sideways.
     #[test]
     fn every_role_prompt_delivers_and_delegates() {
-        for id in ["planner", "researcher", "writer", "reviewer", "engineer"] {
+        for id in [
+            "planner",
+            "researcher",
+            "writer",
+            "reviewer",
+            "engineer",
+            "designer",
+        ] {
             let text = definition(&Employee::new(id, "N", "Role"));
             assert!(
                 text.contains("@user <"),
@@ -441,6 +519,71 @@ mod tests {
         assert!(
             !text.contains("through MCP") && !text.contains("via MCP"),
             "must not describe blender-toolkit as an MCP bridge: {text}"
+        );
+    }
+
+    /// The designer mandate names the one skill it relies on (`unslop-ui`, which
+    /// must be installed where OpenCode can see it) and keeps implementation with
+    /// `@writer` — a designer that writes the code has taken a teammate's job.
+    #[test]
+    fn designer_gets_the_ux_mandate() {
+        let employee = Employee::new("designer", "Juno", "UI/UX designer");
+        let text = definition(&employee);
+
+        assert!(
+            text.contains("## UI/UX mandate"),
+            "should carry the mandate"
+        );
+        assert!(text.contains("`unslop-ui`"), "should name its design skill");
+
+        // The pipeline's five stages are the shape of the work.
+        for stage in [
+            "**Brief**",
+            "**Audit**",
+            "**Spec**",
+            "**Hand-off**",
+            "**Critique**",
+        ] {
+            assert!(
+                text.contains(stage),
+                "the mandate should have {stage}: {text}"
+            );
+        }
+
+        // Specs and reviews, not code: implementation is `@writer`'s.
+        assert!(
+            text.contains("`@writer` implements the spec"),
+            "implementation must be handed to the writer: {text}"
+        );
+        assert!(
+            !text.contains("You own the implementation"),
+            "the designer must not claim code authorship: {text}"
+        );
+        assert!(
+            text.contains("not code"),
+            "the mandate should say it delivers specs, not code: {text}"
+        );
+    }
+
+    /// The designer mandate follows the `agent` override like the modeler's does,
+    /// and its frontmatter description is its own rather than the human role.
+    #[test]
+    fn designer_mandate_follows_the_agent_override() {
+        let mut employee = Employee::new("juno", "Juno", "Designer");
+        assert!(
+            definition(&employee).contains("**Juno** (`juno`)"),
+            "a plain id still gets the generic identity prompt"
+        );
+
+        employee.agent = Some(DESIGNER_ID.into());
+        let text = definition(&employee);
+        assert!(
+            text.contains("## UI/UX mandate"),
+            "the `agent` override should select the mandate"
+        );
+        assert!(
+            text.contains("description: \"UI/UX designer\""),
+            "the description should be the mandate's own: {text}"
         );
     }
 

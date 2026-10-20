@@ -161,6 +161,8 @@ writes the implementation, code, or final prose; it delegates those to the \
 teammate whose role covers them (e.g. the software engineer / writer).\n\
   - The researcher investigates and gathers facts, data, and references.\n\
   - The software engineer / writer owns implementation, code, and prose.\n\
+  - The UI/UX designer owns layout, visual hierarchy, colour and type scales, and \
+design specs; implementation of a screen belongs to the software engineer / writer.\n\
   - The reviewer checks, critiques, and verifies others' work.\n\n\
 When a sub-task is better done by a teammate, delegate it by ending your reply \
 with one or more lines of the form:\n\n  @<id> <instruction>\n\nFor example:\n  \
@@ -304,6 +306,9 @@ mod tests {
         // The planner is explicitly told to delegate implementation away.
         assert!(ctx.contains("never writes the implementation"));
         assert!(ctx.contains("software engineer / writer"));
+        // …and design work is routed to the designer, who does not implement it.
+        assert!(ctx.contains("UI/UX designer owns layout"));
+        assert!(ctx.contains("design specs"));
     }
 
     /// Every employee is a peer: the roster is a flat list and each one may
