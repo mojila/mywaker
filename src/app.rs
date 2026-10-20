@@ -87,10 +87,14 @@ pub enum Mode {
 ///
 /// The kind travels with the text so the delivery policy (and the idempotent
 /// admission id) is decided where the work is queued, not guessed at flush time.
+/// The `token` is minted here, once, so a re-flush of this exact queued prompt
+/// re-sends the same admission id (the service deduplicates it) while the next
+/// prompt — even to the same employee — gets a fresh one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Outgoing {
     kind: harness::PromptKind,
     text: String,
+    token: String,
 }
 
 impl Outgoing {
@@ -98,6 +102,7 @@ impl Outgoing {
         Self {
             kind,
             text: text.into(),
+            token: harness::delivery_token(),
         }
     }
 
@@ -1985,18 +1990,22 @@ impl App {
             prompt,
             harness::PromptKind::UserPrompt,
             0,
+            &harness::delivery_token(),
         );
     }
 
-    /// Spawn one prompt delivery to a live session. A transport error comes back
-    /// as [`Message::DeliveryFailed`], so the caller's retry and queue logic sees
-    /// it as the turn ending badly rather than by silence.
     /// Spawn one prompt delivery to a live session, under the delivery policy for
     /// `kind`.
     ///
     /// The options carry both the steer/queue decision (from
     /// [`harness::delivery_for`]) and the admission id, so a resend of the same
-    /// logical delivery is deduplicated rather than admitted twice.
+    /// logical delivery is deduplicated rather than admitted twice. `token` is
+    /// the delivery's identity: the same token re-sends the same admission id,
+    /// a new token makes a new delivery.
+    ///
+    /// A transport error comes back as [`Message::DeliveryFailed`], so the
+    /// caller's retry and queue logic sees it as the turn ending badly rather
+    /// than by silence.
     fn spawn_prompt(
         &self,
         employee: usize,
@@ -2004,6 +2013,7 @@ impl App {
         prompt: String,
         kind: harness::PromptKind,
         attempt: u8,
+        token: &str,
     ) {
         let Some(client) = self.client.clone() else {
             return;
@@ -2015,7 +2025,7 @@ impl App {
             .map(|e| e.agent_id().to_string())
             .unwrap_or_else(|| employee.to_string());
         let depth = self.chain_depth(employee);
-        let options = harness::prompt_options(kind, &id, depth, attempt);
+        let options = harness::prompt_options(kind, &id, depth, attempt, token);
 
         let tx = self.tx.clone();
         let target = employee;
@@ -2599,6 +2609,7 @@ impl App {
             let Outgoing {
                 kind,
                 text: instruction,
+                token,
             } = outgoing;
             self.team
                 .set_last_task(employee, Some(task_summary(&instruction)));
@@ -2626,7 +2637,7 @@ impl App {
                 }
             }
             let session_id = session_id.clone();
-            self.spawn_prompt(employee, session_id, prompt, kind, attempts);
+            self.spawn_prompt(employee, session_id, prompt, kind, attempts, &token);
         }
     }
 
@@ -4490,6 +4501,7 @@ async fn run_task_attempt(
         agent.unwrap_or_default(),
         0,
         0,
+        &harness::delivery_token(),
     );
 
     client

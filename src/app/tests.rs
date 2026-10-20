@@ -1346,6 +1346,72 @@ async fn user_prompts_steer_and_hand_offs_queue() {
     );
 }
 
+/// Every admission id the app sends must satisfy OpenCode's `Session.Message.ID`
+/// contract (`^msg_`). Before this, the id was `mywaker:<kind>:…` and the service
+/// rejected *every* prompt with `400 … Expected a string starting with "msg_"`.
+#[tokio::test]
+async fn every_admission_id_starts_with_msg_() {
+    let (client, server) = recorder::start().await;
+
+    let (mut app, _rx) = make_app();
+    app.client = Some(client);
+
+    let writer = employee(&app, "writer");
+    app.chats.entry(writer).or_default().session_id = Some("ses_w".into());
+    open_chat(&mut app, writer);
+    app.input = "draft the intro".into();
+    app.send_prompt();
+    recorder::wait_for_prompts(&server, 1).await;
+
+    app.send_to_employee(
+        writer,
+        "polish the intro".to_string(),
+        harness::PromptKind::Delegation,
+    );
+    recorder::wait_for_prompts(&server, 2).await;
+
+    let ids = server.admission_ids.lock().unwrap().clone();
+    assert_eq!(ids.len(), 2);
+    for id in ids {
+        let id = id.expect("every delivery carries an admission id");
+        assert!(id.starts_with("msg_"), "not a Session.Message.ID: {id}");
+    }
+}
+
+/// Two user prompts to the same employee are two deliveries, so they must not
+/// share an admission id. A repeat would be silently deduplicated by the
+/// service (same session) or rejected with a 409 (another session) — either way
+/// the second prompt would never run.
+#[tokio::test]
+async fn a_second_prompt_to_the_same_employee_gets_a_new_admission_id() {
+    let (client, server) = recorder::start().await;
+
+    let (mut app, _rx) = make_app();
+    app.client = Some(client);
+
+    let writer = employee(&app, "writer");
+    app.chats.entry(writer).or_default().session_id = Some("ses_w".into());
+    open_chat(&mut app, writer);
+
+    app.input = "draft the intro".into();
+    app.send_prompt();
+    recorder::wait_for_prompts(&server, 1).await;
+
+    // The turn ended, so the employee is idle again and the next prompt goes
+    // straight out — same employee, same depth, same attempt.
+    app.team.set_status(writer, EmployeeStatus::Idle);
+    app.input = "now tighten it".into();
+    app.send_prompt();
+    recorder::wait_for_prompts(&server, 2).await;
+
+    let ids = server.admission_ids.lock().unwrap().clone();
+    assert_eq!(ids.len(), 2, "both prompts were delivered");
+    assert_ne!(
+        ids[0], ids[1],
+        "a second prompt reused the first prompt's admission id"
+    );
+}
+
 /// A queued delivery that has not started executing is never treated as silent:
 /// the retry clock starts at `session.execution.started`, so a prompt waiting
 /// behind the previous turn is not "retried" into a duplicate admission.

@@ -179,15 +179,47 @@ pub fn delivery_for(kind: PromptKind) -> Delivery {
     }
 }
 
-/// The admission id for one delivery: `(employee, chain depth, attempt)`.
+/// The prefix every client-supplied admission id must carry.
 ///
-/// Idempotency is what makes a retry safe. The same logical delivery — the same
-/// employee, at the same point in the same chain, on the same attempt — always
-/// produces the same id, so a resend after a timeout is deduplicated by the
-/// service instead of starting a second turn. A genuinely different delivery
-/// (another employee, one step deeper, a later attempt) gets a different id.
-pub fn admission_id(kind: PromptKind, employee: &str, depth: usize, attempt: u8) -> String {
-    format!("mywaker:{}:{employee}:{depth}:{attempt}", kind.label())
+/// OpenCode types a prompt's `id` as `Session.Message.ID`, which is
+/// `^msg_`-anchored. A well-meaning `mywaker:…` id is rejected outright with
+/// `400 InvalidRequestError: Expected a string starting with "msg_" at ["id"]`,
+/// so the prefix is part of the contract, not a convention.
+const ADMISSION_PREFIX: &str = "msg_mywaker";
+
+/// A fresh token identifying one logical delivery.
+///
+/// The `(kind, employee, depth, attempt)` tuple alone does **not** identify a
+/// delivery: a user's second prompt to the same employee, a fresh session after
+/// `/new`, and two independent chains that reach the same employee at the same
+/// depth all produce the same tuple. OpenCode's admission ids are unique across
+/// the whole service (a repeat in *another* session is a `409 ConflictError`),
+/// and within one session a repeat is silently deduplicated — the second message
+/// would be swallowed. So each delivery carries its own token, minted once when
+/// the delivery is created and reused only if that exact delivery is re-sent.
+pub fn delivery_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The admission id for one delivery: `(kind, employee, chain depth, attempt,
+/// token)`.
+///
+/// The id starts with `msg_` because OpenCode requires it, and it is unique per
+/// logical delivery because of the token. Re-sending the *same* delivery (same
+/// tuple, same token) repeats the id, which is what lets the service deduplicate
+/// it instead of starting a second turn; a genuinely different delivery (another
+/// employee, one step deeper, a later attempt, a new token) gets a different id.
+pub fn admission_id(
+    kind: PromptKind,
+    employee: &str,
+    depth: usize,
+    attempt: u8,
+    token: &str,
+) -> String {
+    format!(
+        "{ADMISSION_PREFIX}:{}:{employee}:{depth}:{attempt}:{token}",
+        kind.label()
+    )
 }
 
 /// The options for one delivery: the policy from [`delivery_for`] plus the
@@ -197,10 +229,11 @@ pub fn prompt_options(
     employee: &str,
     depth: usize,
     attempt: u8,
+    token: &str,
 ) -> PromptOptions {
     PromptOptions::new(
         delivery_for(kind),
-        admission_id(kind, employee, depth, attempt),
+        admission_id(kind, employee, depth, attempt, token),
     )
 }
 
@@ -234,35 +267,97 @@ mod tests {
     /// the same logical delivery is deduplicated and a different one is not.
     #[test]
     fn admission_ids_are_stable_per_delivery_and_distinct_across_deliveries() {
-        let first = admission_id(PromptKind::Delegation, "writer", 2, 0);
+        let token = "abc123";
+        let first = admission_id(PromptKind::Delegation, "writer", 2, 0, token);
 
-        // Same employee, same depth, same attempt → the same id.
-        assert_eq!(first, admission_id(PromptKind::Delegation, "writer", 2, 0));
+        // Same employee, same depth, same attempt, same token → the same id.
+        assert_eq!(
+            first,
+            admission_id(PromptKind::Delegation, "writer", 2, 0, token)
+        );
 
         // A retry of the same hand-off is a *different* delivery.
-        assert_ne!(first, admission_id(PromptKind::Delegation, "writer", 2, 1));
-        // As is one step deeper, another employee, or another kind.
-        assert_ne!(first, admission_id(PromptKind::Delegation, "writer", 3, 0));
-        assert_ne!(first, admission_id(PromptKind::Delegation, "coder", 2, 0));
-        assert_ne!(first, admission_id(PromptKind::Report, "writer", 2, 0));
+        assert_ne!(
+            first,
+            admission_id(PromptKind::Delegation, "writer", 2, 1, token)
+        );
+        // As is one step deeper, another employee, another kind, or a new token.
+        assert_ne!(
+            first,
+            admission_id(PromptKind::Delegation, "writer", 3, 0, token)
+        );
+        assert_ne!(
+            first,
+            admission_id(PromptKind::Delegation, "coder", 2, 0, token)
+        );
+        assert_ne!(
+            first,
+            admission_id(PromptKind::Report, "writer", 2, 0, token)
+        );
+        assert_ne!(
+            first,
+            admission_id(PromptKind::Delegation, "writer", 2, 0, "other")
+        );
 
         // It names the kind and the employee, so a log line is readable.
         assert!(first.contains("delegation"), "{first}");
         assert!(first.contains("writer"), "{first}");
     }
 
+    /// OpenCode types a prompt's `id` as `Session.Message.ID` (`^msg_`). An id
+    /// without that prefix is rejected with a 400, which is what broke every
+    /// prompt before this was pinned.
+    #[test]
+    fn admission_ids_start_with_the_prefix_the_service_requires() {
+        for kind in [
+            PromptKind::UserPrompt,
+            PromptKind::Delegation,
+            PromptKind::Report,
+            PromptKind::FanoutBrief,
+            PromptKind::Retry,
+            PromptKind::AutonomousTask,
+        ] {
+            let id = admission_id(kind, "orchestrator", 0, 0, &delivery_token());
+            assert!(id.starts_with("msg_"), "{kind:?} produced {id}");
+        }
+    }
+
+    /// Two deliveries that share `(kind, employee, depth, attempt)` are still
+    /// distinct: a user's second prompt, or a fresh session after `/new`, must
+    /// not reuse an admission id. Reusing one makes the service swallow the
+    /// message (same session) or reject it with a 409 (another session).
+    #[test]
+    fn two_deliveries_with_the_same_shape_get_different_ids() {
+        let first = admission_id(
+            PromptKind::UserPrompt,
+            "orchestrator",
+            0,
+            0,
+            &delivery_token(),
+        );
+        let second = admission_id(
+            PromptKind::UserPrompt,
+            "orchestrator",
+            0,
+            0,
+            &delivery_token(),
+        );
+        assert_ne!(first, second);
+    }
+
     /// The options pair the policy with the id — one call site cannot take one
     /// without the other.
     #[test]
     fn prompt_options_carry_both_the_policy_and_the_id() {
-        let options = prompt_options(PromptKind::Report, "writer", 1, 0);
+        let token = delivery_token();
+        let options = prompt_options(PromptKind::Report, "writer", 1, 0, &token);
         assert_eq!(options.delivery, Delivery::Queue);
         assert_eq!(
             options.admission_id.as_deref(),
-            Some(admission_id(PromptKind::Report, "writer", 1, 0).as_str())
+            Some(admission_id(PromptKind::Report, "writer", 1, 0, &token).as_str())
         );
 
-        let user = prompt_options(PromptKind::UserPrompt, "writer", 0, 0);
+        let user = prompt_options(PromptKind::UserPrompt, "writer", 0, 0, &token);
         assert_eq!(user.delivery, Delivery::Steer);
     }
 

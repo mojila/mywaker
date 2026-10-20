@@ -73,23 +73,42 @@ async fn prompt(
     State(state): State<FakeState>,
     Path(_id): Path<String>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Response {
     let text = body
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let admission_id = body.get("id").and_then(Value::as_str).map(str::to_owned);
+
+    // OpenCode types a prompt's `id` as `Session.Message.ID` (`^msg_`) and
+    // rejects anything else with a 400 — the exact failure this fake must
+    // reproduce, or a regression in the client goes unnoticed.
+    if let Some(id) = &admission_id
+        && !id.starts_with("msg_")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "_tag": "InvalidRequestError",
+                "message": "Expected a string starting with \"msg_\"\n  at [\"id\"]",
+                "kind": "Payload",
+            })),
+        )
+            .into_response();
+    }
+
     let received = ReceivedPrompt {
         text: text.clone(),
         delivery: body
             .get("delivery")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        admission_id: body.get("id").and_then(Value::as_str).map(str::to_owned),
+        admission_id,
     };
     state.prompts.lock().unwrap().push(text);
     state.received.lock().unwrap().push(received);
-    Json(json!({}))
+    Json(json!({})).into_response()
 }
 
 async fn messages(State(state): State<FakeState>, Path(_id): Path<String>) -> Json<Value> {
@@ -249,7 +268,7 @@ async fn prompt_with_sends_delivery_and_admission_id() {
 
     let options = mywaker::opencode::PromptOptions::new(
         mywaker::opencode::Delivery::Queue,
-        "mywaker:delegation:writer:1:0",
+        "msg_mywaker:delegation:writer:1:0:abc123",
     );
     client
         .prompt_with("ses_test", "queued work", &options)
@@ -262,7 +281,7 @@ async fn prompt_with_sends_delivery_and_admission_id() {
     assert_eq!(received[0].delivery.as_deref(), Some("queue"));
     assert_eq!(
         received[0].admission_id.as_deref(),
-        Some("mywaker:delegation:writer:1:0")
+        Some("msg_mywaker:delegation:writer:1:0:abc123")
     );
 
     // The same id again is the same admission: the client sends it unchanged, which
@@ -274,4 +293,31 @@ async fn prompt_with_sends_delivery_and_admission_id() {
     let received = state.received.lock().unwrap().clone();
     assert_eq!(received.len(), 2);
     assert_eq!(received[0].admission_id, received[1].admission_id);
+}
+
+/// A harness-built admission id must survive the service's own validation. This
+/// drives the real `harness::prompt_options` into the fake, whose `prompt` handler
+/// enforces OpenCode's `Session.Message.ID` (`^msg_`) contract — so reverting the
+/// prefix (the bug that made every prompt a 400) fails here.
+#[tokio::test]
+async fn a_harness_admission_id_is_accepted_by_the_service_contract() {
+    let (client, state) = start_server().await;
+    client.create_session("/work", None, None).await.unwrap();
+
+    for kind in [
+        mywaker::harness::PromptKind::UserPrompt,
+        mywaker::harness::PromptKind::Delegation,
+        mywaker::harness::PromptKind::Report,
+        mywaker::harness::PromptKind::FanoutBrief,
+        mywaker::harness::PromptKind::Retry,
+        mywaker::harness::PromptKind::AutonomousTask,
+    ] {
+        let options = mywaker::harness::prompt_options(kind, "writer", 1, 0, "abc123");
+        client
+            .prompt_with("ses_test", "hand-off", &options)
+            .await
+            .unwrap_or_else(|err| panic!("{kind:?} was rejected by the service contract: {err:#}"));
+    }
+
+    assert_eq!(state.received.lock().unwrap().len(), 6);
 }
