@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 
-use crate::opencode::{AgentInfo, DEFAULT_PROVIDER, ModelRef};
+use crate::opencode::{AgentInfo, DEFAULT_PROVIDER, ModelRef, ToolUse};
 use crate::role::Role;
 
 /// Lifecycle status of an employee; drives the robot avatar and roster UI.
@@ -75,6 +75,17 @@ pub struct Employee {
     /// task.
     #[serde(skip)]
     pub last_task: Option<String>,
+    /// The most recent tool this employee invoked (runtime-only).
+    ///
+    /// Set from the `session.tool.started` / `.success` / `.failed` events, from
+    /// [`Event::tool_use`](crate::opencode::Event::tool_use) — the classified
+    /// call, not the raw label the chat transcript prints. Cleared when a new turn
+    /// starts (`session.execution.started`) and by `App::reset_chat`
+    /// (`/new` · `/clear`). Like [`Self::last_task`] it is **retained** through
+    /// `Done`/`Error`, so a finished card still says what it did — the grid's
+    /// `tool` row reads it.
+    #[serde(skip)]
+    pub last_tool: Option<ToolUse>,
     /// Current work status (runtime-only).
     #[serde(skip)]
     pub status: EmployeeStatus,
@@ -93,6 +104,7 @@ impl Employee {
             agent: None,
             onboarded: today_iso(),
             last_task: None,
+            last_tool: None,
             status: EmployeeStatus::Idle,
         }
     }
@@ -261,6 +273,20 @@ impl Team {
         }
     }
 
+    /// Set one employee's last tool by index (no-op if out of range).
+    pub fn set_last_tool(&mut self, index: usize, tool: Option<ToolUse>) {
+        if let Some(employee) = self.employees.get_mut(index) {
+            employee.last_tool = tool;
+        }
+    }
+
+    /// Set one employee's last tool by id (no-op if the id is unknown).
+    pub fn set_last_tool_by_id(&mut self, id: &str, tool: Option<ToolUse>) {
+        if let Some(employee) = self.employee_mut(id) {
+            employee.last_tool = tool;
+        }
+    }
+
     // --- roster management (CRUD) ---
 
     /// Add an employee, rejecting duplicate ids.
@@ -385,6 +411,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opencode::ToolClass;
 
     #[test]
     fn status_labels() {
@@ -612,17 +639,83 @@ mod tests {
     }
 
     #[test]
+    fn set_last_tool_updates_by_index_and_id_and_clears() {
+        let mut team = Team::starter();
+        let writer = team
+            .employees()
+            .iter()
+            .position(|e| e.id == "writer")
+            .expect("the starter roster has a writer");
+
+        let tool = |name: &str| Some(ToolUse::builtin(name));
+        team.set_last_tool(writer, tool("bash"));
+        assert_eq!(
+            team.employee("writer").and_then(|e| e.last_tool.as_ref()),
+            tool("bash").as_ref()
+        );
+        assert_eq!(
+            team.employee("writer")
+                .and_then(|e| e.last_tool.as_ref())
+                .map(ToolUse::label)
+                .as_deref(),
+            Some("bash")
+        );
+
+        // Only the named employee changes.
+        assert!(
+            team.employees()
+                .iter()
+                .enumerate()
+                .all(|(index, e)| index == writer || e.last_tool.is_none())
+        );
+
+        // By id, overwriting with a classified call and then clearing.
+        let skill = ToolUse::new(ToolClass::Skill, "opencode");
+        team.set_last_tool_by_id("writer", Some(skill.clone()));
+        let stored = team
+            .employee("writer")
+            .and_then(|e| e.last_tool.clone())
+            .expect("the skill is stored");
+        assert_eq!(stored, skill);
+        assert_eq!(stored.label(), "skill:opencode");
+        assert_eq!(stored.class, ToolClass::Skill);
+
+        team.set_last_tool_by_id("writer", None);
+        assert!(
+            team.employee("writer")
+                .and_then(|e| e.last_tool.as_ref())
+                .is_none()
+        );
+
+        // Clearing by index clears too.
+        team.set_last_tool(writer, tool("grep"));
+        team.set_last_tool(writer, None);
+        assert!(
+            team.employee("writer")
+                .and_then(|e| e.last_tool.as_ref())
+                .is_none()
+        );
+
+        // Unknown index / id are no-ops, not panics.
+        team.set_last_tool(99, tool("x"));
+        team.set_last_tool_by_id("nobody", tool("x"));
+    }
+
+    #[test]
     fn round_trips_through_toml() {
         let mut team = Team::starter();
         team.add_skill("writer", "copywriting").unwrap();
         team.employee_mut("writer").unwrap().model = Some("openai/gpt-6-luna-pro".into());
         team.employee_mut("writer").unwrap().model_provider = Some("openrouter".into());
         team.employee_mut("writer").unwrap().agent = Some("code-gen".into());
+        // Runtime-only: even when set, it must not reach the file (A6).
+        team.set_last_tool_by_id("writer", Some(ToolUse::builtin("bash")));
 
         let text = toml::to_string_pretty(&team).unwrap();
         // Runtime fields are not persisted.
         assert!(!text.contains("status"));
         assert!(!text.contains("last_task"));
+        assert!(!text.contains("last_tool"));
 
         let loaded: Team = toml::from_str(&text).unwrap();
         assert_eq!(loaded.len(), 4);

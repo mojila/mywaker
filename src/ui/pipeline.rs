@@ -28,6 +28,7 @@ use ratatui::{
 };
 
 use crate::app::App;
+use crate::opencode::{ToolClass, ToolUse};
 use crate::team::Employee;
 use crate::ui::{status, truncate, wires};
 
@@ -78,9 +79,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Number of content rows inside a stage box (plus two border rows): the head
-/// (status glyph + name), the role, the live status, and the model. Every card
-/// fills all of them, so the cards line up.
-const CONTENT_LINES: u16 = 4;
+/// (status glyph + name), the role, the live status, the model, and the tool the
+/// employee is (or was last) running. Every card fills all of them, so the cards
+/// line up.
+const CONTENT_LINES: u16 = 5;
 const STAGE_HEIGHT: u16 = CONTENT_LINES + 2;
 
 /// Columns in the grid. Fixed: the roster is a team, not a responsive gallery,
@@ -200,15 +202,15 @@ struct Row {
 }
 
 impl Row {
-    /// The row's height including its heading, before the gap that separates it
-    /// from the previous row.
-    fn block(self) -> u16 {
-        STAGE_HEIGHT + if self.heading { 1 } else { 0 }
+    /// The row's height including its heading — when headings are being drawn at
+    /// all — before the gap that separates it from the previous row.
+    fn block(self, headings: bool) -> u16 {
+        STAGE_HEIGHT + u16::from(headings && self.heading)
     }
 
     /// The row's height plus the gap above it (none above the first row).
-    fn span(self, index: usize) -> u16 {
-        self.block() + if index == 0 { 0 } else { ROW_GAP }
+    fn span(self, index: usize, headings: bool) -> u16 {
+        self.block(headings) + if index == 0 { 0 } else { ROW_GAP }
     }
 }
 
@@ -253,6 +255,9 @@ pub(crate) struct Shape {
     pub(crate) active_count: usize,
     /// The height the rows may occupy (below the title, strip, and bus).
     pub(crate) available: u16,
+    /// Whether section headings are drawn. Off only when a heading would cost the
+    /// last card row (see [`shape`]); [`sticky_rows`] and [`window`] read it.
+    pub(crate) headings: bool,
 }
 
 /// The grid's geometry for one panel, roster, and scroll offset: the shape, the
@@ -316,12 +321,13 @@ pub(crate) fn shape(area: Rect, sections: &Sections) -> Shape {
     let title = Rect::new(area.x, area.y, area.width, title_height);
     let below_title = area.height.saturating_sub(title_height);
 
-    // How many whole card rows fit in `height`, counting each row's heading.
-    let rows_fitting = |height: u16| {
+    // How many whole card rows fit in `height`, counting each row's heading when
+    // headings are being drawn.
+    let rows_fitting = |height: u16, headings: bool| {
         let mut used = 0u16;
         let mut count = 0usize;
         for (index, row) in rows.iter().enumerate() {
-            let need = row.span(index);
+            let need = row.span(index, headings);
             if used + need > height {
                 break;
             }
@@ -334,10 +340,10 @@ pub(crate) fn shape(area: Rect, sections: &Sections) -> Shape {
     // The pipeline costs up to two rows (strip + bus). Each is kept only when it
     // does not cost a card row, and the bus goes before the strip: the strip is
     // Jev, the bus is the wire between employees.
-    let without = rows_fitting(below_title);
-    let with_strip = rows_fitting(below_title.saturating_sub(1));
+    let without = rows_fitting(below_title, true);
+    let with_strip = rows_fitting(below_title.saturating_sub(1), true);
     let strip_height = u16::from(with_strip == without && below_title > STAGE_HEIGHT);
-    let with_bus = rows_fitting(below_title.saturating_sub(strip_height + 1));
+    let with_bus = rows_fitting(below_title.saturating_sub(strip_height + 1), true);
     let bus_height =
         u16::from(strip_height == 1 && with_bus == without && below_title > STAGE_HEIGHT);
 
@@ -351,14 +357,29 @@ pub(crate) fn shape(area: Rect, sections: &Sections) -> Shape {
 
     let available = below_title.saturating_sub(strip_height + bus_height);
 
+    // A heading is a label; a card is the work. When the panel is so short that
+    // the heading would cost the *last* card row, the headings go instead of the
+    // row — at 60×16 the team panel is eight rows, and one seven-row card plus a
+    // heading no longer fits. Cards keep their status glyph and colour, so the
+    // sections stay readable without the label.
+    let mut headings = true;
+    let mut visible_rows = rows_fitting(available, true);
+    if visible_rows == 0 && !rows.is_empty() {
+        let bare = rows_fitting(available, false);
+        if bare > 0 {
+            headings = false;
+            visible_rows = bare;
+        }
+    }
+
     // The bottom-most scroll position is the *first* one whose tail — every row
     // from there to the end, plus the sticky heading it needs — still fits whole.
     // That is the last page: it ends exactly on the last row, and scrolling
     // further would only add blank rows.
     let tail_fits = |offset: usize| {
         let used: u16 = (offset..rows.len())
-            .map(|index| rows[index].span(index - offset))
-            .fold(sticky_rows(&rows, offset), |sum, need| {
+            .map(|index| rows[index].span(index - offset, headings))
+            .fold(sticky_rows(&rows, offset, headings), |sum, need| {
                 sum.saturating_add(need)
             });
         used <= available
@@ -370,7 +391,6 @@ pub(crate) fn shape(area: Rect, sections: &Sections) -> Shape {
     let (visible_rows, max_offset) = if cell_width == 0 || rows.is_empty() {
         (0, 0)
     } else {
-        let visible_rows = rows_fitting(available.saturating_sub(sticky_rows(&rows, 0)));
         let max_offset = if visible_rows == 0 {
             0 // nothing drawn, so there is nowhere to scroll to
         } else {
@@ -399,15 +419,17 @@ pub(crate) fn shape(area: Rect, sections: &Sections) -> Shape {
         visible_card_rows,
         active_count,
         available,
+        headings,
     }
 }
 
 /// The rows reserved above the window for a sticky section heading: one when the
 /// window starts mid-section (so the label is never scrolled away from its
-/// cards), none when it starts on a section's first row.
-fn sticky_rows(rows: &[Row], offset: usize) -> u16 {
+/// cards), none when it starts on a section's first row — or when headings are
+/// not drawn at all.
+fn sticky_rows(rows: &[Row], offset: usize, headings: bool) -> u16 {
     match rows.get(offset) {
-        Some(row) if !row.heading => 1,
+        Some(row) if headings && !row.heading => 1,
         _ => 0,
     }
 }
@@ -418,13 +440,13 @@ fn window(shape: &Shape, offset: usize) -> (Option<Section>, usize) {
     let sticky = shape
         .rows
         .get(offset)
-        .filter(|row| !row.heading)
+        .filter(|row| shape.headings && !row.heading)
         .map(|row| row.section);
     let height = shape.available.saturating_sub(u16::from(sticky.is_some()));
     let mut used = 0u16;
     let mut count = 0usize;
     for (index, row) in shape.rows.iter().enumerate().skip(offset) {
-        let need = row.span(index - offset);
+        let need = row.span(index - offset, shape.headings);
         if used + need > height {
             break;
         }
@@ -464,7 +486,7 @@ pub(crate) fn grid(area: Rect, sections: &Sections, offset: usize) -> Grid {
             if index > offset {
                 y = y.saturating_add(ROW_GAP);
             }
-            if row.heading {
+            if shape.headings && row.heading {
                 headings.push((row.section, Rect::new(area.x, y, area.width, 1)));
                 y = y.saturating_add(1);
             }
@@ -748,6 +770,7 @@ fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, s
         )),
         Line::from(Span::styled(employee.status.label(), accent)),
         model_line(employee.model.as_deref(), width, Color::Cyan),
+        tool_line(employee.last_tool.as_ref(), width),
     ];
 
     render_node(frame, area, title, border, lines);
@@ -802,6 +825,92 @@ fn model_line(model: Option<&str>, inner_width: usize, accent: Color) -> Line<'s
                 .add_modifier(Modifier::DIM),
         )),
     }
+}
+
+/// A card's tool row: the name of the tool the employee is running (or last
+/// ran) after a dim `tool` label, or a dimmed placeholder when it has not called
+/// one yet.
+///
+/// **ASCII only.** [`truncate`] counts `char`s, not display columns, so a
+/// double-width glyph (an emoji, say) would blow the inner-width budget and push
+/// the border out of shape. The label, the separator, and the placeholder are
+/// therefore all plain ASCII.
+/// A card's tool row: the classified tool the employee is running (or last ran)
+/// after a dim `tool` label, or a dimmed placeholder when it has not called one
+/// yet.
+///
+/// The **class prefix** (`skill:`, `subagent:`) carries its own colour so the row
+/// is scannable at a glance; the name itself stays gray, so nothing competes with
+/// the card's status colour. A namespaced call has no prefix to colour — its
+/// source (MCP or plugin) is not decidable from the event — so it renders as one
+/// gray name. See [`ToolClass::prefix`].
+///
+/// **ASCII only.** [`truncate`] counts `char`s, not display columns, so a
+/// double-width glyph (an emoji, say) would blow the inner-width budget and push
+/// the border out of shape. The label, the prefixes, and the placeholder are
+/// therefore all plain ASCII.
+fn tool_line(tool: Option<&ToolUse>, inner_width: usize) -> Line<'static> {
+    const PREFIX: &str = "tool ";
+    let label = Style::default().fg(Color::DarkGray);
+    let room = inner_width.saturating_sub(PREFIX.chars().count());
+
+    let Some(tool) = tool else {
+        return Line::from(Span::styled(
+            truncate("tool -", inner_width),
+            label.add_modifier(Modifier::DIM),
+        ));
+    };
+
+    // Too narrow for a label *and* a name: the name is what the row is for, so on
+    // a sliver of a card it keeps the whole width rather than the row overflowing
+    // its box.
+    if room == 0 {
+        return Line::from(Span::styled(
+            truncate(&tool.label(), inner_width),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    let prefix = tool.class.prefix().unwrap_or_default();
+    let name_room = room.saturating_sub(prefix.chars().count());
+    let mut spans = vec![Span::styled(PREFIX, label)];
+    if !prefix.is_empty() && name_room > 0 {
+        // Prefix and name are drawn as one string: truncating the name to what
+        // the prefix leaves is what keeps the row inside the border.
+        spans.push(Span::styled(
+            prefix.to_string(),
+            tool_class_style(tool.class),
+        ));
+        spans.push(Span::styled(
+            truncate(&tool.name, name_room),
+            Style::default().fg(Color::Gray),
+        ));
+    } else {
+        // The prefix would not survive truncation, so it is dropped whole rather
+        // than drawn half-cut: `tool open…` names the skill, `tool skil…` only
+        // names a fragment of a label. The name is the data; the class is the
+        // gloss.
+        spans.push(Span::styled(
+            truncate(&tool.name, room),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The colour a tool class's prefix is drawn in: distinct enough to scan, dim
+/// enough not to compete with the card's status border.
+fn tool_class_style(class: ToolClass) -> Style {
+    let color = match class {
+        ToolClass::Skill => Color::Cyan,
+        ToolClass::Subagent => Color::Magenta,
+        ToolClass::Mcp => Color::Blue,
+        ToolClass::Plugin => Color::Yellow,
+        // No prefix is drawn for these, so the colour is never seen; gray keeps
+        // the mapping total.
+        ToolClass::Builtin | ToolClass::Namespaced => Color::Gray,
+    };
+    Style::default().fg(color)
 }
 
 #[cfg(test)]
@@ -1097,32 +1206,45 @@ mod tests {
     }
 
     /// G9: the Jev strip and bus are drawn while a band still fits beneath them,
-    /// and dropped — bus first, then strip — before that band.
+    /// and dropped — bus first, then strip — before that band. When even a bare
+    /// card row no longer fits beside a heading, the heading goes before the row.
     #[test]
     fn the_pipeline_bands_yield_before_a_card_row() {
         let sections = idle(4);
         // The first row carries the `idle` heading, so it needs
-        // `1 + STAGE_HEIGHT` = 7 rows below the title. With the strip and bus
-        // that is 10 panel rows.
-        let with_both = shape(Rect::new(0, 1, 64, 10), &sections);
+        // `1 + STAGE_HEIGHT` = 8 rows below the title. With the strip and bus
+        // that is 11 panel rows.
+        let with_both = shape(Rect::new(0, 1, 64, 11), &sections);
         assert_eq!(with_both.strip.height, 1);
         assert_eq!(with_both.bus.height, 1);
+        assert!(with_both.headings);
         assert_eq!(with_both.visible_rows, 1);
 
         // One row shorter: the bus would cost the card row, so it goes; the strip
         // stays.
-        let busless = shape(Rect::new(0, 1, 64, 9), &sections);
+        let busless = shape(Rect::new(0, 1, 64, 10), &sections);
         assert_eq!(busless.strip.height, 1);
         assert_eq!(busless.bus.height, 0);
         assert_eq!(busless.visible_rows, 1);
 
         // One shorter again: the strip would cost the row too, so it goes.
-        let bare = shape(Rect::new(0, 1, 64, 8), &sections);
+        let bare = shape(Rect::new(0, 1, 64, 9), &sections);
         assert_eq!(bare.strip.height, 0);
         assert_eq!(bare.bus.height, 0);
+        assert!(bare.headings);
         assert_eq!(bare.visible_rows, 1);
 
-        // Seven rows: not even one complete card (with its heading) fits.
+        // Eight rows: the heading would now cost the only card row, so the
+        // heading goes and the card stays — a label is not worth the work it
+        // labels.
+        let unlabelled = shape(Rect::new(0, 1, 64, 8), &sections);
+        assert!(!unlabelled.headings);
+        assert_eq!(unlabelled.visible_rows, 1);
+        let drawn = grid(Rect::new(0, 1, 64, 8), &sections, 0);
+        assert_eq!(drawn.cells.len(), 3, "a whole row of cards is drawn");
+        assert!(drawn.headings.is_empty(), "no heading, no stray label row");
+
+        // Seven rows: not even one bare card fits.
         let empty = shape(Rect::new(0, 1, 64, 7), &sections);
         assert_eq!(empty.visible_rows, 0);
         assert_eq!(
@@ -1208,9 +1330,17 @@ mod tests {
     /// move the viewport, one past the bottom scrolls just far enough.
     #[test]
     fn reveal_scrolls_the_minimum_distance() {
-        let area = Rect::new(0, 1, 64, 16);
+        // Title + strip + bus + two card bands: the first band carries the `idle`
+        // heading, so two whole rows need `1 + 2 * (1 + STAGE_HEIGHT)` = 17 rows
+        // below the title.
+        let area = Rect::new(0, 1, 64, 19);
         let sections = idle(12);
         let max = shape(area, &sections).max_offset;
+        assert_eq!(
+            shape(area, &sections).visible_rows,
+            2,
+            "the fixture must show two rows for `row 1` to be visible"
+        );
 
         assert_eq!(reveal(area, &sections, 0, 0), 0, "already visible");
         assert_eq!(
@@ -1296,6 +1426,155 @@ mod tests {
         });
 
         assert!(text.contains("kenari/jev-1-13-free"), "{text}");
+    }
+
+    /// The tool row names the tool after a dim label, placeholders an empty row
+    /// with `tool -`, and truncates to what is left of the inner width (A2/A5).
+    /// It is ASCII only: a double-width glyph would break the budget, because
+    /// [`truncate`] counts `char`s rather than display columns.
+    #[test]
+    fn tool_row_labels_placeholders_and_truncates() {
+        let present = tool_line(Some(&ToolUse::builtin("bash")), 40);
+        assert_eq!(present.spans[0].content, "tool ");
+        assert_eq!(present.spans[1].content, "bash");
+        assert!(present.spans.iter().all(|s| s.content.is_ascii()));
+
+        // The name gets the inner width minus the label, and an ellipsis when it
+        // does not fit.
+        let clipped = tool_line(Some(&ToolUse::builtin("very-long-tool-name")), 12);
+        assert_eq!(clipped.spans[0].content, "tool ");
+        assert_eq!(clipped.spans[1].content, "very-l…");
+        let drawn: usize = clipped
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert!(drawn <= 12, "the row never overflows its box: {drawn}");
+
+        let absent = tool_line(None, 40);
+        assert_eq!(absent.spans[0].content, "tool -");
+        assert!(absent.spans[0].content.is_ascii());
+        assert_eq!(
+            absent.spans[0].style.fg,
+            Some(Color::DarkGray),
+            "the placeholder is dim, like the sidebar's empty rows"
+        );
+        assert!(
+            absent.spans[0].style.add_modifier.contains(Modifier::DIM),
+            "the placeholder is dim"
+        );
+
+        // A sliver of a card keeps the name rather than overflowing.
+        let sliver = tool_line(Some(&ToolUse::builtin("bash")), 2);
+        assert_eq!(sliver.spans[0].content, "b…");
+    }
+
+    /// Every class renders its own label — and only `skill:`/`subagent:` carry a
+    /// prefix, because a namespaced call's source is not decidable from the event
+    /// (A8/A9). Each prefix has its own colour so the row scans.
+    #[test]
+    fn tool_row_renders_each_class_label() {
+        let cases = [
+            (ToolUse::builtin("shell"), "", "shell", Color::Gray),
+            (
+                ToolUse::new(ToolClass::Skill, "opencode"),
+                "skill:",
+                "opencode",
+                Color::Cyan,
+            ),
+            (
+                ToolUse::new(ToolClass::Subagent, "backend"),
+                "subagent:",
+                "backend",
+                Color::Magenta,
+            ),
+            (
+                ToolUse::new(ToolClass::Namespaced, "db-audit.run_select_query"),
+                "",
+                "db-audit.run_select_query",
+                Color::Gray,
+            ),
+        ];
+
+        for (tool, prefix, name, color) in cases {
+            let line = tool_line(Some(&tool), 40);
+            assert_eq!(line.spans[0].content, "tool ", "{}", tool.label());
+            assert!(line.spans.iter().all(|s| s.content.is_ascii()));
+            if prefix.is_empty() {
+                // One gray name: no prefix span to colour.
+                assert_eq!(line.spans.len(), 2, "{}", tool.label());
+                assert_eq!(line.spans[1].content, name);
+                assert_eq!(line.spans[1].style.fg, Some(Color::Gray));
+            } else {
+                assert_eq!(line.spans[1].content, prefix, "{}", tool.label());
+                assert_eq!(line.spans[1].style.fg, Some(color), "{}", tool.label());
+                assert_eq!(line.spans[2].content, name, "{}", tool.label());
+                assert_eq!(line.spans[2].style.fg, Some(Color::Gray));
+            }
+        }
+    }
+
+    /// A classified label is truncated as one string — prefix included — so the
+    /// longest class still fits the narrowest 12-column card (A10).
+    #[test]
+    fn a_class_label_fits_the_narrowest_card() {
+        let cases = [
+            ToolUse::new(ToolClass::Skill, "opencode"),
+            ToolUse::new(ToolClass::Subagent, "backend"),
+            ToolUse::new(ToolClass::Namespaced, "db-audit.run_select_query"),
+            ToolUse::builtin("very-long-tool-name"),
+        ];
+        // A 12-column card is 10 cells of inner width.
+        for tool in cases {
+            let line = tool_line(Some(&tool), 10);
+            let drawn: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(drawn <= 10, "{} drew {drawn}: {line:?}", tool.label());
+            // ASCII apart from `truncate`'s own ellipsis: the prefixes and the
+            // names carry no double-width glyph.
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|s| s.content.chars().all(|c| c.is_ascii() || c == '…')),
+                "{}: {line:?}",
+                tool.label()
+            );
+        }
+
+        // A prefix that does not survive truncation is dropped whole rather than
+        // left as a dangling `skill:` fragment with no name.
+        let tight = tool_line(Some(&ToolUse::new(ToolClass::Skill, "opencode")), 8);
+        let joined: String = tight.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            joined, "tool op…",
+            "the prefix is dropped, the name survives"
+        );
+    }
+
+    /// A card prints the tool its employee last used, and the dim placeholder
+    /// when it has not called one (A1/A2).
+    #[test]
+    fn stage_renders_the_last_tool() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+        let mut team = Team::starter();
+        team.set_last_tool(1, Some(ToolUse::new(ToolClass::Skill, "opencode")));
+        let app = App::with_team(Config::default(), tx, team);
+
+        let employee = app.team().employees()[1].clone();
+        let text = node_text(|frame| {
+            let area = frame.area();
+            render_stage(frame, &app, &employee, area, false);
+        });
+        assert!(text.contains("tool skill:opencode"), "{text}");
+
+        // The same card without a tool reads the placeholder.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+        let app = App::with_team(Config::default(), tx, Team::starter());
+        let employee = app.team().employees()[1].clone();
+        let text = node_text(|frame| {
+            let area = frame.area();
+            render_stage(frame, &app, &employee, area, false);
+        });
+        assert!(text.contains("tool -"), "{text}");
     }
 
     /// The strip carries Jev — the shared answerer, which is not a card.

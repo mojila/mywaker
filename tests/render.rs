@@ -191,3 +191,105 @@ fn renders_a_delegation_packet() {
         "an expired packet is still drawn: {expired}"
     );
 }
+
+/// The card's tool row is drawn from the employee's `last_tool`: the name after
+/// a dim `tool` label at 120×40, and the placeholder before anything ran.
+#[test]
+fn renders_the_tool_row_on_a_card() {
+    let mut team = mywaker::team::Team::starter();
+    team.set_last_tool(1, Some(mywaker::opencode::ToolUse::builtin("bash")));
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+    let app = App::with_team(Config::default(), tx, team);
+
+    let text = screen(&app, 120, 40);
+    assert!(
+        text.contains("tool bash"),
+        "the tool row is missing: {text}"
+    );
+    // The other cards have not called one, so they carry the placeholder.
+    assert!(text.contains("tool -"), "the placeholder is missing");
+}
+
+/// A classified tool reads with its class prefix on the card. At 120×40 the
+/// three-column card is 16 cells wide, so the prefix survives and the name is
+/// ellipsised; at 160×50 the whole label fits (A5/A10).
+#[test]
+fn renders_a_classified_tool_label() {
+    let mut team = mywaker::team::Team::starter();
+    team.set_last_tool(
+        1,
+        Some(mywaker::opencode::ToolUse::new(
+            mywaker::opencode::ToolClass::Skill,
+            "opencode",
+        )),
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+    let app = App::with_team(Config::default(), tx, team);
+
+    // Narrow card: the class is the part that must survive, because it is the
+    // information the row exists to add.
+    let narrow = screen(&app, 120, 40);
+    assert!(
+        narrow.contains("tool skill:"),
+        "the class prefix is missing: {narrow}"
+    );
+    assert!(
+        !narrow.contains("skill:opencode"),
+        "a 16-cell card cannot hold the whole label: {narrow}"
+    );
+
+    // Wide card: the whole label fits, unellipsised.
+    let wide = screen(&app, 160, 50);
+    assert!(
+        wide.contains("tool skill:opencode"),
+        "the full classified label is missing: {wide}"
+    );
+}
+
+/// A namespaced call is printed with no source prefix: the row says what ran and
+/// never claims `mcp:` or `plugin:` for a namespace it cannot resolve (A9).
+#[test]
+fn renders_a_namespaced_tool_unprefixed() {
+    let mut team = mywaker::team::Team::starter();
+    team.set_last_tool(
+        1,
+        Some(mywaker::opencode::ToolUse::new(
+            mywaker::opencode::ToolClass::Namespaced,
+            "db-audit.run_select_query",
+        )),
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+    let app = App::with_team(Config::default(), tx, team);
+
+    let text = screen(&app, 120, 40);
+    assert!(text.contains("tool db-audit"), "{text}");
+    assert!(!text.contains("mcp:"), "no invented source prefix: {text}");
+    assert!(!text.contains("plugin:"), "no invented source prefix");
+}
+
+/// A whole card row still fits at 80×24 with the five-row card — the height the
+/// extra row costs comes out of the card *count*, never out of a card.
+#[test]
+fn the_fifth_row_still_leaves_a_whole_card_at_80x24() {
+    let cells = ui::grid_cells(&app(), (80, 24));
+    assert!(
+        !cells.is_empty(),
+        "80×24 must still draw at least one whole card"
+    );
+    let panel = ui::team_area((80, 24));
+    for (_, rect) in &cells {
+        assert!(
+            rect.bottom() <= panel.bottom(),
+            "a card is clipped by the panel: {rect:?} in {panel:?}"
+        );
+        assert!(
+            rect.height >= 7,
+            "a card must keep all five content rows and both borders: {rect:?}"
+        );
+    }
+    // And the screen itself renders.
+    screen(&app(), 80, 24);
+}

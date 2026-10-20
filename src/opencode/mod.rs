@@ -10,7 +10,8 @@ use serde::de::DeserializeOwned;
 
 pub use models::{
     AgentInfo, DEFAULT_PROVIDER, Event, FormField, FormOption, FormRequest, Location, MessageError,
-    ModelRef, Part, ProviderModel, ServerInfo, SessionInfo, SessionMessage, pick_provider,
+    ModelRef, Part, ProviderModel, ServerInfo, SessionInfo, SessionMessage, ToolClass, ToolUse,
+    pick_provider,
 };
 
 /// The fixed username OpenCode's local server expects in its `Basic` auth.

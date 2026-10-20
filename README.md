@@ -37,10 +37,11 @@ employee.
 ```
 
 The team renders as an **employee grid** — three cards per row, ordered plan →
-research → write → review. Each card is a box (name, role, live status, model)
-that lights up in its status colour (yellow thinking, cyan working, green done)
-while the sidebar's robot mirrors the aggregate state. Jev, the shared question
-answerer, is a one-row header above the grid rather than a card of its own.
+research → write → review. Each card is a box (name, role, live status, model,
+the classified tool it is running) that lights up in its status colour (yellow
+thinking, cyan working, green done) while the sidebar's robot mirrors the
+aggregate state. Jev, the shared question answerer, is a one-row header above the
+grid rather than a card of its own.
 The grid is split in two: employees who are **working** sit on top under a
 `◆ working` heading, and everyone else sits below under `◇ idle`, so the top of
 the panel always answers "who is busy right now".
@@ -52,7 +53,14 @@ selected employee, and its answer comes back to the log without opening a chat.
 - **Employee grid** — the team as a fixed three-column grid (one column on a
   narrow panel), ordered plan → research → write → review within each of two
   sections — `◆ working` above, `◇ idle` below — one card per employee with live
-  status + model; a running employee lights up in its status colour and moves to
+  status + model, plus the **tool** it is running, classified: `tool shell` for a
+  built-in, `tool skill:opencode`, `tool subagent:backend`, or the bare
+  `tool db-audit.run_select_query` for a namespaced MCP/plugin tool (no `mcp:` or
+  `plugin:` prefix is claimed — the event cannot tell those apart, so the row says
+  only what it knows). A dim `tool -` stands in before the employee calls
+  anything; the row is cleared when the next turn starts and by `/new`, and kept
+  through `done`/`error` so a finished card still says what it did; a running
+  employee lights up in its status colour and moves to
   the top section. The wheel scrolls the grid, the arrows move the selection and
   reveal it, and
   the title reads `team · N · rows a-b/c` while the roster overflows.

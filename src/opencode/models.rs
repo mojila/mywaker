@@ -85,6 +85,101 @@ pub struct SessionInfo {
     pub location: Option<Location>,
 }
 
+/// What kind of capability a tool call exercised.
+///
+/// OpenCode's own tool ids do not say this: `skill` and `subagent` are ordinary
+/// built-ins that happen to take an argument naming *another* capability, and an
+/// MCP or plugin tool arrives as a namespaced id (`db-audit.run_select_query`)
+/// called from inside the code-mode `execute` tool. The class is therefore
+/// derived in [`Event::tool_use`], not read off the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolClass {
+    /// A tool OpenCode ships itself (`shell`, `read`, `edit`, `execute`, …).
+    Builtin,
+    /// A skill loaded through the `skill` tool.
+    Skill,
+    /// A sub-agent started through the `subagent` tool.
+    Subagent,
+    /// A namespaced tool (`ns.function`) whose *source* — MCP server or plugin —
+    /// this client cannot resolve from the event alone.
+    ///
+    /// Deliberately its own class rather than a guess: an MCP server and a plugin
+    /// both register namespaced ids, and the event carries no marker that tells
+    /// them apart. [`ToolUse::label`] renders it with **no prefix**, so the card
+    /// never claims `mcp:` or `plugin:` for a namespace it has not resolved.
+    Namespaced,
+    /// A namespaced tool known to come from an MCP server.
+    ///
+    /// Reserved for the deferred source resolution (see [`ToolUse`]); nothing
+    /// produces it from an event today.
+    Mcp,
+    /// A namespaced tool known to come from a plugin. Reserved, like [`Self::Mcp`].
+    Plugin,
+}
+
+impl ToolClass {
+    /// The prefix the card prints before the tool's name, or `None` when the name
+    /// stands on its own.
+    ///
+    /// The prefixes are ASCII on purpose: the card's width budget is counted in
+    /// `char`s (`ui::truncate`), so a double-width glyph would push the border
+    /// out of shape.
+    pub fn prefix(self) -> Option<&'static str> {
+        match self {
+            ToolClass::Builtin | ToolClass::Namespaced => None,
+            ToolClass::Skill => Some("skill:"),
+            ToolClass::Subagent => Some("subagent:"),
+            ToolClass::Mcp => Some("mcp:"),
+            ToolClass::Plugin => Some("plugin:"),
+        }
+    }
+}
+
+/// One tool call, classified: what was used, and the name it was used by.
+///
+/// This is what the employee grid's `tool` row shows — `shell`, `skill:opencode`,
+/// `subagent:backend`, `db-audit.run_select_query` — so a glance says both *what
+/// kind* of capability is in play and which one. The chat transcript keeps the
+/// raw [`Event::tool_label`] string, which is the event's own wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUse {
+    pub class: ToolClass,
+    /// The tool id, the skill id, the sub-agent id, or the namespaced tool id.
+    pub name: String,
+}
+
+impl ToolUse {
+    /// A classified tool call.
+    pub fn new(class: ToolClass, name: impl Into<String>) -> Self {
+        Self {
+            class,
+            name: name.into(),
+        }
+    }
+
+    /// A built-in tool call, by id.
+    pub fn builtin(name: impl Into<String>) -> Self {
+        Self::new(ToolClass::Builtin, name)
+    }
+
+    /// What the card prints: the class prefix (when there is one) and the name.
+    pub fn label(&self) -> String {
+        match self.class.prefix() {
+            Some(prefix) => format!("{prefix}{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// The namespace of a namespaced tool (`db-audit` in
+    /// `db-audit.run_select_query`), or `None` when the name has no `.`.
+    ///
+    /// This is the key a future `ToolSources` lookup would use to decide
+    /// [`ToolClass::Mcp`] from [`ToolClass::Plugin`]; nothing reads it yet.
+    pub fn namespace(&self) -> Option<&str> {
+        self.name.split_once('.').map(|(namespace, _)| namespace)
+    }
+}
+
 /// A single event from the `GET /api/event` SSE stream.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -194,6 +289,168 @@ impl Event {
             .get("file")
             .and_then(|v| v.as_str())
             .map(str::to_owned)
+    }
+
+    /// Classify a tool-activity event (`session.tool.*`) for the employee grid's
+    /// `tool` row.
+    ///
+    /// The rules, in order:
+    ///
+    /// | event | class | name |
+    /// |---|---|---|
+    /// | `name == "skill"` | [`ToolClass::Skill`] | `input.id` |
+    /// | `name == "subagent"` | [`ToolClass::Subagent`] | `input.agent` |
+    /// | `name == "execute"` + `metadata.toolCalls[0].tool` | [`ToolClass::Namespaced`] | that id |
+    /// | `name == "execute"` + `tools["ns"]` in `input.code` | [`ToolClass::Namespaced`] | `ns` |
+    /// | `name == "execute"`, nothing nested | [`ToolClass::Builtin`] | `"execute"` |
+    /// | anything else | [`ToolClass::Builtin`] | the name (then `data.file`) |
+    ///
+    /// **MCP vs plugin is not decided here.** Both register namespaced ids, and
+    /// the event carries no marker that separates them, so a namespaced call is
+    /// [`ToolClass::Namespaced`] and its [`ToolUse::label`] is printed with **no
+    /// prefix** — the row states what it knows and never guesses a source. (A
+    /// `ToolSources` set built from config would resolve it; the config mywaker
+    /// loads has no MCP/plugin section, so that is deferred rather than faked.)
+    ///
+    /// Returns `None` for a malformed event — a `skill` with no `input.id`, a
+    /// `subagent` with no `input.agent`, or no name at all — so a partial payload
+    /// leaves the row alone instead of showing a blank tool.
+    ///
+    /// The transcript line still uses [`Self::tool_label`], which is the event's
+    /// own wording and deliberately unchanged.
+    pub fn tool_use(&self) -> Option<ToolUse> {
+        let name = self.tool_name()?;
+        match name.as_str() {
+            "skill" => self
+                .tool_input()
+                .and_then(|input| input.get("id"))
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+                .map(|id| ToolUse::new(ToolClass::Skill, id)),
+            "subagent" => self
+                .tool_input()
+                .and_then(|input| input.get("agent"))
+                .and_then(|v| v.as_str())
+                .filter(|agent| !agent.is_empty())
+                .map(|agent| ToolUse::new(ToolClass::Subagent, agent)),
+            "execute" => Some(self.execute_use()),
+            _ => Some(ToolUse::builtin(name)),
+        }
+    }
+
+    /// What the code-mode `execute` tool actually ran: the first nested tool call
+    /// when the service reported one, else the namespace referenced by the code,
+    /// else `execute` itself.
+    ///
+    /// The nested call is the strongest evidence, so it wins even when the code
+    /// names a different namespace.
+    fn execute_use(&self) -> ToolUse {
+        if let Some(tool) = self
+            .tool_metadata()
+            .and_then(|metadata| metadata.get("toolCalls"))
+            .and_then(|calls| calls.as_array())
+            .and_then(|calls| calls.first())
+            .and_then(|call| call.get("tool"))
+            .and_then(|v| v.as_str())
+            .filter(|tool| !tool.is_empty())
+        {
+            // A dotted id is a namespaced tool; a bare one is just a tool.
+            return if tool.contains('.') {
+                ToolUse::new(ToolClass::Namespaced, tool)
+            } else {
+                ToolUse::builtin(tool)
+            };
+        }
+        if let Some(namespace) = self
+            .tool_input()
+            .and_then(|input| input.get("code"))
+            .and_then(|v| v.as_str())
+            .and_then(first_tool_namespace)
+        {
+            return ToolUse::new(ToolClass::Namespaced, namespace);
+        }
+        ToolUse::builtin("execute")
+    }
+
+    /// The tool id an event names, from whichever payload shape carries it.
+    ///
+    /// Live `session.tool.*` events put it at `data.tool`; message parts call it
+    /// `name`. Both are accepted, plus `title` as the last resort — the same order
+    /// [`Self::tool_label`] uses, so the card and the transcript agree on which
+    /// tool an event is about.
+    fn tool_name(&self) -> Option<String> {
+        let payloads = [&self.data, &self.properties];
+        for payload in payloads {
+            for key in ["tool", "name", "title"] {
+                if let Some(value) = payload.get(key).and_then(|v| v.as_str())
+                    && !value.is_empty()
+                {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        // A `message.part.updated` snapshot nests the part.
+        for payload in payloads {
+            let Some(part) = payload.get("part") else {
+                continue;
+            };
+            for key in ["tool", "name"] {
+                if let Some(value) = part.get(key).and_then(|v| v.as_str())
+                    && !value.is_empty()
+                {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        // Last resort, as in `tool_label`: the file the event names. A card that
+        // says `tool src/app.rs` is still telling the truth about what ran.
+        for payload in payloads {
+            if let Some(value) = payload.get("file").and_then(|v| v.as_str())
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
+            }
+        }
+        None
+    }
+
+    /// The tool's input object, from the flat event shape or a nested part.
+    fn tool_input(&self) -> Option<&serde_json::Value> {
+        self.tool_field("input")
+    }
+
+    /// The tool's `metadata` object, from the flat event shape or a nested part.
+    fn tool_metadata(&self) -> Option<&serde_json::Value> {
+        self.tool_field("metadata")
+    }
+
+    /// One object field of the tool call, from whichever container holds it.
+    ///
+    /// Live `session.tool.*` events put it at `data.<field>`; a
+    /// `message.part.updated` snapshot nests the whole call under `data.part`
+    /// with its arguments and metadata inside `part.state`. Both are searched,
+    /// in that order, so one classifier serves both surfaces.
+    fn tool_field(&self, field: &str) -> Option<&serde_json::Value> {
+        for payload in [&self.data, &self.properties] {
+            let candidates = [
+                Some(payload),
+                payload.get("part"),
+                payload.get("part").and_then(|part| part.get("state")),
+                payload.get("state"),
+            ];
+            for container in candidates.into_iter().flatten() {
+                if let Some(value) = container.get(field).filter(|v| v.is_object()) {
+                    return Some(value);
+                }
+            }
+            // The older alias for a tool's arguments.
+            if field == "input"
+                && let Some(value) = payload.get("args").filter(|v| v.is_object())
+            {
+                return Some(value);
+            }
+        }
+        None
     }
 
     /// True if this event's error signals a provider budget/quota exhaustion.
@@ -310,6 +567,24 @@ fn is_budget_message(message: &str) -> bool {
     ]
     .iter()
     .any(|k| lower.contains(k))
+}
+
+/// The first `tools["ns"]` / `tools['ns']` reference in a code-mode snippet, if
+/// any.
+///
+/// Used only as a fallback: when `execute` reports no `metadata.toolCalls`, the
+/// code it ran still names the namespace it reached for.
+fn first_tool_namespace(code: &str) -> Option<&str> {
+    for (index, _) in code.match_indices("tools[") {
+        let rest = code.get(index + "tools[".len()..)?;
+        let rest = rest.strip_prefix('"').or_else(|| rest.strip_prefix('\''))?;
+        let end = rest.find(['"', '\''])?;
+        let namespace = rest.get(..end)?;
+        if !namespace.is_empty() {
+            return Some(namespace);
+        }
+    }
+    None
 }
 
 /// A single content part of an assistant message (text, tool, step, …).
@@ -933,6 +1208,223 @@ mod tests {
         let model: ProviderModel = serde_json::from_str(single).unwrap();
         assert_eq!(model.input_cost(), Some(3.0));
         assert_eq!(model.output_cost(), Some(12.0));
+    }
+
+    /// One `session.tool.*` event, built from a raw `data` payload.
+    fn tool_event(data: serde_json::Value) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "id": "e", "type": "session.tool.started", "data": data,
+        }))
+        .unwrap()
+    }
+
+    /// The classification table: every row of it, from payloads shaped like the
+    /// ones the service actually emits (verified against real tool parts —
+    /// `{type:"tool", name, state:{input, metadata}}`).
+    #[test]
+    fn tool_use_classifies_the_observed_shapes() {
+        // A built-in tool: its own id, no prefix.
+        let builtin = tool_event(serde_json::json!({"sessionID":"s","tool":"shell"}))
+            .tool_use()
+            .expect("a plain tool is classifiable");
+        assert_eq!(builtin, ToolUse::builtin("shell"));
+        assert_eq!(builtin.class, ToolClass::Builtin);
+        assert_eq!(builtin.label(), "shell");
+        assert_eq!(builtin.class.prefix(), None);
+
+        // `skill` carries the skill id in `input.id`.
+        let skill = tool_event(serde_json::json!({
+            "sessionID":"s","tool":"skill","input":{"id":"opencode"}
+        }))
+        .tool_use()
+        .expect("a skill is classifiable");
+        assert_eq!(skill, ToolUse::new(ToolClass::Skill, "opencode"));
+        assert_eq!(skill.label(), "skill:opencode");
+
+        // `subagent` carries the agent id in `input.agent`.
+        let subagent = tool_event(serde_json::json!({
+            "sessionID":"s","tool":"subagent","input":{"agent":"backend","prompt":"…"}
+        }))
+        .tool_use()
+        .expect("a sub-agent is classifiable");
+        assert_eq!(subagent, ToolUse::new(ToolClass::Subagent, "backend"));
+        assert_eq!(subagent.label(), "subagent:backend");
+
+        // `execute` with a nested tool call: that call is what actually ran, and
+        // it is namespaced. The row prints it **without** a source prefix — the
+        // event cannot say MCP from plugin (A9).
+        let nested = tool_event(serde_json::json!({
+            "sessionID":"s",
+            "tool":"execute",
+            "input":{"code":"return await tools[\"db-audit\"].run_select_query({})"},
+            "metadata":{"toolCalls":[{"tool":"db-audit.run_select_query","status":"completed"}]}
+        }))
+        .tool_use()
+        .expect("a code-mode call is classifiable");
+        assert_eq!(
+            nested,
+            ToolUse::new(ToolClass::Namespaced, "db-audit.run_select_query")
+        );
+        assert_eq!(nested.label(), "db-audit.run_select_query");
+        assert_eq!(nested.class.prefix(), None, "no invented mcp:/plugin:");
+        assert_eq!(nested.namespace(), Some("db-audit"));
+
+        // `execute` with only a `tools["ns"]` reference in the code.
+        let from_code = tool_event(serde_json::json!({
+            "sessionID":"s",
+            "tool":"execute",
+            "input":{"code":"await tools['mqtt-test'].broker_status({})"}
+        }))
+        .tool_use()
+        .expect("a namespace in the code is classifiable");
+        assert_eq!(from_code, ToolUse::new(ToolClass::Namespaced, "mqtt-test"));
+
+        // `execute` with nothing nested: the code-mode tool itself, a built-in.
+        let bare = tool_event(serde_json::json!({
+            "sessionID":"s","tool":"execute","input":{"code":"return 1 + 1"}
+        }))
+        .tool_use()
+        .expect("a bare execute is classifiable");
+        assert_eq!(bare, ToolUse::builtin("execute"));
+        assert_eq!(bare.label(), "execute");
+
+        // A nested call that is not namespaced stays a built-in by its own name.
+        let bare_nested = tool_event(serde_json::json!({
+            "sessionID":"s",
+            "tool":"execute",
+            "metadata":{"toolCalls":[{"tool":"read"}]}
+        }))
+        .tool_use()
+        .expect("a nested built-in is classifiable");
+        assert_eq!(bare_nested, ToolUse::builtin("read"));
+    }
+
+    /// A nested tool call wins over the namespace the code mentions: the report
+    /// of what ran beats a string in the source.
+    #[test]
+    fn a_reported_tool_call_beats_the_code_namespace() {
+        let event = tool_event(serde_json::json!({
+            "sessionID":"s",
+            "tool":"execute",
+            "input":{"code":"tools[\"db-audit\"].run_select_query({})"},
+            "metadata":{"toolCalls":[{"tool":"mqtt-test.broker_status"}]}
+        }));
+        assert_eq!(
+            event.tool_use(),
+            Some(ToolUse::new(
+                ToolClass::Namespaced,
+                "mqtt-test.broker_status"
+            ))
+        );
+    }
+
+    /// Malformed payloads classify to `None` — never a panic, and never a blank
+    /// tool on the card.
+    #[test]
+    fn tool_use_is_none_for_malformed_events() {
+        // No name at all.
+        assert!(
+            tool_event(serde_json::json!({"sessionID":"s"}))
+                .tool_use()
+                .is_none()
+        );
+        // An empty name is not a name.
+        assert!(
+            tool_event(serde_json::json!({"tool":""}))
+                .tool_use()
+                .is_none()
+        );
+        // `skill` without `input.id`.
+        assert!(
+            tool_event(serde_json::json!({"tool":"skill"}))
+                .tool_use()
+                .is_none()
+        );
+        assert!(
+            tool_event(serde_json::json!({"tool":"skill","input":{"id":""}}))
+                .tool_use()
+                .is_none()
+        );
+        assert!(
+            tool_event(serde_json::json!({"tool":"skill","input":"not-an-object"}))
+                .tool_use()
+                .is_none()
+        );
+        // `subagent` without `input.agent`.
+        assert!(
+            tool_event(serde_json::json!({"tool":"subagent","input":{"prompt":"x"}}))
+                .tool_use()
+                .is_none()
+        );
+        // `execute` with junk in `toolCalls` still classifies as itself.
+        let junk = tool_event(serde_json::json!({
+            "tool":"execute",
+            "metadata":{"toolCalls":"nope"},
+            "input":{"code":42}
+        }))
+        .tool_use()
+        .expect("execute always has a name");
+        assert_eq!(junk, ToolUse::builtin("execute"));
+    }
+
+    /// The same classification works from a `message.part.updated` snapshot,
+    /// where the tool part nests its input under `part.state`.
+    #[test]
+    fn tool_use_reads_a_nested_part_snapshot() {
+        let part: Event = serde_json::from_value(serde_json::json!({
+            "id": "e",
+            "type": "message.part.updated",
+            "data": {"sessionID": "s", "part": {
+                "type": "tool",
+                "name": "skill",
+                "state": {"status": "completed", "input": {"id": "opencode"}}
+            }}
+        }))
+        .unwrap();
+        assert_eq!(
+            part.tool_use(),
+            Some(ToolUse::new(ToolClass::Skill, "opencode"))
+        );
+
+        let nested_execute: Event = serde_json::from_value(serde_json::json!({
+            "id": "e",
+            "type": "message.part.updated",
+            "data": {"sessionID": "s", "part": {
+                "type": "tool",
+                "name": "execute",
+                "state": {
+                    "input": {"code": "return await tools[\"db-audit\"].run_select_query({})"},
+                    "metadata": {"toolCalls": [{"tool": "db-audit.run_select_query"}]}
+                }
+            }}
+        }))
+        .unwrap();
+        assert_eq!(
+            nested_execute.tool_use(),
+            Some(ToolUse::new(
+                ToolClass::Namespaced,
+                "db-audit.run_select_query"
+            ))
+        );
+    }
+
+    /// The transcript's label is untouched by the classification: it stays the
+    /// event's own wording, so the chat line reads `🔧 shell`, not `🔧 skill:…`.
+    #[test]
+    fn tool_label_keeps_its_own_wording() {
+        let event = tool_event(serde_json::json!({
+            "sessionID":"s","tool":"skill","input":{"id":"opencode"}
+        }));
+        assert_eq!(event.tool_label().as_deref(), Some("skill"));
+        assert_eq!(
+            event.tool_use().map(|tool| tool.label()).as_deref(),
+            Some("skill:opencode")
+        );
+
+        // The file fallback still works for both, as before.
+        let by_file = tool_event(serde_json::json!({"sessionID":"s","file":"src/app.rs"}));
+        assert_eq!(by_file.tool_label().as_deref(), Some("src/app.rs"));
+        assert_eq!(by_file.tool_use(), Some(ToolUse::builtin("src/app.rs")));
     }
 
     #[test]

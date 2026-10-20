@@ -53,7 +53,7 @@ mywaker/
         ├── hit.rs            mouse hit-testing — a point → the employee/row under it
         ├── robot.rs          animated robot avatar (state-driven ASCII)
         ├── sidebar.rs        left sidebar — avatar + Now + inspector + vitals, priority `fit` (see acceptance-sidebar.md)
-        ├── pipeline.rs       team grid — 3-column employee cards, Jev header, scrollable viewport
+        ├── pipeline.rs       team grid — 3-column employee cards (5 content rows), Jev header, scrollable viewport
         ├── tasks.rs          per-employee board + persisted task queue
         ├── chat.rs           conversation transcript + streaming (modal)
         ├── modal.rs          reopen prompt — the tasks paused at the last shutdown
@@ -265,11 +265,46 @@ consts; no per-frame allocation.
   section, it stays pinned above the cards so the label never leaves the group it
   names. The title carries the active count (`team · N · M working`) because that
   is the number the split exists to surface.
+- A card's five content rows are the head (status glyph + name), the role, the
+  live status, the model, and the **tool** — `tool <label>` for the tool the
+  employee last invoked, `tool -` while it has not called one. `last_tool` holds a
+  `ToolUse` (`src/opencode/models.rs`): a `ToolClass` plus the tool's name, so
+  the row says *what kind* of capability is in play and not just which one —
+  `shell` (built-in), `skill:opencode`, `subagent:backend`, or a namespaced
+  `db-audit.run_select_query`. It is runtime-only (never written to `team.toml`,
+  like `last_task` and `status`), set by `Event::tool_use` from the
+  `session.tool.{started,success,failed}` payload, cleared when the next turn
+  starts (`session.execution.started`) and by `/new`, and **kept** through
+  `done`/`error` so a finished card still says what it did.
+
+  Classification is derived, not read off the wire: `skill` and `subagent` are
+  ordinary built-ins that name *another* capability in `input.id` / `input.agent`,
+  and an MCP or plugin tool arrives as a namespaced id called from inside the
+  code-mode `execute` tool (`metadata.toolCalls[0].tool`, else a `tools["ns"]`
+  reference in the code). **MCP and plugin are deliberately not distinguished**:
+  both register namespaced ids and the event carries no marker that separates
+  them, so such a call is `ToolClass::Namespaced` and its label is printed with
+  **no prefix** — the row states what it knows rather than guessing a source. A
+  `ToolSources` set built from config would resolve it; mywaker's config has no
+  MCP/plugin section, so that stays a recorded follow-up rather than a guess.
+
+  A malformed payload (`skill` with no `input.id`, `subagent` with no
+  `input.agent`, no name at all) yields `None` and leaves the row alone. The chat
+  transcript keeps `Event::tool_label()`, the event's own wording, so the chat
+  line still reads `🔧 skill` while the card reads `tool skill:opencode`. The row
+  is deliberately **ASCII only**: `ui::truncate` counts `char`s rather than
+  display columns, so a double-width glyph would break the inner-width budget and
+  push the card's border out of shape. The class prefix is the only coloured part
+  (cyan skill, magenta sub-agent); the name stays gray, and a prefix that would
+  not survive truncation is dropped whole so the name — the actual data — is what
+  remains.
 - The employee grid degrades in a fixed order: the Jev header strip is dropped
-  first (it is a status line, not work), then whole card rows. A card row is only
-  counted when its full height (plus its section heading, on a section's first
-  row) fits, so a short main area can never produce a box with a top border and
-  no body, and a partial row is never drawn at the bottom of the viewport either.
+  first (it is a status line, not work), then whole card rows, and only then the
+  section headings — a heading is a label, a card is the work, so at 60×16 the
+  headings give way rather than the last card row. A card row is only counted
+  when its full height (plus its section heading, on a section's first row) fits,
+  so a short main area can never produce a box with a top border and no body, and
+  a partial row is never drawn at the bottom of the viewport either.
   The same rule covers the horizontal axis: below a 12-column card the grid falls
   back to one full-width column instead of squeezing three unreadable ones.
 

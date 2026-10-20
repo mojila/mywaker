@@ -1,4 +1,5 @@
 use super::*;
+use crate::opencode::{ToolClass, ToolUse};
 
 fn make_app() -> (App, tokio::sync::mpsc::Receiver<Message>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<Message>(16);
@@ -794,6 +795,249 @@ fn streams_deltas_in_order_and_ignores_other_sessions() {
         serde_json::json!({"sessionID":"ses_9","delta":"x"}),
     ));
     assert_eq!(app.streaming_text(), "Hello");
+}
+
+/// A tool event sets `last_tool` on the employee that owns the session — and on
+/// no one else — as a classified [`ToolUse`], while the transcript keeps the
+/// event's own wording.
+#[test]
+fn a_tool_event_records_the_tool_on_its_employee_only() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    let researcher = employee(&app, "researcher");
+    open_chat(&mut app, writer);
+    app.chats.entry(researcher).or_default().session_id = Some("ses_r".into());
+
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"bash"}),
+    ));
+
+    let stored = app.team.employees()[writer]
+        .last_tool
+        .clone()
+        .expect("the tool is recorded");
+    assert_eq!(stored.class, ToolClass::Builtin);
+    assert_eq!(stored.label(), "bash");
+    assert!(
+        app.team.employees()[researcher].last_tool.is_none(),
+        "another employee's card must not claim this tool"
+    );
+
+    // The transcript line is unchanged by the capture: it still names the tool.
+    assert!(
+        app.chats[&writer]
+            .transcript
+            .iter()
+            .any(|line| line.text == "🔧 bash"),
+        "the 🔧 transcript line survives"
+    );
+}
+
+/// The classification table reaches the card: a skill, a sub-agent, and a
+/// namespaced call each land as their own class, labelled the way the row prints
+/// them (A8).
+#[test]
+fn tool_classes_reach_the_card_with_their_labels() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+
+    let label = |app: &App| {
+        app.team.employees()[writer]
+            .last_tool
+            .as_ref()
+            .map(ToolUse::label)
+    };
+
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"skill","input":{"id":"opencode"}}),
+    ));
+    assert_eq!(label(&app).as_deref(), Some("skill:opencode"));
+
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"subagent","input":{"agent":"backend"}}),
+    ));
+    assert_eq!(label(&app).as_deref(), Some("subagent:backend"));
+
+    // A namespaced tool is printed *unprefixed*: MCP and plugin are
+    // indistinguishable from the event, so the row states the name and no more
+    // (A9).
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({
+            "sessionID":"ses_1",
+            "tool":"execute",
+            "input":{"code":"await tools[\"db-audit\"].run_select_query({})"},
+            "metadata":{"toolCalls":[{"tool":"db-audit.run_select_query"}]}
+        }),
+    ));
+    assert_eq!(label(&app).as_deref(), Some("db-audit.run_select_query"));
+    assert_eq!(
+        app.team.employees()[writer]
+            .last_tool
+            .as_ref()
+            .map(|t| t.class),
+        Some(ToolClass::Namespaced)
+    );
+    assert!(
+        !label(&app).unwrap().contains("mcp:") && !label(&app).unwrap().contains("plugin:"),
+        "the row never invents a source it cannot resolve"
+    );
+}
+
+/// A malformed tool event leaves the row alone instead of blanking it.
+#[test]
+fn a_malformed_tool_event_keeps_the_previous_row() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"bash"}),
+    ));
+    // `skill` with no `input.id`: nothing to name, so nothing changes.
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"skill","input":{}}),
+    ));
+
+    assert_eq!(
+        app.team.employees()[writer]
+            .last_tool
+            .as_ref()
+            .map(ToolUse::label)
+            .as_deref(),
+        Some("bash"),
+        "a partial payload does not clear a good row"
+    );
+}
+
+/// `success` and `failed` are the same tool continuing (or ending), so they keep
+/// the row — including after the turn settles as `Done`/`Error` (A3).
+#[test]
+fn a_finished_turn_keeps_the_tool_it_last_used() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"bash"}),
+    ));
+    app.handle_stream_event(&event(
+        "session.tool.success",
+        serde_json::json!({"sessionID":"ses_1","tool":"bash"}),
+    ));
+    app.handle_stream_event(&event(
+        "session.execution.succeeded",
+        serde_json::json!({"sessionID":"ses_1"}),
+    ));
+
+    assert_eq!(
+        app.team.employees()[writer].status,
+        EmployeeStatus::Done,
+        "the fixture settles the turn"
+    );
+    assert_eq!(
+        app.team.employees()[writer]
+            .last_tool
+            .as_ref()
+            .map(ToolUse::label)
+            .as_deref(),
+        Some("bash")
+    );
+
+    // A failure is the same story: the row is the record of what ran.
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"edit"}),
+    ));
+    app.handle_stream_event(&event(
+        "session.tool.failed",
+        serde_json::json!({"sessionID":"ses_1","tool":"edit"}),
+    ));
+    app.handle_stream_event(&event(
+        "session.execution.failed",
+        serde_json::json!({"sessionID":"ses_1","error":{"message":"boom"}}),
+    ));
+    assert_eq!(app.team.employees()[writer].status, EmployeeStatus::Error);
+    assert_eq!(
+        app.team.employees()[writer]
+            .last_tool
+            .as_ref()
+            .map(ToolUse::label)
+            .as_deref(),
+        Some("edit")
+    );
+}
+
+/// A new turn starts with no tool behind it: the previous turn's tool is stale,
+/// and the card must not claim this turn is running it (A2).
+#[test]
+fn a_new_turn_clears_the_tool_row() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"bash"}),
+    ));
+    assert!(app.team.employees()[writer].last_tool.is_some());
+
+    app.handle_stream_event(&event(
+        "session.execution.started",
+        serde_json::json!({"sessionID":"ses_1"}),
+    ));
+    assert!(
+        app.team.employees()[writer].last_tool.is_none(),
+        "the row empties when the next turn begins"
+    );
+}
+
+/// `/new` starts a fresh conversation, so the card's record of the old one goes
+/// with it (A4).
+#[test]
+fn reset_chat_clears_the_tool_row() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_1","tool":"bash"}),
+    ));
+    assert!(app.team.employees()[writer].last_tool.is_some());
+
+    app.input = "/new".into();
+    app.send_prompt();
+
+    assert!(
+        app.team.employees()[writer].last_tool.is_none(),
+        "/new drops the old session's tool"
+    );
+}
+
+/// An event for a session no employee owns changes nothing at all.
+#[test]
+fn a_tool_event_for_an_unknown_session_changes_nothing() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    open_chat(&mut app, writer);
+
+    app.handle_stream_event(&event(
+        "session.tool.started",
+        serde_json::json!({"sessionID":"ses_unknown","tool":"bash"}),
+    ));
+
+    assert!(
+        app.team.employees().iter().all(|e| e.last_tool.is_none()),
+        "no card claims a tool from a session it does not own"
+    );
 }
 
 #[test]

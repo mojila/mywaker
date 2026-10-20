@@ -1757,6 +1757,7 @@ impl App {
         self.input_scroll = 0;
         self.command_menu = None;
         self.team.set_last_task(employee, None);
+        self.team.set_last_tool(employee, None);
         // Drop the old session binding and start a fresh one (same worker).
         if let Some(chat) = self.chats.get_mut(&employee) {
             chat.session_id = None;
@@ -2604,6 +2605,10 @@ impl App {
             }
             "session.execution.started" => {
                 self.team.set_status(employee, EmployeeStatus::Working);
+                // A new turn starts with no tool behind it: whatever the last
+                // turn called is stale, and the card's `tool` row must not claim
+                // otherwise while this turn reasons.
+                self.team.set_last_tool(employee, None);
                 // The turn actually started, so the silence clock starts now: a
                 // queued delivery that sat behind the previous turn is not
                 // "silent", it was waiting.
@@ -2631,6 +2636,14 @@ impl App {
                 }
             }
             "session.tool.started" | "session.tool.success" | "session.tool.failed" => {
+                // The card's `tool` row shows the *classified* call (skill,
+                // sub-agent, namespaced, built-in); the transcript keeps the
+                // event's own wording. A malformed payload leaves the row alone
+                // rather than blanking it, and the two are read separately so a
+                // shape only one of them understands still reaches its surface.
+                if let Some(tool) = event.tool_use() {
+                    self.team.set_last_tool(employee, Some(tool));
+                }
                 if let Some(label) = event.tool_label() {
                     self.push_to_chat(employee, TranscriptRole::Info, format!("🔧 {label}"));
                 }
