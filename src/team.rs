@@ -12,6 +12,16 @@ use crate::role::Role;
 /// roster and can't be removed; see [`Team::ensure_orchestrator`].
 pub const ORCHESTRATOR_ID: &str = "orchestrator";
 
+/// The OpenCode *agent* id backing the orchestrator.
+///
+/// The employee id stays `orchestrator` (it is what `@orchestrator` directives
+/// route to), but the agent id is namespaced: `orchestrator` as a bare agent id
+/// collides with any other system that keeps its own `orchestrator` agent in
+/// OpenCode's global agents dir (a machine-wide orchestrator, e.g.). Namespacing
+/// the agent id keeps mywaker's root prompt from being silently replaced by such
+/// a definition.
+pub const ORCHESTRATOR_AGENT_ID: &str = "team-orchestrator";
+
 /// Lifecycle status of an employee; drives the robot avatar and roster UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EmployeeStatus {
@@ -154,19 +164,19 @@ impl Team {
     /// The orchestrator is first: it is the root of the delegation tree, so a
     /// freshly hired team already has one and the roster never starts flat.
     pub fn starter() -> Self {
-        let roster = [
-            (ORCHESTRATOR_ID, "Otto", "Orchestrator"),
+        let workers = [
             ("researcher", "Aria", "Research lead"),
             ("writer", "Bruno", "Writer"),
             ("reviewer", "Cleo", "Reviewer"),
             ("planner", "Dex", "Planner"),
         ];
-        Self {
-            employees: roster
+        let mut employees = vec![orchestrator_employee()];
+        employees.extend(
+            workers
                 .into_iter()
-                .map(|(id, name, role)| Employee::new(id, name, role))
-                .collect(),
-        }
+                .map(|(id, name, role)| Employee::new(id, name, role)),
+        );
+        Self { employees }
     }
 
     /// Guarantee the roster has an orchestrator, inserting one at index 0 when it
@@ -182,12 +192,20 @@ impl Team {
     /// Called by [`Team::starter`] and [`Team::load_or_starter`], and again by
     /// `App::with_team` so a fixture built from `Team::default()` also satisfies
     /// it.
+    ///
+    /// The same pass also points an *existing* orchestrator at the namespaced
+    /// agent id (see [`ORCHESTRATOR_AGENT_ID`]) when it has no explicit agent
+    /// override — a roster written before the namespacing still defaulted to the
+    /// bare `orchestrator` agent, which collides with any other system's agent of
+    /// that name. The employee id (`@orchestrator`) is left untouched.
     pub fn ensure_orchestrator(&mut self) -> bool {
-        if self.employee(ORCHESTRATOR_ID).is_some() {
+        if let Some(employee) = self.employee_mut(ORCHESTRATOR_ID) {
+            if employee.agent.is_none() {
+                employee.agent = Some(ORCHESTRATOR_AGENT_ID.to_string());
+            }
             return false;
         }
-        self.employees
-            .insert(0, Employee::new(ORCHESTRATOR_ID, "Otto", "Orchestrator"));
+        self.employees.insert(0, orchestrator_employee());
         true
     }
 
@@ -355,6 +373,15 @@ impl Team {
         team.ensure_orchestrator();
         team
     }
+}
+
+/// The root employee: id `orchestrator` (the `@orchestrator` target) bound to the
+/// namespaced [`ORCHESTRATOR_AGENT_ID`] agent, so its definition can never be
+/// shadowed by another system's `orchestrator` agent.
+fn orchestrator_employee() -> Employee {
+    let mut employee = Employee::new(ORCHESTRATOR_ID, "Otto", "Orchestrator");
+    employee.agent = Some(ORCHESTRATOR_AGENT_ID.to_string());
+    employee
 }
 
 /// Clamp a roster cursor to `[0, len)` after moving by `delta`.
@@ -545,6 +572,43 @@ mod tests {
         assert_eq!(
             team.employees()[0].workflow_role(),
             crate::role::Role::Orchestrator
+        );
+    }
+
+    /// The orchestrator keeps its `orchestrator` *id* (that is what `@orchestrator`
+    /// routes to) but binds a namespaced *agent* id, so a foreign `orchestrator`
+    /// agent in OpenCode's global dir can never shadow mywaker's root prompt.
+    #[test]
+    fn the_orchestrator_binds_a_namespaced_agent() {
+        let team = Team::starter();
+        let root = team.employee(ORCHESTRATOR_ID).unwrap();
+        assert_eq!(root.id, ORCHESTRATOR_ID);
+        assert_eq!(root.agent.as_deref(), Some(ORCHESTRATOR_AGENT_ID));
+        assert_eq!(root.agent_id(), ORCHESTRATOR_AGENT_ID);
+
+        // Migration: an orchestrator loaded from an older roster (no `agent`
+        // override) is pointed at the namespaced agent, while an explicit
+        // override is respected.
+        let mut legacy = Team::default();
+        legacy
+            .add_employee(Employee::new(ORCHESTRATOR_ID, "Otto", "Orchestrator"))
+            .unwrap();
+        assert!(legacy.employee(ORCHESTRATOR_ID).unwrap().agent.is_none());
+        legacy.ensure_orchestrator();
+        assert_eq!(
+            legacy.employee(ORCHESTRATOR_ID).unwrap().agent.as_deref(),
+            Some(ORCHESTRATOR_AGENT_ID)
+        );
+
+        let mut custom = Team::default();
+        let mut root = Employee::new(ORCHESTRATOR_ID, "Otto", "Orchestrator");
+        root.agent = Some("my-root".into());
+        custom.add_employee(root).unwrap();
+        custom.ensure_orchestrator();
+        assert_eq!(
+            custom.employee(ORCHESTRATOR_ID).unwrap().agent.as_deref(),
+            Some("my-root"),
+            "an explicit agent override must not be overwritten"
         );
     }
 

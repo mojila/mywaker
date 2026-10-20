@@ -182,7 +182,38 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut app = App::with_team(config, tx, mywaker::team::Team::load_or_starter());
+    let mut app = App::with_team(config, tx.clone(), mywaker::team::Team::load_or_starter());
+    // The orchestrator's agent id is namespaced (`team-orchestrator`) so a
+    // foreign `orchestrator` agent can't shadow mywaker's root prompt. Ensure the
+    // definition exists before the first goal, and surface a log line rather than
+    // crashing: a missing file degrades to OpenCode's default agent (which the
+    // `begin_session` fallback already reports), but the prompt must never fail
+    // quietly.
+    if let Some(root) = app
+        .team()
+        .employees()
+        .iter()
+        .find(|e| e.id == mywaker::team::ORCHESTRATOR_ID)
+    {
+        match mywaker::agent::ensure(root) {
+            Ok((path, true)) => {
+                let _ = tx
+                    .send(Message::Log(format!(
+                        "wrote agent definition {}",
+                        path.display()
+                    )))
+                    .await;
+            }
+            Ok((_, false)) => {}
+            Err(err) => {
+                let _ = tx
+                    .send(Message::Log(format!(
+                        "could not write the orchestrator agent definition: {err:#}"
+                    )))
+                    .await;
+            }
+        }
+    }
     app.set_jev(jev);
     app.enable_persistence();
 

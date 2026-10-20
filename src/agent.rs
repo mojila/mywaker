@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Result, WrapErr};
 
 use crate::role::Role;
-use crate::team::Employee;
+use crate::team::{Employee, ORCHESTRATOR_AGENT_ID};
 
 /// OpenCode's global agents directory. Honors `XDG_CONFIG_HOME` when it is set
 /// to an absolute path, else falls back to `~/.config` — the same resolution
@@ -72,6 +72,13 @@ pub fn definition(employee: &Employee) -> String {
 /// finally the id (for an employee whose role was left blank).
 fn description(employee: &Employee) -> String {
     let agent_id = employee.agent_id();
+
+    // The orchestrator's agent id is namespaced (`team-orchestrator`) to avoid
+    // colliding with another system's `orchestrator` agent; it still describes
+    // itself as the orchestrator.
+    if agent_id == ORCHESTRATOR_AGENT_ID {
+        return capitalize(Role::Orchestrator.label());
+    }
 
     let role = Role::from_label(agent_id);
     if role != Role::General {
@@ -179,6 +186,9 @@ fn prompt(employee: &Employee) -> String {
 /// `GENERAL` pipeline stage. That is intended — the pipeline orders the team, the
 /// prompt tells the agent how to behave.
 fn role_prompt(employee: &Employee) -> String {
+    if employee.agent_id() == ORCHESTRATOR_AGENT_ID {
+        return ORCHESTRATOR.into();
+    }
     match Role::from_label(employee.agent_id()) {
         Role::Orchestrator => ORCHESTRATOR.into(),
         Role::Planner => PLANNER.into(),
@@ -438,6 +448,20 @@ mod tests {
             text.contains("`@user` is yours alone"),
             "must state that delivery is the orchestrator's"
         );
+    }
+
+    /// The namespaced agent id the starter binds the orchestrator to (`agent =
+    /// "team-orchestrator"`) still selects the root prompt — the namespace exists
+    /// only so a foreign `orchestrator` agent can't shadow it, not to change what
+    /// the prompt says.
+    #[test]
+    fn the_namespaced_orchestrator_agent_gets_the_root_prompt() {
+        let mut employee = Employee::new("orchestrator", "Otto", "Orchestrator");
+        employee.agent = Some(ORCHESTRATOR_AGENT_ID.into());
+        let text = definition(&employee);
+        assert!(text.contains("description: \"Orchestrator\""));
+        assert!(text.contains("You are the **orchestrator**"));
+        assert!(text.contains("`@user` is yours alone"));
     }
 
     /// The mandate text the UI and the docs both point at: every skill it names must
