@@ -74,9 +74,8 @@ fn renders_one_column_grid_in_a_narrow_team_panel() {
             "one column spans the panel less its riser"
         );
     }
-    // At 24 columns the strip has room for the root but not for Jev: the root's
-    // name is the part that must survive, so `jev` is what gives way.
-    assert!(text.contains("Otto"), "the orchestrator strip is drawn");
+    // The Jev strip survives at 24 columns: it is a single short line.
+    assert!(text.contains("jev"), "the Jev strip is drawn");
 }
 
 #[test]
@@ -112,15 +111,15 @@ fn rows(text: &str, width: u16) -> Vec<String> {
         .collect()
 }
 
-/// The delegation pipeline is drawn: the root's strip, a dashed bus across the
-/// panel, and one riser per card column — so the tree's shape is legible before
+/// The delegation diagram is drawn: the Jev strip, a dashed bus across the panel,
+/// and one riser per card column — so the team's wiring is legible before
 /// anything moves.
 #[test]
-fn renders_the_pipeline_strip_bus_and_risers() {
+fn renders_the_strip_bus_and_risers() {
     let app = app();
     let text = screen(&app, 120, 40);
 
-    assert!(text.contains("Otto"), "the orchestrator strip is missing");
+    assert!(text.contains("jev"), "the Jev strip is missing");
     assert!(text.contains("┄"), "the dashed bus is missing");
     assert!(text.contains("┆"), "the risers are missing");
 
@@ -142,12 +141,12 @@ fn renders_the_pipeline_strip_bus_and_risers() {
 #[test]
 fn renders_a_delegation_packet() {
     let mut app = app();
-    let root = app
+    let planner = app
         .team()
         .employees()
         .iter()
-        .position(|e| e.id == "orchestrator")
-        .expect("root");
+        .position(|e| e.id == "planner")
+        .expect("planner");
     let writer = app
         .team()
         .employees()
@@ -156,10 +155,10 @@ fn renders_a_delegation_packet() {
         .expect("writer");
 
     // Record a hand-off through the public model, then draw it.
-    app.record_trace_for_test(root, writer);
+    app.record_trace_for_test(planner, writer);
 
-    // The packet leaves from the strip's port, so it is on the wire once it has
-    // started moving.
+    // The packet leaves the source card, so it is on the wire once it has started
+    // moving.
     app.advance();
     app.advance();
     let first = screen(&app, 120, 40);

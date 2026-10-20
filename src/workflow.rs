@@ -71,13 +71,6 @@ pub fn is_jev(target: &str) -> bool {
     matches!(target, "jev" | "judge" | "decide")
 }
 
-/// True when a directive targets the root employee — the one employee that
-/// delivers to the user. Workers report upward to it instead of answering the
-/// user directly.
-pub fn is_orchestrator(target: &str) -> bool {
-    target == crate::team::ORCHESTRATOR_ID
-}
-
 /// True when a directive means "fan this goal out to the whole team in parallel".
 pub fn is_parallel(target: &str) -> bool {
     matches!(target, "parallel" | "fanout" | "all" | "team")
@@ -149,50 +142,19 @@ pub fn contribution(text: &str) -> Option<String> {
 /// knows (a) who its teammates are, (b) the role boundaries that keep jobs with
 /// the right teammate, and (c) how to delegate to them.
 ///
-/// The roster is drawn as the delegation tree, with the orchestrator at the root.
-///
-/// **Role-aware.** A worker is told to report *upward* to `@orchestrator` rather
-/// than answer the user, because the orchestrator owns the synthesis. The
-/// orchestrator itself is told the opposite — `@user` is its alone — so the two
-/// prompts agree instead of contradicting each other. The `is_root` flag comes
-/// from the employee being briefed, not from a guess at its name.
+/// **Flat.** There is no root employee above the team: every employee is a peer,
+/// so any of them may hand a sub-task sideways and any of them may deliver its
+/// own finished work to the user with `@user`.
 pub fn team_context(team: &Team, name: &str) -> String {
-    team_context_for(team, name, false)
-}
-
-/// [`team_context`] for an employee that may be the root.
-///
-/// `is_root` is the caller's answer to "is the employee being briefed the
-/// orchestrator?", which is what lets one function serve both halves of the tree
-/// without either being told a rule that belongs to the other.
-pub fn team_context_for(team: &Team, name: &str, is_root: bool) -> String {
     let roster = team
         .employees()
         .iter()
-        .map(|e| {
-            let marker = if is_orchestrator(&e.id) {
-                "◆"
-            } else {
-                "├─"
-            };
-            format!("  {marker} @{} — {}", e.id, e.role)
-        })
+        .map(|e| format!("  @{} — {}", e.id, e.role))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let reporting = if is_root {
-        "You are the orchestrator: the root of the tree. Every teammate reports to you, \
-and `@user` is yours alone — you are the one who delivers to the user. Synthesize what \
-comes back, then deliver it with `@user <final deliverable>`."
-    } else {
-        "The orchestrator is the root. You report to `@orchestrator`; `@user` is the \
-orchestrator's alone, so a finished result goes to the orchestrator, not to the user."
-    };
-
     format!(
-        "You are {name}, one employee on a team of AI employees. The team is a tree:\n\
-{roster}\n\n\
-{reporting}\n\n\
+        "You are {name}, one employee on a team of AI employees:\n{roster}\n\n\
 Stick to YOUR OWN role and delegate anything outside it. In particular:\n\
   - The planner only produces plans, roadmaps, and task breakdowns — it never \
 writes the implementation, code, or final prose; it delegates those to the \
@@ -202,15 +164,10 @@ teammate whose role covers them (e.g. the software engineer / writer).\n\
   - The reviewer checks, critiques, and verifies others' work.\n\n\
 When a sub-task is better done by a teammate, delegate it by ending your reply \
 with one or more lines of the form:\n\n  @<id> <instruction>\n\nFor example:\n  \
-@researcher gather the sources\n  @writer implement the feature\n\n{closing}",
-        closing = if is_root {
-            "To have the whole team work a goal in parallel (each from their own role), \
-end your reply with `@parallel <goal>`."
-        } else {
-            "When your work is finished, report it upward with `@orchestrator <result>`. \
-To have the whole team work a goal in parallel (each from their own role), end your \
-reply with `@parallel <goal>`."
-        }
+@researcher gather the sources\n  @writer implement the feature\n\nTo have the \
+whole team work a goal in parallel (each from their own role), end your reply \
+with `@parallel <goal>`. To hand the final result back to the user, prefix a \
+line with @user or @deliver."
     )
 }
 
@@ -349,44 +306,22 @@ mod tests {
         assert!(ctx.contains("software engineer / writer"));
     }
 
-    /// The roster is a tree: the root is marked, everyone else hangs off it, and
-    /// the reporting rule is stated rather than implied.
+    /// Every employee is a peer: the roster is a flat list and each one may
+    /// deliver its own finished work, with no root to report to.
     #[test]
-    fn team_context_roots_the_roster_and_reports_upward() {
+    fn team_context_is_flat_and_lets_everyone_deliver() {
         let team = Team::starter();
         let ctx = team_context(&team, "Bruno");
 
-        assert!(ctx.contains("◆ @orchestrator"), "{ctx}");
-        assert!(ctx.contains("├─ @writer"), "{ctx}");
+        assert!(ctx.contains("  @writer"), "{ctx}");
+        assert!(ctx.contains("  @researcher"), "{ctx}");
         assert!(
-            ctx.contains("You report to `@orchestrator`"),
-            "the reporting rule must be explicit: {ctx}"
+            !ctx.contains("orchestrator"),
+            "no employee reports to a root any more: {ctx}"
         );
-        assert!(
-            ctx.contains("`@user` is the orchestrator's alone"),
-            "a worker must not be told it can deliver: {ctx}"
-        );
-        assert!(ctx.contains("@orchestrator <result>"), "{ctx}");
-    }
-
-    /// The root is briefed as the root: `@user` is *its* alone. The worker wording
-    /// would contradict its own prompt, which says exactly that.
-    #[test]
-    fn team_context_for_the_root_owns_delivery() {
-        let team = Team::starter();
-        let ctx = team_context_for(&team, "Otto", true);
-
-        assert!(
-            ctx.contains("`@user` is yours alone"),
-            "the root must be told delivery is its job: {ctx}"
-        );
-        assert!(
-            !ctx.contains("You report to `@orchestrator`"),
-            "the root cannot report to itself: {ctx}"
-        );
-        // It still sees the same tree and the same delegation protocol.
-        assert!(ctx.contains("◆ @orchestrator"), "{ctx}");
+        assert!(ctx.contains("@user"), "{ctx}");
         assert!(ctx.contains("@<id> <instruction>"), "{ctx}");
+        assert!(ctx.contains("@parallel <goal>"), "{ctx}");
     }
 
     /// A marker line is presentation, not content: a reply whose only payload sits
@@ -407,13 +342,5 @@ mod tests {
             contribution("[step]\nthe actual answer\n@user x").as_deref(),
             Some("the actual answer")
         );
-    }
-
-    #[test]
-    fn is_orchestrator_matches_the_root_id_only() {
-        assert!(is_orchestrator("orchestrator"));
-        assert!(!is_orchestrator("lead"));
-        assert!(!is_orchestrator("writer"));
-        assert!(!is_orchestrator("user"));
     }
 }

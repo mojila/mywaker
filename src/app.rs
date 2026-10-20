@@ -24,6 +24,7 @@ use crate::task::{PauseReason, Task, TaskId, TaskStatus};
 use crate::team::{EmployeeStatus, Team, move_selection};
 use crate::tui::Tui;
 use crate::ui;
+use crate::ui::pipeline;
 use crate::usage::{ProcessMetrics, Usage};
 use crate::workflow::{
     self, Delegation, is_final, is_jev, is_parallel, parse_delegations, strip_directives,
@@ -196,7 +197,7 @@ impl Chat {
 }
 
 /// A parallel fan-out: one goal broadcast to several workers, whose outputs are
-/// collected and handed to an aggregator (the orchestrator) once they all finish.
+/// collected and handed to an aggregator once they all finish.
 #[derive(Debug)]
 struct FanOut {
     /// Worker employees fanned out to (excluding the source and the aggregator).
@@ -417,9 +418,9 @@ impl TaskStats {
 /// What a hand-off did, for the delegation wires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceKind {
-    /// Work going out: the root handing a piece of the goal to a worker.
+    /// Work going out: one employee handing a piece of the goal to another.
     Out,
-    /// Work coming back: a worker reporting a finished part upward.
+    /// Work coming back: a round's contributions arriving at its aggregator.
     Report,
     /// A fan-out brief: one goal broadcast to the whole team at once.
     Fanout,
@@ -442,7 +443,7 @@ impl TraceKind {
 ///
 /// A trace is a *display* record: it is created when a hand-off is dispatched and
 /// forgotten a moment later (`App::tick_traces`), so the UI can animate work
-/// moving through the tree without keeping a history nobody asked for.
+/// moving between employees without keeping a history nobody asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegationTrace {
     /// Roster index of the employee the work left.
@@ -699,24 +700,12 @@ impl App {
     /// several per frame; the window only has to cover what the wires draw, so
     /// the oldest are dropped rather than the list growing without bound.
     pub const TRACE_LIMIT: usize = 12;
-    pub fn with_team(config: Config, tx: Sender<Message>, mut team: Team) -> Self {
-        // The orchestrator is a roster invariant, not a starter-roster detail:
-        // every app has one, whether it was loaded, built by a fixture, or
-        // handed in by a test. In memory only — `ensure_orchestrator` never
-        // writes the file.
-        team.ensure_orchestrator();
-        // The root is where the user starts: a goal typed on the roster screen
-        // goes to the orchestrator, so the cursor starts there too.
-        let selected = team
-            .employees()
-            .iter()
-            .position(|e| e.id == crate::team::ORCHESTRATOR_ID)
-            .unwrap_or(0);
-        Self {
+    pub fn with_team(config: Config, tx: Sender<Message>, team: Team) -> Self {
+        let mut app = Self {
             config,
             tx,
             team,
-            selected,
+            selected: 0,
             client: None,
             server_info: None,
             agents: Vec::new(),
@@ -765,7 +754,11 @@ impl App {
             orchestration: crate::trace::Traces::default(),
             active_trace: None,
             pending_clipboard: None,
-        }
+        };
+        // Start on the first card in workflow order, so the prompt bar names an
+        // employee the grid actually draws.
+        app.selected = app.card_order().first().copied().unwrap_or(0);
+        app
     }
 
     /// Attach the Jev (System One) decision client, used to answer `@jev`
@@ -1631,10 +1624,10 @@ impl App {
 
     /// Submit the goal typed on the roster screen.
     ///
-    /// A goal is the orchestrator's work: it is the root that decomposes and
-    /// delegates, so the prompt always routes there rather than to whichever card
-    /// happens to be selected. `Enter` in a card's chat is still how you talk to
-    /// that employee directly.
+    /// The goal goes to the **selected** employee: there is no root above the
+    /// team any more, so the card the cursor is on is who the prompt bar speaks
+    /// to. `Enter` in that employee's chat is the same conversation — the bar is
+    /// just a shortcut that does not leave the roster.
     fn submit_goal(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() {
@@ -1648,25 +1641,26 @@ impl App {
 
         // Slash commands are handled locally, exactly as they are in a chat: a
         // `/help` typed in the main prompt is the same request as a `/help` typed
-        // in a conversation, and must never be sent to the orchestrator as a goal.
+        // in a conversation, and must never be sent to an employee as a goal.
         //
         // This runs before the roster check below: `/help` and `/skills` do not
-        // need an employee to act on, so they must still work on a roster that has
-        // no root.
+        // need an employee to act on, so they must still work on an empty roster.
         if self.dispatch_chat_command(&text) {
             return;
         }
 
-        let Some(employee) = self.orchestrator_index() else {
-            self.push_log("no orchestrator on the roster — cannot route the goal".to_string());
+        if self.team.is_empty() {
+            self.push_log("no employees on the roster — cannot send the goal".to_string());
             return;
-        };
+        }
+
+        let employee = self.selected;
 
         if self.prompt_history.last() != Some(&text) {
             self.prompt_history.push(text.clone());
         }
 
-        // The goal starts a chain rooted at the orchestrator's own chat, so its
+        // The goal starts a chain rooted at this employee's own chat, so its
         // eventual `@user` is delivered there. The chat may not exist yet — a
         // goal typed on the roster screen is the first thing this employee is
         // asked to do — so it is created here rather than dropped.
@@ -1678,7 +1672,11 @@ impl App {
         // A goal from the user starts a new trace: everything it causes is
         // recorded under this id so the run can be named in a bug report.
         self.begin_trace(&text, Some(employee));
-        self.push_log(format!("◆ goal → orchestrator: {}", task_summary(&text)));
+        let name = self
+            .team
+            .name_at(employee)
+            .unwrap_or_else(|| employee.to_string());
+        self.push_log(format!("◆ goal → {name}: {}", task_summary(&text)));
 
         if !self.can_prompt(employee) {
             self.enqueue_prompt(employee, text);
@@ -1757,8 +1755,8 @@ impl App {
             // Prompts queued against the old conversation don't carry over.
             chat.queue_running.clear();
             // The new session has never been briefed: the preamble (roster +
-            // the `@orchestrator` reporting rule) must go out again, or the
-            // employee loses the protocol the moment the user types `/new`.
+            // the delegation protocol) must go out again, or the employee
+            // loses the protocol the moment the user types `/new`.
             chat.bootstrapped = false;
         }
         self.begin_session(employee);
@@ -2285,10 +2283,14 @@ impl App {
     }
 
     /// The employee a slash command acts on: the chat being viewed, else the
-    /// orchestrator — the main prompt bar speaks for the root, so a command typed
-    /// there (`/new`, `/skill add …`, `/parallel …`) means the root, not nobody.
+    /// card the roster cursor is on — the main prompt bar speaks for that
+    /// employee, so a command typed there (`/new`, `/skill add …`,
+    /// `/parallel …`) means them, not nobody.
     fn command_employee(&self) -> Option<usize> {
-        self.chat_employee.or_else(|| self.orchestrator_index())
+        self.chat_employee.or({
+            // A roster with nobody on it has no employee to act on.
+            (!self.team.is_empty()).then_some(self.selected)
+        })
     }
 
     /// Report a command's output.
@@ -2302,8 +2304,8 @@ impl App {
         match self.chat_employee {
             Some(employee) => self.push_to_chat(employee, TranscriptRole::Info, text),
             None => {
-                if let Some(orchestrator) = self.orchestrator_index() {
-                    self.push_to_chat(orchestrator, TranscriptRole::Info, text.clone());
+                if let Some(employee) = self.command_employee() {
+                    self.push_to_chat(employee, TranscriptRole::Info, text.clone());
                 }
                 self.push_log(text);
             }
@@ -2315,8 +2317,8 @@ impl App {
         match self.chat_employee {
             Some(employee) => self.push_to_chat(employee, TranscriptRole::Error, text),
             None => {
-                if let Some(orchestrator) = self.orchestrator_index() {
-                    self.push_to_chat(orchestrator, TranscriptRole::Error, text.clone());
+                if let Some(employee) = self.command_employee() {
+                    self.push_to_chat(employee, TranscriptRole::Error, text.clone());
                 }
                 self.push_log(text);
             }
@@ -2533,15 +2535,13 @@ impl App {
         self.note_fanout_result(employee, &messages);
         let contributed = !owed_before.is_empty();
 
-        // §8.2: the root's finished turn reaches the main screen. A worker that
-        // simply answers is not the deliverable (it owes a report upward), but the
-        // orchestrator answering in plain text *is* — so it is surfaced in the log,
-        // which is what the user reads from the roster. A turn that handed work on,
-        // or that contributed to a round, has not finished the goal yet and stays
-        // out of the log.
+        // A finished turn reaches the main screen. Every employee may deliver
+        // its own work now, and the roster's prompt bar has no transcript on
+        // screen — the log is where the user reads the answer. A turn that handed
+        // work on, or that contributed to a round, has not finished the goal yet
+        // and stays out of the log.
         if !handed_off
             && !contributed
-            && self.orchestrator_index() == Some(employee)
             && let Some(text) = last_assistant_output(&messages)
         {
             let summary = task_summary(&text);
@@ -2692,8 +2692,7 @@ impl App {
             chat.bootstrapped = true;
         }
         let name = self.team.name_at(employee).unwrap_or_default();
-        let is_root = self.orchestrator_index() == Some(employee);
-        let context = workflow::team_context_for(&self.team, &name, is_root);
+        let context = workflow::team_context(&self.team, &name);
         format!("{context}\n\n{text}")
     }
 
@@ -2870,7 +2869,7 @@ impl App {
             if delegation.message.is_empty() {
                 return;
             }
-            self.deliver_or_report(source, delegation.message);
+            self.deliver(source, delegation.message);
             return;
         }
 
@@ -2898,76 +2897,13 @@ impl App {
         self.send_to_employee(target, delegation.message, harness::PromptKind::Delegation);
     }
 
-    /// A `@user` directive: the orchestrator delivers to the user, a worker's
-    /// result bubbles up to the orchestrator as a report.
+    /// A `@user` directive: deliver the employee's finished work to the chat the
+    /// chain started from.
     ///
-    /// The tree has one mouth. A worker that answers `@user` has finished its
-    /// part, not the goal, so its text is relayed to the orchestrator with the
-    /// author named — the orchestrator can then synthesize, ask for a missing
-    /// piece, or deliver. This is what keeps a partial answer from reaching the
-    /// user mid-chain.
-    ///
-    /// **Budget.** A report is already counted by
-    /// [`Self::dispatch_delegations`], which increments `delegation_count` before
-    /// calling [`Self::dispatch_delegation`] — so bubbling spends the same
-    /// [`harness::DELEGATION_TOTAL_LIMIT`] as any other hand-off and is not
-    /// counted twice here. What *is* checked here is
-    /// [`harness::MAX_CHAIN_DEPTH`], because a report is the one hop that climbs
-    /// back up: neither guard falls back to delivering, since the one-mouth
-    /// invariant matters most at the limits, where a worker's partial answer would
-    /// be most misleading.
-    fn deliver_or_report(&mut self, source: usize, message: String) {
-        let Some(orchestrator) = self.orchestrator_index() else {
-            // No root (a roster with every employee removed): there is nobody to
-            // report to, so the old direct delivery is the only option that does
-            // not silently drop the result.
-            self.deliver_to_origin(source, message);
-            return;
-        };
-        if source == orchestrator {
-            self.deliver_to_origin(source, message);
-            return;
-        }
-
-        let name = self
-            .team
-            .name_at(source)
-            .unwrap_or_else(|| source.to_string());
-
-        if self.chain_depth(source) >= harness::MAX_CHAIN_DEPTH {
-            self.push_log(format!(
-                "delegation chain depth limit reached reporting from '{name}'"
-            ));
-            self.note_dropped_report(source, &name, "chain depth limit reached");
-            return;
-        }
-
-        self.push_log(format!("↥ {name} reported to the orchestrator")); // The report joins the same chain (so a later delivery still lands in the
-        // right chat).
-        self.inherit_chain(source, orchestrator);
-        self.trace(source, orchestrator, TraceKind::Report);
-        self.trace_hop(
-            crate::trace::Kind::Report,
-            Some(source),
-            Some(orchestrator),
-            task_summary(&message),
-        );
-        self.send_to_employee(
-            orchestrator,
-            format!("Report from {name}:\n\n{message}"),
-            harness::PromptKind::Report,
-        );
-    }
-
-    /// Record a report that the guards refused to relay.
-    ///
-    /// It becomes an abandon note in the worker's own chat and — when a fan-out is
-    /// waiting on that worker — its contribution, so the round can still finish.
-    /// What it must never become is the user's answer.
-    fn note_dropped_report(&mut self, source: usize, name: &str, reason: &str) {
-        let note = harness::abandon_note(name, Some(reason));
-        self.push_to_chat(source, TranscriptRole::Error, note.clone());
-        self.force_worker_contribution(source, note);
+    /// The team is flat, so there is no root to report upward to — whoever was
+    /// asked owns the answer, and its `@user` is the deliverable.
+    fn deliver(&mut self, source: usize, message: String) {
+        self.deliver_to_origin(source, message);
     }
 
     /// Put `message` in the chat the chain started from, as the final answer.
@@ -2988,10 +2924,6 @@ impl App {
         self.team.set_status(origin, EmployeeStatus::Done);
     }
 
-    /// The roster index of the orchestrator, when the roster has one.
-    fn orchestrator_index(&self) -> Option<usize> {
-        self.team_index_by_id(crate::team::ORCHESTRATOR_ID)
-    }
     fn route_to_jev(&mut self, source: usize, question: String) {
         self.push_to_chat(source, TranscriptRole::Info, format!("🤖 @jev: {question}"));
         if self.jev.is_none() {
@@ -3016,28 +2948,21 @@ impl App {
     }
 
     /// Fan `goal` out to every teammate in parallel (each interprets it from its
-    /// own role), then aggregate their outputs through the orchestrator once all
+    /// own role), then aggregate their outputs through one of them once all
     /// finish.
     ///
     /// The source and the aggregator are excluded from the worker set. The
-    /// aggregator is the orchestrator — the root owns synthesis — falling back to
-    /// the reviewer, then the planner, then the source itself when no root exists.
+    /// aggregator is the reviewer, then the planner, then the source itself —
+    /// there is no root above the team to own the synthesis. The fallbacks must
+    /// differ from the source too: aggregating *through the source* would make
+    /// the round's synthesizer one of its own workers (and, for a reviewer
+    /// source, put the review in the hands of the employee being reviewed).
     fn fan_out(&mut self, source: usize, goal: String) {
         let team = self.team.employees().to_vec();
 
-        // The root aggregates; a roster without one falls back to the old
-        // reviewer → planner → source chain. The fallbacks must differ from the
-        // source too: aggregating *through the source* would make the round's
-        // synthesizer one of its own workers (and, for a reviewer source, put the
-        // review in the hands of the employee being reviewed).
-        let aggregator = self
-            .orchestrator_index()
-            .filter(|&index| index != source)
-            .or_else(|| {
-                ["reviewer", "planner"]
-                    .iter()
-                    .find_map(|id| self.team_index_by_id(id).filter(|&index| index != source))
-            })
+        let aggregator = ["reviewer", "planner"]
+            .iter()
+            .find_map(|id| self.team_index_by_id(id).filter(|&index| index != source))
             .unwrap_or(source);
 
         let mut workers: Vec<usize> = (0..team.len())
@@ -3425,7 +3350,7 @@ impl App {
         let model = employee.model_ref();
         // A scheduled job runs outside any chain, so it is briefed as an isolated
         // job — see `run_task_attempt`.
-        let context = workflow::team_context_for(&self.team, &employee.name, false);
+        let context = workflow::team_context(&self.team, &employee.name);
         let goal = task.goal.clone();
         let task_id = task.id;
         let tx = self.tx.clone();
@@ -3919,8 +3844,7 @@ impl App {
 
     /// Employee storage indices in canonical workflow order (plan → research →
     /// write → review → general), stable by name within a stage. This is the
-    /// whole roster, root included, and it is what the *tasks* panel lists — the
-    /// board shows every employee's work, the orchestrator's included.
+    /// whole roster, and it is what the *tasks* panel lists.
     pub fn workflow_order(&self) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..self.team.len()).collect();
         indices.sort_by_key(|&i| {
@@ -3931,34 +3855,40 @@ impl App {
     }
 
     /// Employee storage indices the roster **grid** draws, in card order: the
-    /// workflow order minus the orchestrator.
+    /// workflow order. Every employee is a card — there is no root above the
+    /// grid to draw separately.
     ///
-    /// The root is not one of the pipeline stages it directs, so it does not get
-    /// a card among them — it is the strip above the grid (see
-    /// `ui::pipeline`). Everything that draws or hit-tests a card reads this,
-    /// while [`Self::workflow_order`] keeps listing everyone for the tasks
-    /// panel, so the two views can't drift.
+    /// The *drawing* splits this into two sections (active employees first, then
+    /// idle); this flat order is what the arrow keys walk and what the tasks panel
+    /// lists, so the two views can't drift.
     pub fn card_order(&self) -> Vec<usize> {
-        let orchestrator = self.orchestrator_index();
         self.workflow_order()
-            .into_iter()
-            .filter(|&index| Some(index) != orchestrator)
-            .collect()
+    }
+
+    /// The roster split into the grid's two sections: employees mid-turn on top,
+    /// everyone else below.
+    ///
+    /// Both lists keep workflow order, so a card's position within its section is
+    /// stable as statuses change — an employee moving between sections is the one
+    /// thing that re-orders the panel, which is exactly what the split is for.
+    pub(crate) fn card_sections(&self) -> pipeline::Sections {
+        let employees = self.team.employees();
+        pipeline::Sections::new(&self.card_order(), |index| {
+            employees
+                .get(index)
+                .is_some_and(|employee| employee.is_busy())
+        })
     }
 
     /// Move the roster cursor one cell in the grid, revealing the card it lands
     /// on.
     ///
-    /// The grid is read left-to-right, top-to-bottom, so `delta` walks that
-    /// order; the plan's arrow keys call this with `±1` (←/→) and `±cols`
-    /// (↑/↓), which keeps the column fixed.
-    ///
-    /// The orchestrator has no card, so it is reached by leaving the grid: `↑`
-    /// from the first card row moves the cursor up to the root, and `↓` from
-    /// there returns it to the card it came from. Both are handled in
-    /// [`Self::move_selection`], which wraps this for the key handler.
+    /// The grid is read left-to-right, top-to-bottom *within each section* (the
+    /// active employees above the idle ones), so `delta` walks that order; the
+    /// arrow keys call this with `±1` (←/→) and `±cols` (↑/↓), which keeps the
+    /// column fixed.
     fn move_selection_grid(&mut self, delta: isize) {
-        let order = self.card_order();
+        let order = self.card_sections().flat();
         if order.is_empty() {
             return;
         }
@@ -3968,43 +3898,8 @@ impl App {
         self.reveal_selection();
     }
 
-    /// Move the roster cursor by `delta` cells, with the orchestrator as the row
-    /// above the grid.
-    ///
-    /// `↑` (`delta == -cols`) from the first card row lands on the root rather
-    /// than clamping at the first card; `↓` (`delta == +cols`) from the root
-    /// returns to the first card. Left/right never leave the grid, so a
-    /// horizontal move while the root is selected is a no-op. Everything else is
-    /// the plain grid walk.
+    /// Move the roster cursor by `delta` cells.
     fn move_selection(&mut self, delta: isize) {
-        let cols = self.roster_cols();
-        let orchestrator = self.orchestrator_index();
-        let on_orchestrator = orchestrator == Some(self.selected);
-        let order = self.card_order();
-        let first_row = order.len().min(cols.max(1) as usize);
-
-        if on_orchestrator {
-            if delta == cols
-                && let Some(&first) = order.first()
-            {
-                self.selected = first;
-                self.reveal_selection();
-            }
-            // Every other direction stays on the root: it has no card to walk
-            // to, and clamping into the grid from a horizontal move would be a
-            // jump the user did not ask for.
-            return;
-        }
-
-        if delta == -cols
-            && let Some(root) = orchestrator
-            && order.iter().take(first_row).any(|&i| i == self.selected)
-        {
-            self.selected = root;
-            self.reveal_selection();
-            return;
-        }
-
         self.move_selection_grid(delta);
     }
 
@@ -4024,16 +3919,13 @@ impl App {
     /// Bring the selected card inside the viewport, scrolling the minimum
     /// distance. Called after every selection move, so the keyboard can never
     /// move the cursor somewhere the user cannot see.
-    ///
-    /// The orchestrator has no card, so it cannot be revealed: selecting it
-    /// leaves the viewport where it was, which is the row it sits above.
     fn reveal_selection(&mut self) {
-        let order = self.card_order();
-        let Some(position) = order.iter().position(|&i| i == self.selected) else {
+        let sections = self.card_sections();
+        let Some(position) = sections.flat().iter().position(|&i| i == self.selected) else {
             return;
         };
         self.roster_scroll =
-            ui::reveal_roster(self.last_size, order.len(), position, self.roster_scroll);
+            ui::reveal_roster(self.last_size, &sections, position, self.roster_scroll);
     }
 
     /// Columns in the roster grid at the current terminal size — the `↑`/`↓`
@@ -4042,12 +3934,9 @@ impl App {
         ui::roster_cols(self.last_size) as isize
     }
 
-    /// The `PgUp`/`PgDn` step, in cells: the plan pins it to one viewport of
-    /// rows. On the one-column fallback that is exactly a page; on a three-column
-    /// grid it is a shorter hop, which keeps the key symmetrical with the rows
-    /// the panel actually shows rather than skipping cells the user never saw.
+    /// The `PgUp`/`PgDn` step, in cells: one viewport of card rows.
     fn roster_page(&self) -> isize {
-        ui::roster_page(self.last_size, self.card_order().len()) as isize
+        ui::roster_page(self.last_size, &self.card_sections()) as isize
     }
 
     // --- project discovery ---
@@ -4205,13 +4094,9 @@ impl App {
     }
 
     /// The largest scroll offset the roster grid accepts right now — the last
-    /// page that still shows whole rows. `0` when everything fits.
-    ///
-    /// Counted over [`Self::card_order`], not the whole roster: the orchestrator
-    /// has no card, so counting it would let the wheel scroll to a page that does
-    /// not exist.
+    /// page that still shows whole bands. `0` when everything fits.
     pub fn roster_max_scroll(&self) -> usize {
-        ui::roster_max_scroll(self.last_size, self.card_order().len())
+        ui::roster_max_scroll(self.last_size, &self.card_sections())
     }
 
     pub fn frame(&self) -> u64 {
@@ -4246,62 +4131,60 @@ impl App {
         self.prompt_focused
     }
 
-    /// The orchestrator's display name (`None` on a roster with no root, which
-    /// only a hand-built fixture can produce).
-    pub fn orchestrator_name(&self) -> Option<&str> {
-        self.orchestrator().map(|employee| employee.name.as_str())
+    /// The employee the roster prompt bar speaks to, for its border: the name of
+    /// the selected card.
+    pub fn prompt_employee_name(&self) -> Option<&str> {
+        self.team
+            .employees()
+            .get(self.selected)
+            .map(|employee| employee.name.as_str())
     }
 
-    /// The orchestrator's live status, for the prompt bar's border.
-    pub fn orchestrator_status(&self) -> Option<EmployeeStatus> {
-        self.orchestrator().map(|employee| employee.status)
+    /// The prompt employee's live status, for the prompt bar's border.
+    pub fn prompt_employee_status(&self) -> Option<EmployeeStatus> {
+        self.team
+            .employees()
+            .get(self.selected)
+            .map(|employee| employee.status)
     }
 
-    /// The orchestrator's assigned model, when it has one.
-    pub fn orchestrator_model(&self) -> Option<&str> {
-        self.orchestrator()
+    /// The prompt employee's assigned model, when it has one.
+    pub fn prompt_employee_model(&self) -> Option<&str> {
+        self.team
+            .employees()
+            .get(self.selected)
             .and_then(|employee| employee.model.as_deref())
     }
 
-    /// The root employee, if the roster has one.
-    fn orchestrator(&self) -> Option<&crate::team::Employee> {
-        self.team
-            .employees()
-            .iter()
-            .find(|employee| employee.id == crate::team::ORCHESTRATOR_ID)
-    }
-
-    /// How many employees are mid-turn *under* the root — the work the
-    /// orchestrator has handed out and is waiting on.
-    ///
-    /// The root's own turn is excluded: it is the one delegating, so counting it
-    /// would make an idle team look busy the moment a goal is typed.
+    /// How many employees are mid-turn — the work currently running, whoever it
+    /// belongs to.
     pub fn delegating_count(&self) -> usize {
-        let orchestrator = self.orchestrator_index();
         self.team
             .employees()
             .iter()
-            .enumerate()
-            .filter(|(index, employee)| Some(*index) != orchestrator && employee.is_busy())
+            .filter(|employee| employee.is_busy())
             .count()
     }
 
-    /// True while the orchestrator is thinking — the prompt band grows a row for
-    /// the indicator then.
-    pub fn orchestrator_is_thinking(&self) -> bool {
-        self.orchestrator_status() == Some(EmployeeStatus::Thinking)
+    /// True while the prompt employee is thinking — the prompt band grows a row
+    /// for the indicator then.
+    pub fn prompt_employee_is_thinking(&self) -> bool {
+        self.prompt_employee_status() == Some(EmployeeStatus::Thinking)
     }
 
-    /// The root's pinned thinking row for the prompt band, or `None` when it is
-    /// not thinking (or the `[ui] thinking` mode hides it).
-    pub fn orchestrator_thinking_line(&self, width: usize) -> Option<ratatui::text::Line<'static>> {
-        let orchestrator = self.orchestrator_index()?;
-        if self.team.employees().get(orchestrator)?.status != EmployeeStatus::Thinking {
+    /// The prompt employee's pinned thinking row for the prompt band, or `None`
+    /// when it is not thinking (or the `[ui] thinking` mode hides it).
+    pub fn prompt_employee_thinking_line(
+        &self,
+        width: usize,
+    ) -> Option<ratatui::text::Line<'static>> {
+        let employee = self.selected;
+        if self.team.employees().get(employee)?.status != EmployeeStatus::Thinking {
             return None;
         }
-        // The root's thinking lives in its own chat, whether or not that chat is
-        // the one on screen — the prompt bar always speaks for the root.
-        let thinking = self.chats.get(&orchestrator).map(|chat| &chat.thinking);
+        // The employee's thinking lives in its own chat, whether or not that chat
+        // is the one on screen — the prompt bar always speaks for the card.
+        let thinking = self.chats.get(&employee).map(|chat| &chat.thinking);
         self.thinking_line_for(thinking, width)
     }
 
@@ -4311,7 +4194,7 @@ impl App {
     }
 
     /// Mutable access to the roster, for tests that need a roster the app's own
-    /// commands refuse to build (a flat one with no orchestrator, say).
+    /// commands refuse to build (an empty one, say).
     #[cfg(test)]
     pub fn team_mut_for_test(&mut self) -> &mut Team {
         &mut self.team

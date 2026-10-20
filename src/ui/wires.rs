@@ -1,21 +1,20 @@
-//! The delegation wires: the strip's port, the dashed bus, the per-column risers,
-//! and the packets that travel them.
+//! The delegation wires: the dashed bus, the per-column risers, and the packets
+//! that travel them.
 //!
-//! The path is fixed geometry (one route per card column), and `path` is a pure
-//! function of the grid and a card's position, so the renderer and the tests
-//! agree on where a wire is. The animation is the only moving part: a trace's
-//! packet walks the path by its `progress`, and the cells it has already crossed
-//! are lit in the trace's colour, so a hand-off reads as a signal running down the
-//! tree and a report reads as one running back up.
+//! Employees are peers, so a hand-off runs from one card's riser up to the bus,
+//! along the bus, and down the destination's riser — and `path` is a pure
+//! function of the grid and the two cards, so the renderer and the tests agree on
+//! where a wire is. The animation is the only moving part: a trace's packet walks
+//! the path by its `progress`, and the cells it has already crossed are lit in the
+//! trace's colour.
 //!
 //! Direction is the whole story:
 //!
 //! ```text
-//!            ◆ root                        strip
 //!   ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄      bus
-//!            ┆          ┆          ┆
-//!        ┌───┴──┐   ┌───┴──┐   ┌───┴──┐       risers → card tops
-//!        │ card │   │ card │   │ card │
+//!      ┆          ┆          ┆
+//!  ┌───┴──┐   ┌───┴──┐   ┌───┴──┐       risers → card tops
+//!  │ card │   │ card │   │ card │
 //! ```
 
 use ratatui::{
@@ -26,7 +25,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::app::{App, DelegationTrace, TraceKind};
+use crate::app::{App, DelegationTrace};
 
 use super::pipeline::Grid;
 
@@ -75,60 +74,46 @@ impl Path {
     }
 }
 
-/// The route from the strip to a card: out of the strip's port onto the bus, along
-/// the bus to the card's riser, then down the riser to the card's top border.
+/// The route between two cards: up from the source's riser to the bus, along the
+/// bus to the destination's riser, then down to the destination's top border.
 ///
-/// Pure: same grid and card, same path. A report travels it reversed
-/// ([`reverse`]), so both directions share one geometry.
-///
-/// The path starts *on the bus*, not on the strip row: the port is where the wire
-/// emerges from under the strip, and drawing a packet on the strip row itself
-/// would overwrite the root's name.
-pub fn path(grid: &Grid, card: Rect, riser_x: u16) -> Path {
+/// Pure: same grid and cards, same path.
+pub fn path(grid: &Grid, from: Rect, from_riser_x: u16, to: Rect, to_riser_x: u16) -> Path {
     let bus = grid.bus();
-    let strip = grid.strip();
     let mut cells = Vec::new();
 
     if bus.height == 0 {
-        // No bus (a very short panel): the wire is just the riser, so a packet
-        // still visibly reaches the card.
-        for y in bus.bottom()..card.y {
-            cells.push(Position::new(riser_x, y));
+        // No bus (a very short panel): a hand-off between cards in the same
+        // column is just the riser, and anything else has no wire to draw.
+        if from_riser_x == to_riser_x {
+            for y in from.y..=to.y {
+                cells.push(Position::new(from_riser_x, y));
+            }
         }
-        cells.push(Position::new(riser_x, card.y));
         return Path { cells };
     }
 
-    // The port: the root's column, where the wire leaves the strip.
-    let port_x = strip.x.saturating_add(2);
     let bus_y = bus.y;
 
-    // Along the bus to the card's riser column, walking from the port toward the
-    // riser so every step is one cell.
-    let mut x = port_x;
-    cells.push(Position::new(x, bus_y));
-    while x != riser_x {
-        x = if x < riser_x { x + 1 } else { x - 1 };
+    // Up from the source's card top to the bus.
+    for y in (bus_y..=from.y).rev() {
+        cells.push(Position::new(from_riser_x, y));
+    }
+
+    // Along the bus to the destination's riser.
+    let mut x = from_riser_x;
+    while x != to_riser_x {
+        x = if x < to_riser_x { x + 1 } else { x - 1 };
         cells.push(Position::new(x, bus_y));
     }
 
-    // Down the riser to the card's top border.
-    for y in bus_y + 1..card.y {
-        cells.push(Position::new(riser_x, y));
+    // Down the riser to the destination's top border.
+    for y in bus_y + 1..=to.y {
+        cells.push(Position::new(to_riser_x, y));
     }
 
-    // The card's top border is where the work arrives.
-    cells.push(Position::new(riser_x, card.y));
     cells.dedup();
-
     Path { cells }
-}
-
-/// A path travelled the other way — a report climbing back to the root.
-pub fn reverse(path: &Path) -> Path {
-    Path {
-        cells: path.cells.iter().rev().copied().collect(),
-    }
 }
 
 /// Draw the wires: the static risers for every visible card column, then each
@@ -141,27 +126,25 @@ pub fn render(frame: &mut Frame, app: &App, grid: &Grid) {
 
     let frame_no = app.frame();
     for trace in app.traces() {
-        let Some(card) = card_for(grid, trace) else {
+        let (Some(from), Some(to)) = (card_for(grid, trace.from), card_for(grid, trace.to)) else {
             continue;
         };
-        let route = path(grid, card.area, card.riser_x);
-        // Work going out runs strip → card; a report runs card → strip. A
-        // fan-out is outbound too — it is the root broadcasting, not answering.
-        let route = match trace.kind {
-            TraceKind::Out | TraceKind::Fanout => route,
-            TraceKind::Report => reverse(&route),
-        };
+        let route = path(grid, from.area, from.riser_x, to.area, to.riser_x);
+        if route.cells.is_empty() {
+            continue;
+        }
         draw_trace(frame, grid, &route, trace, frame_no);
     }
 }
 
 /// The static risers: one dim dashed column in the gutter left of each visible
-/// card column, running from the bus down past the cards, so the tree's shape is
+/// card column, running from the bus down past the cards, so the wiring is
 /// legible even when nothing is moving.
 ///
 /// The riser is the *gutter*, not the gap between rows: it runs alongside the
 /// cards it feeds, which is what makes a column of three cards read as hanging
-/// off one wire.
+/// off one wire. A section heading in its path is skipped — the wire resumes
+/// below it, so the heading stays readable.
 fn render_risers(frame: &mut Frame, grid: &Grid) {
     let bus = grid.bus();
     if bus.height == 0 {
@@ -186,18 +169,17 @@ fn render_risers(frame: &mut Frame, grid: &Grid) {
             .max()
             .unwrap_or(cell.area.bottom());
         for y in bus.bottom()..bottom {
-            put(frame, Position::new(cell.riser_x, y), RISER, style);
+            let at = Position::new(cell.riser_x, y);
+            if grid.headings.iter().any(|(_, rect)| rect.contains(at)) {
+                continue; // never draw a wire through a section heading
+            }
+            put(frame, at, RISER, style);
         }
     }
 }
 
-/// The card a trace points at — the *destination* for an outgoing hand-off and
-/// the *origin* for a report.
-fn card_for<'a>(grid: &'a Grid, trace: &DelegationTrace) -> Option<&'a super::pipeline::Node> {
-    let employee = match trace.kind {
-        TraceKind::Report => trace.from,
-        TraceKind::Out | TraceKind::Fanout => trace.to,
-    };
+/// The card for a roster index, when it is on screen.
+fn card_for(grid: &Grid, employee: usize) -> Option<&super::pipeline::Node> {
     grid.cells.iter().find(|cell| cell.employee == employee)
 }
 
@@ -214,9 +196,12 @@ fn draw_trace(
     let colour = trace.kind.color();
     let travelled = route.travelled(progress);
 
-    // The lit wire: one cell at a time, clipped to the panel.
+    // The lit wire: one cell at a time, clipped to the panel and kept off the
+    // title and section headings, which must stay readable.
     for cell in route.cells.iter().take(travelled) {
-        if grid.shape.title.contains(*cell) {
+        if grid.shape.title.contains(*cell)
+            || grid.headings.iter().any(|(_, rect)| rect.contains(*cell))
+        {
             continue;
         }
         put(frame, *cell, "┄", Style::default().fg(colour));
@@ -225,6 +210,7 @@ fn draw_trace(
     // The head.
     if let Some(head) = route.head(progress)
         && !grid.shape.title.contains(head)
+        && !grid.headings.iter().any(|(_, rect)| rect.contains(head))
     {
         put(
             frame,
@@ -253,7 +239,7 @@ fn put(frame: &mut Frame, at: Position, symbol: &str, style: Style) {
 /// The colour a trace is drawn in — exposed so tests can assert the mapping
 /// without reaching into the renderer.
 #[cfg(test)]
-pub fn trace_color(kind: TraceKind) -> Color {
+pub fn trace_color(kind: crate::app::TraceKind) -> Color {
     kind.color()
 }
 
@@ -263,8 +249,11 @@ mod tests {
     use ratatui::layout::Rect;
 
     fn grid_at(width: u16, height: u16, count: usize) -> Grid {
-        let order: Vec<usize> = (0..count).collect();
-        super::super::pipeline::grid(Rect::new(0, 1, width, height), &order, 0)
+        let sections = super::super::pipeline::Sections {
+            active: Vec::new(),
+            idle: (0..count).collect(),
+        };
+        super::super::pipeline::grid(Rect::new(0, 1, width, height), &sections, 0)
     }
 
     /// The route is contiguous: every cell is one step from the previous one, so
@@ -272,66 +261,67 @@ mod tests {
     #[test]
     fn the_path_is_contiguous() {
         let grid = grid_at(64, 24, 6);
-        for cell in &grid.cells {
-            let route = path(&grid, cell.area, cell.riser_x);
-            assert!(route.cells.len() > 1, "a card has a wire");
-            for pair in route.cells.windows(2) {
-                let (a, b) = (pair[0], pair[1]);
-                let step = a.x.abs_diff(b.x) + a.y.abs_diff(b.y);
-                assert_eq!(step, 1, "{a:?} → {b:?} is not one step");
+        for (index, from) in grid.cells.iter().enumerate() {
+            for to in &grid.cells[index + 1..] {
+                let route = path(&grid, from.area, from.riser_x, to.area, to.riser_x);
+                assert!(route.cells.len() > 1, "two cards share a wire");
+                for pair in route.cells.windows(2) {
+                    let (a, b) = (pair[0], pair[1]);
+                    let step = a.x.abs_diff(b.x) + a.y.abs_diff(b.y);
+                    assert_eq!(step, 1, "{a:?} → {b:?} is not one step");
+                }
             }
         }
     }
 
-    /// The route starts on the bus at the root's port and ends on the card's top
-    /// border — the two ends the user watches.
+    /// The route starts at the source card's top and ends at the destination's —
+    /// the two ends the user watches.
     #[test]
-    fn the_path_runs_from_the_strip_to_the_card_top() {
+    fn the_path_runs_from_card_to_card() {
         let grid = grid_at(64, 24, 3);
-        let card = &grid.cells[0];
-        let route = path(&grid, card.area, card.riser_x);
+        let (from, to) = (&grid.cells[0], &grid.cells[2]);
+        let route = path(&grid, from.area, from.riser_x, to.area, to.riser_x);
 
         let first = route.cells.first().expect("a wire has cells");
-        assert_eq!(first.y, grid.bus().y, "the wire starts on the bus");
-        assert_eq!(
-            first.x,
-            grid.strip().x + 2,
-            "at the root's port, under the strip"
-        );
+        assert_eq!(first.y, from.area.y, "the wire starts on the source card");
+        assert_eq!(first.x, from.riser_x, "at its own riser");
 
         let last = route.cells.last().expect("a wire has cells");
-        assert_eq!(last.y, card.area.y, "and ends on the card's top border");
-        assert_eq!(last.x, card.riser_x, "at the card's own riser");
+        assert_eq!(last.y, to.area.y, "and ends on the destination's top");
+        assert_eq!(last.x, to.riser_x, "at its own riser");
     }
 
-    /// No wire cell lands on the strip's row: a packet there would overwrite the
-    /// root's name.
+    /// No wire cell lands on the strip's row: a packet there would overwrite Jev's
+    /// line.
     #[test]
     fn no_wire_cell_covers_the_strip() {
         let grid = grid_at(64, 24, 6);
         let strip = grid.strip();
         assert!(strip.height > 0, "the fixture draws the strip");
-        for cell in &grid.cells {
-            let route = path(&grid, cell.area, cell.riser_x);
-            for point in &route.cells {
-                assert!(
-                    !strip.contains(*point),
-                    "{point:?} is on the strip row {strip:?}"
-                );
+        for (index, from) in grid.cells.iter().enumerate() {
+            for to in &grid.cells[index + 1..] {
+                let route = path(&grid, from.area, from.riser_x, to.area, to.riser_x);
+                for point in &route.cells {
+                    assert!(
+                        !strip.contains(*point),
+                        "{point:?} is on the strip row {strip:?}"
+                    );
+                }
             }
         }
     }
 
-    /// Every wire crosses the bus exactly once — it is the one row all risers
-    /// hang from.
+    /// Every wire crosses the bus — it is the one row all risers hang from.
     #[test]
     fn every_path_crosses_the_bus() {
         let grid = grid_at(64, 24, 6);
         let bus_y = grid.bus().y;
-        for cell in &grid.cells {
-            let route = path(&grid, cell.area, cell.riser_x);
-            let on_bus = route.cells.iter().filter(|p| p.y == bus_y).count();
-            assert!(on_bus >= 1, "the wire misses the bus: {:?}", route.cells);
+        for (index, from) in grid.cells.iter().enumerate() {
+            for to in &grid.cells[index + 1..] {
+                let route = path(&grid, from.area, from.riser_x, to.area, to.riser_x);
+                let on_bus = route.cells.iter().filter(|p| p.y == bus_y).count();
+                assert!(on_bus >= 1, "the wire misses the bus: {:?}", route.cells);
+            }
         }
     }
 
@@ -339,8 +329,8 @@ mod tests {
     #[test]
     fn the_packet_walks_the_path() {
         let grid = grid_at(64, 24, 3);
-        let card = &grid.cells[1];
-        let route = path(&grid, card.area, card.riser_x);
+        let (from, to) = (&grid.cells[0], &grid.cells[1]);
+        let route = path(&grid, from.area, from.riser_x, to.area, to.riser_x);
 
         let mut previous = 0;
         for step in 0..=10 {
@@ -357,13 +347,14 @@ mod tests {
         );
     }
 
-    /// Reversing is the same wire travelled the other way, cell for cell.
+    /// A hand-off and its answer travel opposite directions over the same wire:
+    /// the report path is the hand-off path reversed.
     #[test]
-    fn a_report_travels_the_same_wire_backwards() {
+    fn a_reply_travels_the_same_wire_backwards() {
         let grid = grid_at(64, 24, 3);
-        let card = &grid.cells[0];
-        let forward = path(&grid, card.area, card.riser_x);
-        let backward = reverse(&forward);
+        let (a, b) = (&grid.cells[0], &grid.cells[2]);
+        let forward = path(&grid, a.area, a.riser_x, b.area, b.riser_x);
+        let backward = path(&grid, b.area, b.riser_x, a.area, a.riser_x);
 
         assert_eq!(backward.cells.first(), forward.cells.last());
         assert_eq!(backward.cells.last(), forward.cells.first());
@@ -374,6 +365,7 @@ mod tests {
     /// yellow broadcast.
     #[test]
     fn trace_kinds_have_distinct_colours() {
+        use crate::app::TraceKind;
         assert_eq!(trace_color(TraceKind::Out), Color::Cyan);
         assert_eq!(trace_color(TraceKind::Report), Color::Green);
         assert_eq!(trace_color(TraceKind::Fanout), Color::Yellow);

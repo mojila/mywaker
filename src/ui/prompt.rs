@@ -1,8 +1,8 @@
 //! The roster's prompt bar: the goal input on the main screen, addressed to the
-//! orchestrator.
+//! selected employee.
 //!
-//! Two rows: a top border carrying who you are talking to (the root's name, its
-//! status, its model, and how many hand-offs are in flight), and one content row
+//! Two rows: a top border carrying who you are talking to (their name, status,
+//! their model, and how many employees are mid-turn), and one content row
 //! holding `> ` and the line editor. The editor itself is
 //! [`super::input`], shared with the chat bar, so the two cursors behave the same.
 //!
@@ -67,34 +67,35 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         );
     }
 
-    // While the root is thinking, the band's last row says what about. It uses the
-    // same indicator as the chat transcript (and the same `[ui] thinking` setting),
-    // so the two screens cannot disagree about how much is shown.
+    // While the selected employee is thinking, the band's last row says what
+    // about. It uses the same indicator as the chat transcript (and the same
+    // `[ui] thinking` setting), so the two screens cannot disagree about how much
+    // is shown.
     if area.height > super::layout::PROMPT_HEIGHT
-        && let Some(thinking) = app.orchestrator_thinking_line(area.width as usize)
+        && let Some(thinking) = app.prompt_employee_thinking_line(area.width as usize)
     {
         let row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
         frame.render_widget(Paragraph::new(thinking), row);
     }
 }
 
-/// The left half of the border: `orchestrator · Otto · idle · model`, graded so
-/// the name survives a narrow bar.
+/// The left half of the border: `to · Otto · idle · model`, graded so the name
+/// survives a narrow bar.
 fn left_title(app: &App) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(
-            " orchestrator ",
+            " to ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" {} ", app.orchestrator_name().unwrap_or("—")),
+            format!(" {} ", app.prompt_employee_name().unwrap_or("—")),
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ];
 
-    if let Some(status) = app.orchestrator_status() {
+    if let Some(status) = app.prompt_employee_status() {
         spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
             format!("{} ", status.label()),
@@ -102,7 +103,7 @@ fn left_title(app: &App) -> Vec<Span<'static>> {
         ));
     }
 
-    if let Some(model) = app.orchestrator_model() {
+    if let Some(model) = app.prompt_employee_model() {
         spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
             format!("{model} "),
@@ -113,18 +114,17 @@ fn left_title(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
-/// The right half of the border: `◆ N delegating`, only while something is in
-/// flight, so an idle team keeps the bar quiet.
+/// The right half of the border: `◆ N active`, only while something is running, so
+/// an idle team keeps the bar quiet.
 fn right_badge(app: &App) -> Option<Vec<Span<'static>>> {
     let count = app.delegating_count();
     if count == 0 {
         return None;
     }
-    let plural = if count == 1 { "" } else { "s" };
     Some(vec![
         Span::styled("◆ ", Style::default().fg(Color::Yellow)),
         Span::styled(
-            format!("{count} delegating{plural} "),
+            format!("{count} active "),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::DIM),
@@ -176,34 +176,50 @@ mod tests {
             .collect()
     }
 
-    /// The border names the root and shows its live status, so the main screen
-    /// says who a typed goal is going to.
+    /// The border names the selected employee and shows its live status, so the
+    /// main screen says who a typed goal is going to.
     #[test]
-    fn the_bar_names_the_orchestrator_and_its_status() {
+    fn the_bar_names_the_selected_employee_and_its_status() {
         let app = app();
         let text = bar(&app, 100);
-        assert!(text.contains("orchestrator"), "{text}");
-        assert!(text.contains("Otto"), "{text}");
+        assert!(text.contains("to"), "{text}");
+        // The cursor starts on the first card: the planner sorts first.
+        assert!(text.contains("Dex"), "{text}");
         assert!(text.contains("idle"), "{text}");
 
         let mut team = Team::starter();
-        team.set_status_by_id(crate::team::ORCHESTRATOR_ID, EmployeeStatus::Working);
+        team.set_status_by_id("planner", EmployeeStatus::Working);
         let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
         let working = App::with_team(Config::default(), tx, team);
         assert!(bar(&working, 100).contains("working"));
     }
 
+    /// The bar follows the roster cursor: moving the selection changes who the
+    /// next goal is addressed to.
+    #[test]
+    fn the_bar_follows_the_selection() {
+        let mut app = app();
+        press(&mut app, KeyCode::Right);
+        let text = bar(&app, 100);
+        assert!(
+            !text.contains("Dex"),
+            "the bar still names the first card: {text}"
+        );
+        assert!(
+            text.contains(app.prompt_employee_name().expect("a selection")),
+            "{text}"
+        );
+    }
+
     /// The assigned model is shown when there is one, and omitted when there is
     /// not — the bar never prints a placeholder model.
     #[test]
-    fn the_bar_shows_the_root_model_when_assigned() {
+    fn the_bar_shows_the_selected_model_when_assigned() {
         let app = app();
         assert!(!bar(&app, 100).contains("deepseek"), "no model yet");
 
         let mut team = Team::starter();
-        team.employee_mut(crate::team::ORCHESTRATOR_ID)
-            .expect("root")
-            .model = Some("deepseek-v4-pro".to_string());
+        team.employee_mut("planner").expect("planner").model = Some("deepseek-v4-pro".to_string());
         let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
         let assigned = App::with_team(Config::default(), tx, team);
         assert!(bar(&assigned, 100).contains("deepseek-v4-pro"));
@@ -230,31 +246,32 @@ mod tests {
         assert!(!bar(&app, 60).contains(input::CURSOR));
     }
 
-    /// The badge counts the employees working under the root, and disappears when
-    /// the team is idle.
+    /// The badge counts the employees mid-turn, and disappears when the team is
+    /// idle.
     #[test]
-    fn the_badge_reports_delegation_in_flight() {
+    fn the_badge_reports_work_in_flight() {
         let app = app();
-        assert!(!bar(&app, 100).contains("delegating"), "idle team");
+        assert!(!bar(&app, 100).contains("active"), "idle team");
 
-        // Two workers mid-turn under the root: the root has handed work out.
+        // Two employees mid-turn: the badge says how much is running.
         let mut team = Team::starter();
         team.set_status_by_id("researcher", EmployeeStatus::Working);
         team.set_status_by_id("writer", EmployeeStatus::Thinking);
         let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
         let delegating = App::with_team(Config::default(), tx, team);
         let text = bar(&delegating, 100);
-        assert!(text.contains("◆ 2 delegating"), "{text}");
+        assert!(text.contains("◆ 2 active"), "{text}");
     }
 
-    /// The root's own turn is not delegation: it is the one doing the delegating.
+    /// The prompt employee's own turn counts too: there is no root whose work is
+    /// "delegation" and everyone else's "execution".
     #[test]
-    fn the_roots_own_turn_is_not_counted_as_delegation() {
+    fn the_prompt_employees_own_turn_is_counted() {
         let mut team = Team::starter();
-        team.set_status_by_id(crate::team::ORCHESTRATOR_ID, EmployeeStatus::Working);
+        team.set_status_by_id("planner", EmployeeStatus::Working);
         let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
         let app = App::with_team(Config::default(), tx, team);
-        assert!(!bar(&app, 100).contains("delegating"));
+        assert!(bar(&app, 100).contains("◆ 1 active"));
     }
 
     /// The bar survives a narrow terminal without panicking, and still shows the

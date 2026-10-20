@@ -12,9 +12,9 @@ use crate::app::Mode;
 pub(crate) struct Regions {
     pub title: Rect,
     pub main: Rect,
-    /// The roster's prompt band: the orchestrator bar on the main screen. Zero
-    /// height on every other screen, so `main` keeps the height it had before
-    /// the bar existed.
+    /// The roster's prompt band: the goal bar on the main screen. Zero height on
+    /// every other screen, so `main` keeps the height it had before the bar
+    /// existed.
     pub prompt: Rect,
     pub log: Rect,
     pub help: Rect,
@@ -24,8 +24,8 @@ pub(crate) struct Regions {
 /// of the bordered bar (who you are talking to, then what you are typing).
 pub(crate) const PROMPT_HEIGHT: u16 = 2;
 
-/// The prompt band's height while the orchestrator is thinking: the resting rows
-/// plus one for the thinking indicator.
+/// The prompt band's height while the selected employee is thinking: the resting
+/// rows plus one for the thinking indicator.
 pub(crate) const PROMPT_THINKING_HEIGHT: u16 = 3;
 
 impl Regions {

@@ -6,15 +6,12 @@
 //! employee, every cell of every card resolves to it, and no employee is
 //! clickable that is not drawn.**
 //!
-//! This is the guard the orchestrator work (PLAN §8.2) needs. Introducing
-//! `card_order()` — roster minus the orchestrator — changes *which* employees the
-//! grid draws, and the failure mode it invites is exactly the one asserted against
-//! here: the drawing picks one order and the hit-tester another, so a click
-//! selects the wrong employee (or the orchestrator, which has no card). The
-//! assertions are deliberately order-agnostic and roster-size-agnostic — they name
-//! no employee and assume no particular membership — so they keep holding after
-//! both `grid_cells` and `hit_target_at` move to `card_order()`, and they fail the
-//! moment only one of them moves.
+//! The failure mode this guards is the one that invites itself whenever the grid
+//! order changes: the drawing picks one order and the hit-tester another, so a
+//! click selects the wrong employee. The assertions are deliberately
+//! order-agnostic and roster-size-agnostic — they name no employee and assume no
+//! particular membership — so they keep holding as the roster grows, shrinks, or
+//! re-orders.
 //!
 //! Every pinned size from `docs/acceptance-sidebar.md` §3 is covered, because the
 //! panel changes shape at 40×24 (no grid at all) and at 80×24 (one column).
@@ -284,18 +281,16 @@ fn grid_cells_and_hit_testing_agree_at_every_pinned_size() {
         // the geometry. `grid_cells` and `hit_target_at` could agree with each
         // other while `pipeline::render` drew a different order, so the claim
         // "the grid draws `card_order`" is pinned here: every employee the grid
-        // owns appears as a card title exactly once, and the root never does.
+        // owns appears as a card title exactly once.
         assert_render_draws_card_order(&mut app, size);
     }
 }
 
-/// R1b: the drawn frame contains one card per employee in `card_order`, and the
-/// orchestrator is never drawn as one.
+/// R1b: the drawn frame contains one card per employee in `card_order`.
 ///
 /// This is the guard the drawing needs on its own: mutating `pipeline::render` to
-/// read `workflow_order()` leaves every geometry assertion above green (the two
-/// orders differ only by the root, which is not a card), but it would draw the
-/// root as a card — which the "no root card head" clause below catches directly.
+/// read a different order leaves every geometry assertion above green, but the
+/// card heads below catch it directly.
 fn assert_render_draws_card_order(app: &mut App, size: (u16, u16)) {
     let (width, height) = size;
     let panel = mywaker::ui::team_area(size);
@@ -332,34 +327,14 @@ fn assert_render_draws_card_order(app: &mut App, size: (u16, u16)) {
             .sum()
     };
 
-    // The root is never a card: its stage label is not a card title, and it has no
-    // card head. (The strip prints the root by *name*, not by stage label.)
-    assert_eq!(
-        in_panel(" ORCHESTRATOR "),
-        0,
-        "{width}×{height}: the orchestrator was drawn as a card:\n{frame}"
-    );
-    if let Some(root) = app
-        .team()
-        .employees()
-        .iter()
-        .position(|employee| employee.id == "orchestrator")
-    {
-        let name = app.team().employees()[root].name.as_str();
-        assert_eq!(
-            in_panel(&format!("● {name}")),
-            0,
-            "{width}×{height}: the root was drawn with a card head:\n{frame}"
-        );
-    }
-
+    // No card is drawn without a head: every card title is a real employee.
     // Every card the geometry says is on this page is drawn, exactly once, with
     // its own head. Names anchor the count: several generalists share `GENERAL`,
     // so a label count could not tell one card from eight.
     //
     // A panel too narrow for the head (60×16 leaves the team panel 4 columns)
     // truncates the card instead of drawing it, so the clause is scoped to panels
-    // with room — the root-is-not-a-card clause above still runs everywhere.
+    // with room.
     let drawn = mywaker::ui::grid_cells(app, size);
     assert!(
         !drawn.is_empty(),
@@ -382,13 +357,6 @@ fn assert_render_draws_card_order(app: &mut App, size: (u16, u16)) {
                 "{width}×{height}: {}'s card head was drawn {} times:\n{frame}",
                 employee.name,
                 in_panel(&head)
-            );
-        } else {
-            // Too narrow for the head: the card must still be drawn (its border),
-            // and it must not be the root.
-            assert_ne!(
-                employee.id, "orchestrator",
-                "{width}×{height}: the root was drawn as a card"
             );
         }
     }

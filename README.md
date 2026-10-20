@@ -8,30 +8,32 @@ task stream, and an explicit model selector that lets you assign a model to ever
 employee.
 
 ```
- mywaker  a team of AI employees                                                       ⠋ connecting…
-┌ waker ───────────────┐ team · 4                                   ┌ tasks ───────────────────────┐
-│  ⠋   ◉   ◉           │ jev ◆ on — @jev · jev-1-13-free            │⠋ Dex · Planner               │
-│  ┌─⠋─┐               │┌ PLANNER ───┐ ┌ RESEARCHER ┐ ┌ WRITER ────┐│  —                           │
-│MYWAKER               ││⠋ Dex       │ │▶ Aria      │ │● Bruno     ││                              │
-│  └─────┘             ││Planner     │ │Research le…│ │Writer      ││▶ Aria · Research lead        │
-│                      ││thinking    │ │working     │ │idle        ││  —                           │
-│now ⠋ connecting      ││gpt-6-luna  │ │none        │ │none        ││                              │
-│                      │└────────────┘ └────────────┘ └────────────┘│● Bruno · Writer              │
-│who ▶ Aria            │                                            │  —                           │
-│Research lead         │┌ REVIEWER ──┐                              │                              │
-│none                  ││● Cleo      │                              │● Cleo · Reviewer             │
-│— · session —         ││Reviewer    │                              │  —                           │
-│                      ││idle        │                              │                              │
-│pulse ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁││none        │                              │                              │
-│                      │└────────────┘                              │                              │
-└──────────────────────┘                                            └──────────────────────────────┘
-┌ log ─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ stream 0 agents · 0 events                                                                       │
-│ usage 0/0 in/out · cache 0% (0) · ram 4.0 MiB · cpu 0.0%                                         │
-│connecting to OpenCode…                                                                           │
-│                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
- ↑↓←→ move  wheel scroll  Enter chat  p projects  m model  Space pause  s task  ? help  q quit
+ mywaker  a team of AI employees                                                                   ⠋ connecting…
+┌ waker ───────────────┐ team · 4 · 2 working                                   ┌ tasks ───────────────────────┐
+│  ⠋   ◉   ◉           │jev ◆ off                                               │⠋ Dex · Planner               │
+│  ┌─⠋─┐               │┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│  plan the migration          │
+│MYWAKER               │ ◆ working · 2                                          │                              │
+│  └─────┘             │┆┌ PLANNER ──────┐ ┆┌ WRITER ───────┐                   │● Aria · Research lead        │
+│                      │┆│⠋ Dex          │ ┆│▶ Bruno        │                   │  —                           │
+│now ⠋ connecting      │┆│Planner        │ ┆│Writer         │                   │                              │
+│                      │┆│thinking       │ ┆│working        │                   │▶ Bruno · Writer              │
+│who ⠋ Dex             │┆│none           │ ┆│none           │                   │  —                           │
+│Planner               │┆└───────────────┘ ┆└───────────────┘                   │                              │
+│none                  │┆                  ┆                                    │● Cleo · Reviewer             │
+│— · session —         │ ◇ idle · 2                                             │  —                           │
+│                      │┆┌ RESEARCHER ───┐ ┆┌ REVIEWER ─────┐                   │                              │
+│pulse ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁│┆│● Aria         │ ┆│● Cleo         │                   │                              │
+│                      │┆│Research lead  │ ┆│Reviewer       │                   │                              │
+│vitals queue empty    │┆│idle           │ ┆│idle           │                   │                              │
+│no finished work      │┆│none           │ ┆│none           │                   │                              │
+└──────────────────────┘┆└───────────────┘ ┆└───────────────┘                   └──────────────────────────────┘
+ to  Dex · thinking ─────────────────────────────────────────────────────────────────────────────────◆ 2 active
+>
+⠋ thinking
+┌ log ─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ stream 0 agents · 0 events                                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ↑↓←→ move  wheel scroll  i goal  Enter chat  p projects  m model  Space pause  s task  Ctrl-Y copy log  ? help
 ```
 
 The team renders as an **employee grid** — three cards per row, ordered plan →
@@ -39,13 +41,20 @@ research → write → review. Each card is a box (name, role, live status, mode
 that lights up in its status colour (yellow thinking, cyan working, green done)
 while the sidebar's robot mirrors the aggregate state. Jev, the shared question
 answerer, is a one-row header above the grid rather than a card of its own.
+The grid is split in two: employees who are **working** sit on top under a
+`◆ working` heading, and everyone else sits below under `◇ idle`, so the top of
+the panel always answers "who is busy right now".
+`i` (or `Tab`) puts a goal bar under the panels: what you type there goes to the
+selected employee, and its answer comes back to the log without opening a chat.
 
 ## What it does
 
 - **Employee grid** — the team as a fixed three-column grid (one column on a
-  narrow panel), ordered plan → research → write → review, one card per employee
-  with live status + model; the running employee lights up in its status colour.
-  The wheel scrolls the grid, the arrows move the selection and reveal it, and
+  narrow panel), ordered plan → research → write → review within each of two
+  sections — `◆ working` above, `◇ idle` below — one card per employee with live
+  status + model; a running employee lights up in its status colour and moves to
+  the top section. The wheel scrolls the grid, the arrows move the selection and
+  reveal it, and
   the title reads `team · N · rows a-b/c` while the roster overflows.
 - **Live task board** — a right-hand panel listing every employee with their
   latest task and status, updated as work streams in (per-employee `last_task`).
@@ -182,6 +191,7 @@ rather than failing with `Agent not found`.
 | `↑` / `↓` or `j` / `k` | Move one card row up / down (same column) |
 | `PgUp` / `PgDn` | Move a viewport of cards (the selection follows and is revealed) |
 | `Enter` | Chat with the selected employee |
+| `i` / `Tab` | Type a goal for the selected employee without leaving the roster |
 | `m` | Pick a model for the selected employee |
 | `p` | Choose the working project |
 | `Space` | Pause / resume the autonomous-task engine (new cron/watch fires queue) |

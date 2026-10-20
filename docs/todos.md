@@ -179,6 +179,7 @@ against out-of-band context.
 - [x] 💻 Orchestrator: split one goal across `N` employees → parallel sessions (`tokio::spawn` + `JoinSet`)
   - `@parallel <goal>` (aliases `@all`/`@team`/`@fanout`) fans a goal out to every teammate but the source and the aggregator; each worker gets its own session created in parallel. The `/parallel <goal>` chat command triggers the same from the user.
   - `src/workflow.rs` (`is_parallel`, `strip_directives`) + `src/app.rs` (`fan_out`, `FanOut` state).
+  - *Retired:* the root `orchestrator` employee. It was intended to fan a goal out, but in practice it only delegated to its own OpenCode sub-agents, so the roster's live diagram never reflected the work. The team is flat again: every employee is a card, any employee can delegate to any other, and the roster's goal bar addresses the selected card.
 - [x] 💻 Handoff: employee output fed as input to the next (role chain)
   - Peer-to-peer delegation protocol: an assistant reply ends with line-leading `@<id> <instruction>` directives; the app relays each to the named employee (creating their session on demand). `@user`/`@deliver`/`@done` marks the final answer, routed back to the origin chat.
   - `src/workflow.rs` (`parse_delegations`, `is_final`, `team_context`) + app dispatch (`dispatch_delegations`/`send_to_employee`/`flush_outbox`), idempotent per message id, capped at 64 hand-offs to stop `A → B → A` cycles.

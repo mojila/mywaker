@@ -33,7 +33,7 @@ pub fn target_at(app: &App, size: (u16, u16), x: u16, y: u16) -> Option<Target> 
     let regions = layout::Regions::of(
         Rect::new(0, 0, size.0, size.1),
         app.mode(),
-        app.orchestrator_is_thinking(),
+        app.prompt_employee_is_thinking(),
     );
     let point = Position::from((x, y));
 
@@ -74,11 +74,11 @@ pub fn target_at(app: &App, size: (u16, u16), x: u16, y: u16) -> Option<Target> 
 
 /// The employee whose grid card covers the point. The grid's own geometry
 /// decides — with the app's scroll offset — so a click agrees with the card it
-/// was aimed at. The Jev header and the gaps between cards stand for no employee
-/// and answer `None`.
+/// was aimed at. The Jev strip, the section headings, and the gaps between cards
+/// stand for no employee and answer `None`.
 fn employee_at(app: &App, area: Rect, point: Position) -> Option<Target> {
-    let order = app.card_order();
-    pipeline::grid(area, &order, app.roster_scroll())
+    let sections = app.card_sections();
+    pipeline::grid(area, &sections, app.roster_scroll())
         .cells
         .into_iter()
         .find(|cell| cell.area.contains(point))

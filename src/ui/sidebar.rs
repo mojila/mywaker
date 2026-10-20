@@ -869,22 +869,35 @@ mod tests {
     }
 
     /// The inspector names the selected employee's model, which is the whole
-    /// point of P2. Selection starts at the roster root — the orchestrator — so
-    /// that is the employee whose model the inspector shows.
+    /// point of P2. Selection starts on the first card in workflow order — the
+    /// planner — so that is the employee whose model the inspector shows.
     #[test]
     fn inspector_shows_the_selected_employees_model() {
         let mut team = Team::starter();
-        team.set_model(0, "openai/gpt-6-luna-pro".into(), Some("openai".into()));
+        let planner = team
+            .employees()
+            .iter()
+            .position(|employee| employee.id == "planner")
+            .expect("the starter roster has a planner");
+        team.set_model(
+            planner,
+            "openai/gpt-6-luna-pro".into(),
+            Some("openai".into()),
+        );
         let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
         let app = App::with_team(Config::default(), tx, team);
-        assert_eq!(app.selected(), 0, "the roster root is selected first");
+        assert_eq!(
+            app.selected(),
+            planner,
+            "the first card in workflow order is selected first"
+        );
 
         let text: String = inspector(&app)
             .iter()
             .flatten()
             .map(|(text, _)| text.as_str())
             .collect();
-        assert!(text.contains("Otto"), "{text}");
+        assert!(text.contains("Dex"), "{text}");
         assert!(text.contains("openai/gpt-6-luna-pro"), "{text}");
         assert!(text.contains("openai"), "{text}");
     }

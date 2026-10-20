@@ -2,15 +2,19 @@
 //! ordered by workflow role (see [`Employee::workflow_role`] →
 //! [`Role::order`](crate::role::Role::order)).
 //!
-//! Above the cards sits the **delegation pipeline**: a one-row orchestrator strip
-//! (the root, with Jev on its right) over a dashed **bus** that every card hangs
-//! off by its own one-column **riser**. Work travels that path — strip port →
-//! bus → riser → card top — and reports travel it in reverse; `ui::wires` draws
-//! the packets. The root is not a card because it is not one of the stages it
-//! directs: it is the strip the stages hang from.
+//! The cards are split into **two sections**: the employees that are mid-turn on
+//! top (`◆ working`), and everyone else below (`idle`). Each section is a heading
+//! band followed by its card rows, so a glance at the top of the panel answers
+//! "who is working right now" without reading every card's status line.
+//!
+//! Above both sits the **Jev strip** (the shared decision answerer, with its
+//! model) over a dashed **bus** that every card hangs off by its own one-column
+//! **riser**. Employees are peers, so a hand-off between any two of them travels
+//! that path — source riser → bus → destination riser — and `ui::wires` draws the
+//! packets. Jev is not an employee, so it is the strip, not a card.
 //!
 //! The grid is a **viewport**: the wheel scrolls it, the arrows move the
-//! selection and reveal it, and only whole rows are ever drawn. [`shape`] and
+//! selection and reveal it, and only whole bands are ever drawn. [`shape`] and
 //! [`grid`] are the single source of that geometry — the renderer draws from
 //! them and `ui::hit` hit-tests against them — so a click can only land on a
 //! card that is actually on screen, on the row it points at.
@@ -28,11 +32,9 @@ use crate::team::Employee;
 use crate::ui::{status, truncate, wires};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    // The grid draws the pipeline stages only: the orchestrator is the root
-    // above them, not a card among them (see [`App::card_order`]).
-    let order = app.card_order();
+    let sections = app.card_sections();
 
-    if order.is_empty() {
+    if sections.len() == 0 {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" team ".bold().cyan());
@@ -46,11 +48,22 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let employees = app.team().employees();
-    let grid = grid(area, &order, app.roster_scroll());
+    let grid = grid(area, &sections, app.roster_scroll());
 
     render_title(frame, &grid);
     render_strip(frame, app, grid.strip());
     render_bus(frame, &grid);
+
+    // The headings go down before the wires, so a packet crossing a section band
+    // is drawn on top of it rather than under it.
+    for &(section, rect) in &grid.headings {
+        let count = match section {
+            Section::Active => sections.active.len(),
+            Section::Idle => sections.idle.len(),
+        };
+        render_heading(frame, section, rect, count);
+    }
+
     wires::render(frame, app, &grid);
 
     for cell in &grid.cells {
@@ -89,8 +102,115 @@ const MIN_CELL_WIDTH: u16 = 12;
 /// One blank row between card rows, so cards never touch vertically.
 const ROW_GAP: u16 = 1;
 
-/// Distance between the tops of two adjacent card rows.
-const ROW_PITCH: u16 = STAGE_HEIGHT + ROW_GAP;
+/// Which section a card belongs to. Active employees are drawn above idle ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Section {
+    /// Mid-turn: `Thinking` or `Working`.
+    Active,
+    /// Everyone else.
+    Idle,
+}
+
+impl Section {
+    /// The heading printed above the section's cards.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Section::Active => "working",
+            Section::Idle => "idle",
+        }
+    }
+
+    /// The heading's glyph: a lit dot for work in flight, a hollow one for rest.
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            Section::Active => "◆",
+            Section::Idle => "◇",
+        }
+    }
+}
+
+/// The roster split into the two sections the panel draws, each in card order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Sections {
+    /// Employees mid-turn, in workflow order.
+    pub(crate) active: Vec<usize>,
+    /// Everyone else, in workflow order.
+    pub(crate) idle: Vec<usize>,
+}
+
+impl Sections {
+    /// Split `order` (already in workflow order) by each employee's status.
+    pub(crate) fn new(order: &[usize], is_active: impl Fn(usize) -> bool) -> Self {
+        let mut active = Vec::new();
+        let mut idle = Vec::new();
+        for &index in order {
+            if is_active(index) {
+                active.push(index);
+            } else {
+                idle.push(index);
+            }
+        }
+        Self { active, idle }
+    }
+
+    /// Every employee, active section first — the order the arrow keys walk.
+    pub(crate) fn flat(&self) -> Vec<usize> {
+        self.active
+            .iter()
+            .chain(self.idle.iter())
+            .copied()
+            .collect()
+    }
+
+    /// How many employees the two sections hold.
+    pub(crate) fn len(&self) -> usize {
+        self.active.len() + self.idle.len()
+    }
+
+    /// The card rows the panel draws, top to bottom: the active section's rows
+    /// first, then the idle section's.
+    fn rows(&self, cols: usize) -> Vec<Row> {
+        let cols = cols.max(1);
+        let mut rows = Vec::new();
+        for (section, employees) in [(Section::Active, &self.active), (Section::Idle, &self.idle)] {
+            for row in 0..employees.len().div_ceil(cols) {
+                rows.push(Row {
+                    section,
+                    first: row * cols,
+                    // Only the section's first row carries its heading, so a
+                    // heading can never be scrolled away from the cards it
+                    // labels.
+                    heading: row == 0,
+                });
+            }
+        }
+        rows
+    }
+}
+
+/// One card row, plus the section heading that may sit above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Row {
+    section: Section,
+    /// Index of the row's first employee within the section's list.
+    first: usize,
+    /// True when this is its section's first row, so the heading is drawn above
+    /// it.
+    heading: bool,
+}
+
+impl Row {
+    /// The row's height including its heading, before the gap that separates it
+    /// from the previous row.
+    fn block(self) -> u16 {
+        STAGE_HEIGHT + if self.heading { 1 } else { 0 }
+    }
+
+    /// The row's height plus the gap above it (none above the first row).
+    fn span(self, index: usize) -> u16 {
+        self.block() + if index == 0 { 0 } else { ROW_GAP }
+    }
+}
 
 /// One drawn card: the employee it stands for (an index into the team, in
 /// workflow order) and the rectangle it occupies.
@@ -102,9 +222,8 @@ pub(crate) struct Node {
     pub(crate) riser_x: u16,
 }
 
-/// The fixed part of the grid for one panel size and roster size: the column
-/// split, the pipeline bands, and how many whole rows the remaining height
-/// holds.
+/// The fixed part of the grid for one panel size and roster: the column split,
+/// the pipeline bands, and how many card rows the remaining height holds.
 ///
 /// Split out from [`Grid`] because three callers need the counts without
 /// drawing anything — the reveal rule, the scroll clamp, and the title.
@@ -114,17 +233,26 @@ pub(crate) struct Shape {
     /// Where each column starts (the card's left edge, riser aside).
     pub(crate) column_x: Vec<u16>,
     pub(crate) title: Rect,
-    /// The orchestrator strip: the root's row, with Jev on its right.
+    /// The Jev strip: the shared answerer's row.
     pub(crate) strip: Rect,
     /// The dashed bus the risers hang from.
     pub(crate) bus: Rect,
-    /// The `y` of the first card row when the viewport is at offset 0.
+    /// The `y` of the first row when the viewport is at offset 0.
     pub(crate) first_row: u16,
-    /// Whole card rows that fit in the viewport.
+    /// The card rows themselves, in draw order (active section first).
+    rows: Vec<Row>,
+    /// Card rows that fit in the viewport, starting from the current offset.
     pub(crate) visible_rows: usize,
-    pub(crate) total_rows: usize,
-    /// The largest offset that still fills the viewport with whole rows.
+    /// The largest offset that still shows whole rows.
     pub(crate) max_offset: usize,
+    /// Card rows in the whole roster — the title's total.
+    pub(crate) total_card_rows: usize,
+    /// Card rows in the visible window.
+    pub(crate) visible_card_rows: usize,
+    /// How many employees the active section holds.
+    pub(crate) active_count: usize,
+    /// The height the rows may occupy (below the title, strip, and bus).
+    pub(crate) available: u16,
 }
 
 /// The grid's geometry for one panel, roster, and scroll offset: the shape, the
@@ -135,6 +263,8 @@ pub(crate) struct Grid {
     pub(crate) offset: usize,
     /// How many employees the roster holds — the title's `N`.
     pub(crate) count: usize,
+    /// The section headings on screen, as `(section, rect)`.
+    pub(crate) headings: Vec<(Section, Rect)>,
 }
 
 impl Grid {
@@ -151,14 +281,13 @@ impl Grid {
     }
 }
 
-/// Lay the fixed grid out in `area` for a roster of `count` employees.
+/// Lay the fixed grid out in `area` for a roster split into `sections`.
 ///
 /// **Degradation.** The bands are dropped in the order that costs the user
-/// least: the bus first, then the orchestrator strip, and only when drawing them
-/// would cost a card row. A row is only counted when its full [`STAGE_HEIGHT`]
-/// fits, so a card is never drawn with a top border and no body — the failure
-/// mode the old tree had to special-case.
-pub(crate) fn shape(area: Rect, count: usize) -> Shape {
+/// least: the bus first, then the Jev strip, and only when drawing them would
+/// cost a card row. A row is only counted when its full [`STAGE_HEIGHT`] fits,
+/// so a card is never drawn with a top border and no body.
+pub(crate) fn shape(area: Rect, sections: &Sections) -> Shape {
     // Each column is `riser | card`, with one gap between columns. Three columns
     // therefore need `3 * riser + 3 * card + 2 * gap`; when even a 12-cell card
     // doesn't fit in that budget the grid falls back to one column rather than
@@ -180,31 +309,35 @@ pub(crate) fn shape(area: Rect, count: usize) -> Shape {
         })
         .collect();
 
-    let total_rows = count.div_ceil(cols.max(1));
+    let rows = sections.rows(cols);
+    let total_card_rows = rows.len();
 
     let title_height = area.height.min(1);
     let title = Rect::new(area.x, area.y, area.width, title_height);
     let below_title = area.height.saturating_sub(title_height);
 
-    // `n` rows need `n * ROW_PITCH - 1` lines: the gap sits *between* rows, not
-    // after the last one. Capped at the roster's own row count, so a panel with
-    // room to spare keeps the pipeline: only a band that would push a card row
-    // off the screen is worth dropping.
-    let rows_in = |height: u16| {
-        if total_rows == 0 {
-            0
-        } else {
-            (((height + 1) / ROW_PITCH) as usize).min(total_rows)
+    // How many whole card rows fit in `height`, counting each row's heading.
+    let rows_fitting = |height: u16| {
+        let mut used = 0u16;
+        let mut count = 0usize;
+        for (index, row) in rows.iter().enumerate() {
+            let need = row.span(index);
+            if used + need > height {
+                break;
+            }
+            used += need;
+            count += 1;
         }
+        count
     };
 
     // The pipeline costs up to two rows (strip + bus). Each is kept only when it
     // does not cost a card row, and the bus goes before the strip: the strip is
-    // the root, the bus is the wire between it and the cards.
-    let without = rows_in(below_title);
-    let with_strip = rows_in(below_title.saturating_sub(1));
+    // Jev, the bus is the wire between employees.
+    let without = rows_fitting(below_title);
+    let with_strip = rows_fitting(below_title.saturating_sub(1));
     let strip_height = u16::from(with_strip == without && below_title > STAGE_HEIGHT);
-    let with_bus = rows_in(below_title.saturating_sub(strip_height + 1));
+    let with_bus = rows_fitting(below_title.saturating_sub(strip_height + 1));
     let bus_height =
         u16::from(strip_height == 1 && with_bus == without && below_title > STAGE_HEIGHT);
 
@@ -217,14 +350,39 @@ pub(crate) fn shape(area: Rect, count: usize) -> Shape {
     );
 
     let available = below_title.saturating_sub(strip_height + bus_height);
+
+    // The bottom-most scroll position is the *first* one whose tail — every row
+    // from there to the end, plus the sticky heading it needs — still fits whole.
+    // That is the last page: it ends exactly on the last row, and scrolling
+    // further would only add blank rows.
+    let tail_fits = |offset: usize| {
+        let used: u16 = (offset..rows.len())
+            .map(|index| rows[index].span(index - offset))
+            .fold(sticky_rows(&rows, offset), |sum, need| {
+                sum.saturating_add(need)
+            });
+        used <= available
+    };
+
     // A zero-width panel draws no cards at all (see [`grid`]), so it also has no
     // rows to scroll: `visible_rows` and `max_offset` must agree with what is
     // drawn, or the wheel would accept notches over an empty viewport.
-    let visible_rows = if cell_width == 0 {
-        0
+    let (visible_rows, max_offset) = if cell_width == 0 || rows.is_empty() {
+        (0, 0)
     } else {
-        rows_in(available)
+        let visible_rows = rows_fitting(available.saturating_sub(sticky_rows(&rows, 0)));
+        let max_offset = if visible_rows == 0 {
+            0 // nothing drawn, so there is nowhere to scroll to
+        } else {
+            (0..rows.len())
+                .find(|&offset| tail_fits(offset))
+                .unwrap_or(rows.len().saturating_sub(1))
+        };
+        (visible_rows, max_offset)
     };
+
+    let active_count = sections.active.len();
+    let visible_card_rows = visible_rows.min(rows.len());
 
     Shape {
         cols,
@@ -234,51 +392,100 @@ pub(crate) fn shape(area: Rect, count: usize) -> Shape {
         strip,
         bus,
         first_row: area.y + title_height + strip_height + bus_height,
+        rows,
         visible_rows,
-        total_rows,
-        // With no row on screen there is nothing to scroll *to*, so the only
-        // legal offset is the top. Without this a short panel would accept
-        // notches that move an invisible viewport.
-        max_offset: if visible_rows == 0 {
-            0
-        } else {
-            total_rows.saturating_sub(visible_rows)
-        },
+        max_offset,
+        total_card_rows,
+        visible_card_rows,
+        active_count,
+        available,
     }
 }
 
-/// Lay the grid's cards out for `order` (employee indices in workflow order) and
-/// a scroll `offset` in rows.
+/// The rows reserved above the window for a sticky section heading: one when the
+/// window starts mid-section (so the label is never scrolled away from its
+/// cards), none when it starts on a section's first row.
+fn sticky_rows(rows: &[Row], offset: usize) -> u16 {
+    match rows.get(offset) {
+        Some(row) if !row.heading => 1,
+        _ => 0,
+    }
+}
+
+/// The window drawn at `offset`: the sticky heading it needs (if any) and how
+/// many whole card rows fit below it.
+fn window(shape: &Shape, offset: usize) -> (Option<Section>, usize) {
+    let sticky = shape
+        .rows
+        .get(offset)
+        .filter(|row| !row.heading)
+        .map(|row| row.section);
+    let height = shape.available.saturating_sub(u16::from(sticky.is_some()));
+    let mut used = 0u16;
+    let mut count = 0usize;
+    for (index, row) in shape.rows.iter().enumerate().skip(offset) {
+        let need = row.span(index - offset);
+        if used + need > height {
+            break;
+        }
+        used += need;
+        count += 1;
+    }
+    (sticky, count)
+}
+
+/// Lay the grid's cards out for `sections` and a scroll `offset` in card rows.
 ///
 /// The renderer draws from this and mouse hit-testing reads it, so a click lands
 /// on the card it points at. Only whole rows are emitted, and the offset is
 /// clamped here as well as in [`App::roster_scroll`], so geometry stays sane
 /// even for a caller holding a stale offset.
-pub(crate) fn grid(area: Rect, order: &[usize], offset: usize) -> Grid {
-    let shape = shape(area, order.len());
+pub(crate) fn grid(area: Rect, sections: &Sections, offset: usize) -> Grid {
+    let shape = shape(area, sections);
     let offset = offset.min(shape.max_offset);
 
     let mut cells = Vec::new();
-    let end = (offset + shape.visible_rows).min(shape.total_rows);
+    let mut headings = Vec::new();
+    let mut y = shape.first_row;
+
     // A zero-width panel (a terminal narrower than the fixed side panels) draws
     // nothing: emitting zero-width cards would only give hit-testing rectangles
     // that can never contain a point.
     if shape.cell_width > 0 {
-        for row in offset..end {
+        let (sticky, count) = window(&shape, offset);
+        if let Some(section) = sticky {
+            headings.push((section, Rect::new(area.x, y, area.width, 1)));
+            y = y.saturating_add(1);
+        }
+        let end = (offset + count).min(shape.rows.len());
+        for (index, row) in shape.rows.iter().enumerate().take(end).skip(offset) {
+            // The first drawn row starts flush with `first_row`; every later row
+            // is separated from it by one gap.
+            if index > offset {
+                y = y.saturating_add(ROW_GAP);
+            }
+            if row.heading {
+                headings.push((row.section, Rect::new(area.x, y, area.width, 1)));
+                y = y.saturating_add(1);
+            }
+            let employees = match row.section {
+                Section::Active => &sections.active,
+                Section::Idle => &sections.idle,
+            };
             for col in 0..shape.cols {
-                let Some(&employee) = order.get(row * shape.cols + col) else {
-                    break; // the last row can be ragged — never pad it with ghosts
+                let Some(&employee) = employees.get(row.first + col) else {
+                    break; // the last row can be ragged — never pad it
                 };
                 let Some(&x) = shape.column_x.get(col) else {
                     break;
                 };
-                let y = shape.first_row + (row - offset) as u16 * ROW_PITCH;
                 cells.push(Node {
                     employee,
                     area: Rect::new(x, y, shape.cell_width, STAGE_HEIGHT),
                     riser_x: x.saturating_sub(RISER_WIDTH),
                 });
             }
+            y = y.saturating_add(STAGE_HEIGHT);
         }
     }
 
@@ -286,38 +493,75 @@ pub(crate) fn grid(area: Rect, order: &[usize], offset: usize) -> Grid {
         cells,
         shape,
         offset,
-        count: order.len(),
+        count: sections.len(),
+        headings,
     }
 }
 
-/// The scroll offset that brings workflow `position` inside the viewport.
+/// The scroll offset that brings `position` (an index into the roster's card
+/// order) inside the viewport.
 ///
-/// Scrolling is minimal: a move that is already visible changes nothing, one
-/// past the bottom scrolls by a single row, and one above the top scrolls up to
-/// its row. With no rows on screen there is nothing to reveal.
-pub(crate) fn reveal(area: Rect, count: usize, position: usize, offset: usize) -> usize {
-    let shape = shape(area, count);
+/// Scrolling is minimal: a row that is already visible changes nothing, one past
+/// the bottom scrolls just far enough to show it, and one above the top scrolls
+/// up to it. With no rows on screen there is nothing to reveal.
+pub(crate) fn reveal(area: Rect, sections: &Sections, position: usize, offset: usize) -> usize {
+    let shape = shape(area, sections);
     if shape.visible_rows == 0 {
         return 0;
     }
     let offset = offset.min(shape.max_offset);
-    let row = position / shape.cols.max(1);
+
+    let Some(row) = row_for(&shape, sections, position) else {
+        return offset;
+    };
+
     if row < offset {
-        row
-    } else if row >= offset + shape.visible_rows {
-        (row + 1 - shape.visible_rows).min(shape.max_offset)
-    } else {
-        offset
+        return row;
     }
+    if visible(&shape, offset, row) {
+        return offset;
+    }
+    // Scroll down the minimum distance that still shows the whole row.
+    (offset + 1..=row)
+        .rev()
+        .find(|&start| visible(&shape, start, row))
+        .map(|start| start.min(shape.max_offset))
+        .unwrap_or(row.min(shape.max_offset))
 }
 
-/// The title row: `team · N`, plus ` · rows a-b/c` once the roster overflows the
-/// viewport, so the user can tell there is more above or below.
+/// True when `row` is fully inside the window that starts at `offset`.
+fn visible(shape: &Shape, offset: usize, row: usize) -> bool {
+    if row < offset {
+        return false;
+    }
+    let (_, count) = window(shape, offset);
+    row < offset + count
+}
+
+/// The row index the employee at card `position` is drawn in.
+fn row_for(shape: &Shape, sections: &Sections, position: usize) -> Option<usize> {
+    let cols = shape.cols.max(1);
+    let active = sections.active.len();
+    let (section, index) = if position < active {
+        (Section::Active, position)
+    } else {
+        (Section::Idle, position - active)
+    };
+    let row = index / cols;
+    shape
+        .rows
+        .iter()
+        .position(|r| r.section == section && r.first / cols == row)
+}
+
+/// The title row: `team · N`, plus ` · N working` while anyone is mid-turn, and
+/// ` · rows a-b/c` once the roster overflows the viewport, so the user can tell
+/// there is more above or below.
 ///
-/// The readout is graded: the full form, then a compact ` · a-b/c`, then nothing
-/// — the count itself always survives. A 24-column panel (80×24) has room for
-/// exactly the full form on the first page, and none for the wide one deeper in,
-/// so a fixed string would silently lose the row numbers.
+/// The readout is graded: the full form, then a compact one, then nothing — the
+/// count itself always survives. A 24-column panel (80×24) has room for exactly
+/// the full form on the first page, and none for the wide one deeper in, so a
+/// fixed string would silently lose the numbers.
 fn render_title(frame: &mut Frame, grid: &Grid) {
     let area = grid.title();
     if area.height == 0 || area.width == 0 {
@@ -338,19 +582,31 @@ fn render_title(frame: &mut Frame, grid: &Grid) {
         ),
     ];
 
-    if grid.shape.visible_rows > 0 && grid.shape.total_rows > grid.shape.visible_rows {
+    // The active count is the number the two sections exist to surface, so it is
+    // the first thing added and the last thing dropped.
+    let working = grid.shape.active_count;
+    let overflow = grid.shape.total_card_rows > grid.shape.visible_card_rows;
+    let room_for = |used: usize| (area.width as usize).saturating_sub(used + 1);
+
+    let working_text = format!(" · {working} working");
+    if working > 0 && working_text.chars().count() <= room_for(head.chars().count()) {
+        spans.push(Span::styled(
+            working_text.clone(),
+            Style::default().fg(Color::Green),
+        ));
+    }
+
+    if overflow {
         let first = grid.offset + 1;
-        let last = (grid.offset + grid.shape.visible_rows).min(grid.shape.total_rows);
-        let total = grid.shape.total_rows;
-        let room = (area.width as usize)
-            .saturating_sub(head.chars().count())
-            .saturating_sub(1); // one column of breathing room before the next panel
+        let last = (grid.offset + grid.shape.visible_rows).min(grid.shape.total_card_rows);
+        let total = grid.shape.total_card_rows;
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let text = [
             format!(" · rows {first}-{last}/{total}"),
             format!(" · {first}-{last}/{total}"),
         ]
         .into_iter()
-        .find(|text| text.chars().count() <= room);
+        .find(|text| text.chars().count() <= room_for(used));
         if let Some(text) = text {
             spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
         }
@@ -359,65 +615,55 @@ fn render_title(frame: &mut Frame, grid: &Grid) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// The orchestrator strip: the root on the left, Jev on the right, on one row
-/// above the bus. Dropped wholesale when the panel is too short — see [`shape`].
+/// A section heading: `◆ working · 2` above the active cards, `◇ idle · 5` above
+/// the rest. Drawn between the bus and the section's first card row.
+fn render_heading(frame: &mut Frame, section: Section, area: Rect, count: usize) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let accent = match section {
+        Section::Active => Color::Green,
+        Section::Idle => Color::DarkGray,
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", section.glyph()),
+            Style::default().fg(accent),
+        ),
+        Span::styled(
+            section.label().to_string(),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let tail = format!(" · {count} ");
+    if spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>()
+        + tail.chars().count()
+        <= area.width as usize
+    {
+        spans.push(Span::styled(tail, Style::default().fg(Color::DarkGray)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The Jev strip: the shared decision answerer on one row above the bus, saying
+/// whether it is on and which model it asks. Dropped wholesale when the panel is
+/// too short — see [`shape`].
 ///
-/// The two are the same shape of thing — a shared resource above the stages —
-/// which is why they share the row: the root is where work is decomposed and
-/// Jev is where questions are decided, and neither is a pipeline stage.
+/// Jev is not an employee: every employee delegates questions to it, so it is a
+/// shared resource above the cards rather than one of them.
 fn render_strip(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 || area.width == 0 {
         return;
     }
 
-    let root = app.orchestrator_name().unwrap_or("—");
-    let status = app.orchestrator_status();
-    let accent = status.map(status_color).unwrap_or(Color::Cyan);
-
-    let mut spans = vec![
-        Span::styled(
-            " ◆ ",
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{root} "),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(status) = status {
-        spans.push(Span::styled(
-            format!("{} ", status.label()),
-            Style::default().fg(accent),
-        ));
-    }
-    // The root's model is the one thing that can go: the name and state must
-    // survive a narrow panel.
-    if let Some(model) = app.orchestrator_model() {
-        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let remaining = (area.width as usize).saturating_sub(used + 3);
-        if remaining > 4 {
-            spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(
-                truncate(model, remaining),
-                Style::default().fg(Color::Cyan),
-            ));
-        }
-    }
-
-    // Jev sits at the right end of the same row, when there is room for it.
-    let jev = jev_spans(app);
-    let jev_width: usize = jev.iter().map(|s| s.content.chars().count()).sum();
-    let left_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    if left_width + jev_width + 2 <= area.width as usize {
-        let gap = area.width as usize - left_width - jev_width;
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.extend(jev);
-    }
-
+    let spans = jev_spans(app);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// The Jev half of the strip: on/off and, when there is room, its decision model.
+/// The strip's content: on/off and, when there is room, its decision model.
 fn jev_spans(app: &App) -> Vec<Span<'static>> {
     let enabled = app.jev_enabled();
     let accent = if enabled {
@@ -449,8 +695,8 @@ fn jev_spans(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
-/// The bus: one dashed row spanning the panel, the horizontal wire the strip
-/// feeds and every card's riser hangs from.
+/// The bus: one dashed row spanning the panel, the horizontal wire every card's
+/// riser hangs from — the shared road a peer-to-peer hand-off travels.
 ///
 /// Drawn dim when nothing is moving. The packets that travel it are
 /// [`wires`]' business; this is only the track.
@@ -467,11 +713,6 @@ fn render_bus(frame: &mut Frame, grid: &Grid) {
         ))),
         area,
     );
-}
-
-/// The status colour for an employee, from the shared status table.
-fn status_color(status: crate::team::EmployeeStatus) -> Color {
-    status::color(status)
 }
 
 fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, selected: bool) {
@@ -572,13 +813,25 @@ mod tests {
     use crate::team::Team;
     use ratatui::{Terminal, backend::TestBackend};
 
-    /// A panel with room for the title, the header, and several card rows.
+    /// A panel with room for the title, the strip, and several card rows.
     fn area() -> Rect {
         Rect::new(4, 1, 64, 30)
     }
 
-    fn order(count: usize) -> Vec<usize> {
-        (0..count).collect()
+    /// `count` employees, all idle: one section, drawn exactly like a flat grid.
+    fn idle(count: usize) -> Sections {
+        Sections {
+            active: Vec::new(),
+            idle: (0..count).collect(),
+        }
+    }
+
+    /// `active` employees on top, `idle` below, both in order.
+    fn split(active: usize, idle: usize) -> Sections {
+        Sections {
+            active: (0..active).collect(),
+            idle: (active..active + idle).collect(),
+        }
     }
 
     /// Draw one widget on a throwaway terminal and return the buffer's symbols —
@@ -595,11 +848,64 @@ mod tests {
             .collect()
     }
 
-    /// G1: three cards share a row, and the next row starts one `ROW_PITCH`
-    /// below it.
+    /// The grid split into its two sections: the active employees first, in
+    /// workflow order, then the idle ones — so the arrow keys and the drawing
+    /// agree on one order.
+    #[test]
+    fn sections_split_active_from_idle_and_keep_workflow_order() {
+        let sections = Sections::new(&[3, 1, 4, 0, 2], |index| index == 1 || index == 4);
+        assert_eq!(sections.active, vec![1, 4]);
+        assert_eq!(sections.idle, vec![3, 0, 2]);
+        assert_eq!(sections.flat(), vec![1, 4, 3, 0, 2]);
+        assert_eq!(sections.len(), 5);
+
+        // Nobody working: one section, and the flat order is untouched.
+        let all_idle = Sections::new(&[3, 1, 4], |_| false);
+        assert!(all_idle.active.is_empty());
+        assert_eq!(all_idle.flat(), vec![3, 1, 4]);
+
+        // Everybody working: the idle section simply disappears.
+        let all_active = Sections::new(&[3, 1, 4], |_| true);
+        assert!(all_active.idle.is_empty());
+        assert_eq!(all_active.flat(), vec![3, 1, 4]);
+    }
+
+    /// The panel draws two sections: a `working` heading over the active cards,
+    /// then an `idle` heading over the rest — and never an empty section.
+    #[test]
+    fn the_grid_draws_a_heading_per_non_empty_section() {
+        let both = grid(area(), &split(2, 4), 0);
+        let drawn: Vec<Section> = both.headings.iter().map(|(s, _)| *s).collect();
+        assert_eq!(drawn, vec![Section::Active, Section::Idle]);
+
+        // The active heading sits above every active card, the idle heading
+        // between the two groups.
+        let (_, active_heading) = both.headings[0];
+        let (_, idle_heading) = both.headings[1];
+        let active_bottom = both.cells[..2]
+            .iter()
+            .map(|cell| cell.area.bottom())
+            .max()
+            .expect("two active cards");
+        assert!(active_heading.y < both.cells[0].area.y);
+        assert!(idle_heading.y > active_bottom);
+        assert!(idle_heading.y < both.cells[2].area.y);
+
+        // Only the idle section: one heading, no `working` band.
+        let idle_only = grid(area(), &idle(4), 0);
+        assert_eq!(idle_only.headings.len(), 1);
+        assert_eq!(idle_only.headings[0].0, Section::Idle);
+
+        // Only the active section: the idle band is not drawn at all.
+        let active_only = grid(area(), &split(4, 0), 0);
+        assert_eq!(active_only.headings.len(), 1);
+        assert_eq!(active_only.headings[0].0, Section::Active);
+    }
+
+    /// G1: three cards share a row, and the next row starts one pitch below it.
     #[test]
     fn grid_lays_cards_out_three_to_a_row() {
-        let grid = grid(area(), &order(7), 0);
+        let grid = grid(area(), &idle(7), 0);
 
         assert_eq!(grid.shape.cols, 3);
         assert_eq!(grid.cells.len(), 7, "every employee gets a card");
@@ -633,17 +939,43 @@ mod tests {
         assert_eq!(grid.cells[6].area.x, grid.cells[0].area.x);
     }
 
+    /// A section boundary costs one heading row plus the usual gap, and nothing
+    /// else: cards below it are pushed down, not re-laid out.
+    #[test]
+    fn a_section_boundary_costs_one_heading_row() {
+        let flat = grid(area(), &idle(4), 0);
+        let split = grid(area(), &split(2, 2), 0);
+
+        assert_eq!(
+            flat.cells[0].area, split.cells[0].area,
+            "the first card starts at the same place either way"
+        );
+        // Two headings (`working`, `idle`) plus their gaps separate the groups.
+        assert!(
+            split.cells[2].area.y > flat.cells[2].area.y,
+            "the idle cards sit below the working section's heading"
+        );
+        // The heading itself is exactly one row, on the panel's left edge.
+        let (_, heading) = split.headings[1];
+        assert_eq!(heading.height, 1);
+        assert_eq!(heading.x, area().x);
+        assert_eq!(heading.width, area().width);
+    }
+
     /// G2/G8: cards never overlap, never leave the panel, and are never
     /// vertically clipped — in three columns and in the one-column fallback.
     #[test]
     fn grid_cards_are_disjoint_complete_and_inside_the_area() {
         // A wide panel (three columns) and the 24-column team panel of an 80×24
-        // terminal (one column), at every height the roster actually sees.
+        // terminal (one column), at every height the roster actually sees, with
+        // and without a section split.
         for area_width in [64u16, 24] {
-            for count in [1usize, 3, 4, 7, 12, 13] {
+            for (active, idle_count) in [(0usize, 1usize), (0, 3), (2, 2), (0, 7), (3, 9), (12, 1)]
+            {
                 for height in 1..=34u16 {
                     let area = Rect::new(4, 1, area_width, height);
-                    let grid = grid(area, &order(count), 0);
+                    let sections = split(active, idle_count);
+                    let grid = grid(area, &sections, 0);
 
                     for cell in &grid.cells {
                         assert_eq!(cell.area.height, STAGE_HEIGHT, "a card is never cut");
@@ -661,6 +993,16 @@ mod tests {
                             );
                         }
                     }
+                    // A heading never covers a card either.
+                    for (_, heading) in &grid.headings {
+                        for cell in &grid.cells {
+                            assert!(
+                                !heading.intersects(cell.area),
+                                "heading {heading:?} covers card {:?}",
+                                cell.area
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -669,30 +1011,36 @@ mod tests {
     /// G3/G8: a scroll offset shows whole rows only, starting at that row.
     #[test]
     fn grid_clips_whole_rows_at_a_non_zero_offset() {
-        let area = Rect::new(0, 1, 64, 16); // title + header + two card rows
-        let grid = grid(area, &order(12), 1);
+        let area = Rect::new(0, 1, 64, 16); // title + strip + bus + two rows
+        let sections = idle(12);
+        let grid = grid(area, &sections, 1);
 
-        assert_eq!(grid.shape.visible_rows, 2);
         assert_eq!(grid.offset, 1);
-        assert_eq!(grid.cells.len(), 6, "two full rows, nothing partial");
-        assert_eq!(grid.cells[0].employee, 3, "the second row comes first");
+        assert!(!grid.cells.is_empty());
+        assert_eq!(grid.cells.len() % 3, 0, "whole rows only");
         for cell in &grid.cells {
             assert_eq!(cell.area.height, STAGE_HEIGHT);
             assert!(cell.area.bottom() <= area.bottom());
         }
+        // The second row comes first. The section heading is sticky: scrolled
+        // into the middle of a section, it stays pinned above the cards so the
+        // label never leaves them.
+        assert_eq!(grid.cells[0].employee, 3);
+        assert_eq!(grid.headings.len(), 1, "the section stays labelled");
+        assert_eq!(grid.headings[0].0, Section::Idle);
+        assert_eq!(grid.headings[0].1.y, grid.shape.first_row);
+        assert!(grid.cells[0].area.y > grid.headings[0].1.y);
     }
 
-    /// G3: the offset clamps to the last page that still shows whole rows — no
-    /// blank-row overscroll.
+    /// G3: the offset clamps to the last position whose tail still fits — no
+    /// clipped band and no blank-row overscroll.
     #[test]
     fn grid_clamps_the_offset_to_the_last_full_page() {
-        let area = Rect::new(0, 1, 64, 16); // two visible rows
-        let grid = grid(area, &order(12), 99);
+        let area = Rect::new(0, 1, 64, 16);
+        let sections = idle(12);
+        let grid = grid(area, &sections, 99);
 
-        assert_eq!(grid.shape.total_rows, 4);
-        assert_eq!(grid.shape.max_offset, 2);
-        assert_eq!(grid.offset, 2);
-        assert_eq!(grid.cells.first().map(|cell| cell.employee), Some(6));
+        assert_eq!(grid.offset, grid.shape.max_offset);
         assert_eq!(
             grid.cells.last().map(|cell| cell.employee),
             Some(11),
@@ -701,6 +1049,9 @@ mod tests {
         for cell in &grid.cells {
             assert!(cell.area.bottom() <= area.bottom(), "{:?}", cell.area);
         }
+        // Scrolling one further would clip the last card row.
+        let further = super::grid(area, &sections, grid.offset + 1);
+        assert_eq!(further.offset, grid.offset, "the clamp holds");
     }
 
     /// G7: below a 12-cell card the grid degrades to one full-width column
@@ -708,11 +1059,11 @@ mod tests {
     #[test]
     fn grid_falls_back_to_one_column_below_twelve_cell_width() {
         // Three columns need `3 * (12 + riser + gap) - gap` = 41 columns.
-        let wide = grid(Rect::new(0, 1, 41, 30), &order(4), 0);
+        let wide = grid(Rect::new(0, 1, 41, 30), &idle(4), 0);
         assert_eq!(wide.shape.cols, 3);
         assert_eq!(wide.cells[0].area.width, 12);
 
-        let narrow = grid(Rect::new(0, 1, 40, 30), &order(4), 0);
+        let narrow = grid(Rect::new(0, 1, 40, 30), &idle(4), 0);
         assert_eq!(narrow.shape.cols, 1);
         assert_eq!(
             narrow.cells[0].area.width,
@@ -732,7 +1083,7 @@ mod tests {
     /// share one within a row.
     #[test]
     fn every_card_has_its_own_riser() {
-        let grid = grid(area(), &order(7), 0);
+        let grid = grid(area(), &idle(7), 0);
         for cell in &grid.cells {
             assert_eq!(
                 cell.riser_x + RISER_WIDTH,
@@ -745,45 +1096,49 @@ mod tests {
         assert_eq!(unique.len(), 3, "one riser per column");
     }
 
-    /// G9: the strip and bus are drawn while a card row still fits beneath them,
-    /// and dropped — bus first, then strip — before that row.
+    /// G9: the Jev strip and bus are drawn while a band still fits beneath them,
+    /// and dropped — bus first, then strip — before that band.
     #[test]
     fn the_pipeline_bands_yield_before_a_card_row() {
-        // 9 rows = title + strip + bus + one card row.
-        let full = shape(Rect::new(0, 1, 64, 9), 4);
-        assert_eq!(full.strip.height, 1);
-        assert_eq!(full.bus.height, 1);
-        assert_eq!(full.visible_rows, 1);
+        let sections = idle(4);
+        // The first row carries the `idle` heading, so it needs
+        // `1 + STAGE_HEIGHT` = 7 rows below the title. With the strip and bus
+        // that is 10 panel rows.
+        let with_both = shape(Rect::new(0, 1, 64, 10), &sections);
+        assert_eq!(with_both.strip.height, 1);
+        assert_eq!(with_both.bus.height, 1);
+        assert_eq!(with_both.visible_rows, 1);
 
-        // 8 rows: the bus would cost the only card row, so it goes; the strip
+        // One row shorter: the bus would cost the card row, so it goes; the strip
         // stays.
-        let busless = shape(Rect::new(0, 1, 64, 8), 4);
+        let busless = shape(Rect::new(0, 1, 64, 9), &sections);
         assert_eq!(busless.strip.height, 1);
         assert_eq!(busless.bus.height, 0);
         assert_eq!(busless.visible_rows, 1);
 
-        // 7 rows: the strip would cost the row too, so it goes as well.
-        let bare = shape(Rect::new(0, 1, 64, 7), 4);
+        // One shorter again: the strip would cost the row too, so it goes.
+        let bare = shape(Rect::new(0, 1, 64, 8), &sections);
         assert_eq!(bare.strip.height, 0);
         assert_eq!(bare.bus.height, 0);
         assert_eq!(bare.visible_rows, 1);
 
-        // 6 rows: not even one complete card fits.
-        let empty = shape(Rect::new(0, 1, 64, 6), 4);
+        // Seven rows: not even one complete card (with its heading) fits.
+        let empty = shape(Rect::new(0, 1, 64, 7), &sections);
         assert_eq!(empty.visible_rows, 0);
         assert_eq!(
             empty.max_offset, 0,
             "nothing on screen means nowhere to scroll to"
         );
-        assert!(grid(Rect::new(0, 1, 64, 6), &order(4), 0).cells.is_empty());
+        assert!(grid(Rect::new(0, 1, 64, 7), &sections, 0).cells.is_empty());
     }
 
-    /// The bus is never drawn without the strip above it: it is the wire *from*
-    /// the root, so it has nothing to carry if the root's row is gone.
+    /// The bus is never drawn without the strip above it: it is the wire every
+    /// riser hangs from, and a bare bus under the title reads as a stray line.
     #[test]
     fn the_bus_never_outlives_the_strip() {
+        let sections = idle(4);
         for height in 1..30u16 {
-            let shape = shape(Rect::new(0, 1, 64, height), 4);
+            let shape = shape(Rect::new(0, 1, 64, height), &sections);
             if shape.bus.height > 0 {
                 assert_eq!(
                     shape.strip.height, 1,
@@ -803,12 +1158,12 @@ mod tests {
     /// rows of scroll over an empty viewport.
     #[test]
     fn a_zero_width_panel_has_no_rows_and_no_scroll() {
-        let empty = shape(Rect::new(0, 1, 0, 23), 12);
+        let empty = shape(Rect::new(0, 1, 0, 23), &idle(12));
         assert_eq!(empty.cell_width, 0);
         assert_eq!(empty.visible_rows, 0, "nothing is drawn, so nothing fits");
         assert_eq!(empty.max_offset, 0, "an empty viewport cannot scroll");
 
-        let grid = grid(Rect::new(0, 1, 0, 23), &order(12), 5);
+        let grid = grid(Rect::new(0, 1, 0, 23), &idle(12), 5);
         assert!(grid.cells.is_empty());
         assert_eq!(grid.offset, 0, "the offset clamps back to the top");
     }
@@ -817,23 +1172,22 @@ mod tests {
     /// nothing at all.
     #[test]
     fn grid_degrades_to_nothing_without_height() {
-        let title_only = grid(Rect::new(0, 1, 64, 1), &order(4), 0);
+        let title_only = grid(Rect::new(0, 1, 64, 1), &idle(4), 0);
         assert_eq!(title_only.title().height, 1);
         assert_eq!(title_only.strip().height, 0);
         assert_eq!(title_only.bus().height, 0);
         assert!(title_only.cells.is_empty());
 
-        let nothing = grid(Rect::new(0, 1, 64, 0), &order(4), 0);
+        let nothing = grid(Rect::new(0, 1, 64, 0), &idle(4), 0);
         assert_eq!(nothing.title().height, 0);
         assert!(nothing.cells.is_empty());
     }
 
-    /// An empty roster has no rows to scroll and no cards to draw.
+    /// An empty roster has no bands to scroll and no cards to draw.
     #[test]
     fn grid_of_an_empty_roster_is_empty() {
-        let grid = grid(area(), &[], 3);
+        let grid = grid(area(), &Sections::default(), 3);
         assert!(grid.cells.is_empty());
-        assert_eq!(grid.shape.total_rows, 0);
         assert_eq!(grid.shape.max_offset, 0);
         assert_eq!(grid.offset, 0);
     }
@@ -844,25 +1198,72 @@ mod tests {
     fn stage_boxes_fit_their_content_rows() {
         assert_eq!(STAGE_HEIGHT, CONTENT_LINES + 2);
 
-        let grid = grid(area(), &order(7), 0);
+        let grid = grid(area(), &split(2, 5), 0);
         for cell in &grid.cells {
             assert_eq!(cell.area.height, STAGE_HEIGHT, "{:?}", cell.area);
         }
     }
 
-    /// The reveal rule scrolls by the minimum: an already-visible selection does
-    /// not move the viewport, one past the bottom scrolls by a row.
+    /// The reveal rule scrolls by the minimum: an already-visible card does not
+    /// move the viewport, one past the bottom scrolls just far enough.
     #[test]
     fn reveal_scrolls_the_minimum_distance() {
-        let area = Rect::new(0, 1, 64, 16); // two visible rows of three columns
+        let area = Rect::new(0, 1, 64, 16);
+        let sections = idle(12);
+        let max = shape(area, &sections).max_offset;
 
-        assert_eq!(reveal(area, 12, 0, 0), 0, "already visible");
-        assert_eq!(reveal(area, 12, 2, 0), 0, "last cell of the first row");
-        assert_eq!(reveal(area, 12, 3, 0), 0, "the second row is visible too");
-        assert_eq!(reveal(area, 12, 6, 0), 1, "the third row scrolls by one");
-        assert_eq!(reveal(area, 12, 9, 0), 2, "clamped to the last page");
-        assert_eq!(reveal(area, 12, 6, 2), 2, "already visible near the end");
-        assert_eq!(reveal(area, 12, 3, 2), 1, "above the viewport scrolls up");
+        assert_eq!(reveal(area, &sections, 0, 0), 0, "already visible");
+        assert_eq!(
+            reveal(area, &sections, 2, 0),
+            0,
+            "last cell of the first row"
+        );
+        assert_eq!(
+            reveal(area, &sections, 3, 0),
+            0,
+            "the second row is visible too"
+        );
+        assert_eq!(
+            reveal(area, &sections, 9, 0),
+            max,
+            "clamped to the last page"
+        );
+        assert_eq!(
+            reveal(area, &sections, 9, max),
+            max,
+            "already visible near the end"
+        );
+
+        // A card above the window scrolls the window up to its band.
+        let down = reveal(area, &sections, 9, 0);
+        assert_eq!(reveal(area, &sections, 0, down), 0, "back to the top");
+    }
+
+    /// The reveal rule counts the section headings: a card in the idle section
+    /// scrolls to the band it is actually drawn in, not to its flat row index.
+    #[test]
+    fn reveal_accounts_for_the_section_headings() {
+        let area = Rect::new(0, 1, 64, 24);
+        // One active card, then five idle ones: bands are `working`, card,
+        // `idle`, cards…, so the idle cards sit one band lower than a flat grid
+        // would put them.
+        let sections = split(1, 5);
+        let shape = shape(area, &sections);
+        assert_eq!(shape.total_card_rows, 3, "one active row + two idle rows");
+
+        // The first idle employee (flat position 1) is in the band *after* the
+        // `working` card and the `idle` heading, so it is not visible in a
+        // one-band window that starts at the top.
+        let tall = Rect::new(0, 1, 64, 9); // title + one band
+        assert_eq!(
+            reveal(tall, &sections, 0, 0),
+            0,
+            "the active card is on top"
+        );
+        assert!(
+            reveal(tall, &sections, 1, 0) > 0,
+            "the idle card scrolls past the headings"
+        );
     }
 
     /// The model row carries the assigned id — truncated to the box's inner
@@ -897,10 +1298,9 @@ mod tests {
         assert!(text.contains("kenari/jev-1-13-free"), "{text}");
     }
 
-    /// The strip carries the root on the left and Jev on the right — the two
-    /// shared resources above the stages, neither of which is a card.
+    /// The strip carries Jev — the shared answerer, which is not a card.
     #[test]
-    fn the_strip_shows_the_root_and_jev() {
+    fn the_strip_shows_jev() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
         let mut app = App::new(Config::default(), tx);
 
@@ -908,9 +1308,7 @@ mod tests {
             let area = frame.area();
             render_strip(frame, &app, area);
         });
-        assert!(off.contains("Otto"), "the root's name: {off}");
-        assert!(off.contains("idle"), "its state: {off}");
-        assert!(off.contains("jev"), "Jev shares the row: {off}");
+        assert!(off.contains("jev"), "Jev's row: {off}");
         assert!(off.contains("off"), "{off}");
         assert!(!off.contains("@jev"), "no delegation target while off");
 
@@ -925,43 +1323,55 @@ mod tests {
         assert!(on.contains("jev-1-13-free"), "{on}");
     }
 
-    /// The root's model is the strip's most expendable part: a narrow panel keeps
-    /// the name and drops it rather than truncating the name away.
+    /// A heading names its section and its count, and degrades to just the name
+    /// on a narrow panel.
     #[test]
-    fn a_narrow_strip_keeps_the_root_name() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
-        let mut team = Team::starter();
-        team.employee_mut(crate::team::ORCHESTRATOR_ID)
-            .expect("root")
-            .model = Some("deepseek-v4-pro".to_string());
-        let app = App::with_team(Config::default(), tx, team);
+    fn a_heading_names_its_section_and_count() {
+        let wide = node_text(|frame| {
+            let area = frame.area();
+            render_heading(frame, Section::Active, area, 3);
+        });
+        assert!(wide.contains("working"), "{wide}");
+        assert!(wide.contains("3"), "{wide}");
+        assert!(wide.contains('◆'), "{wide}");
 
-        let mut terminal = Terminal::new(TestBackend::new(14, 1)).unwrap();
+        let idle = node_text(|frame| {
+            let area = frame.area();
+            render_heading(frame, Section::Idle, area, 5);
+        });
+        assert!(idle.contains("idle"), "{idle}");
+        assert!(idle.contains('◇'), "{idle}");
+
+        // A narrow panel cannot fit `◇ idle · 5`, so the count is what goes.
+        let mut terminal = Terminal::new(TestBackend::new(8, 1)).unwrap();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_strip(frame, &app, area);
+                render_heading(frame, Section::Idle, area, 5);
             })
             .unwrap();
-        let text: String = terminal
+        let narrow: String = terminal
             .backend()
             .buffer()
             .content
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Otto"), "{text}");
+        assert!(narrow.contains("idle"), "{narrow}");
     }
 
     /// The bus is a row of dashes, one per column of the panel.
     #[test]
     fn the_bus_spans_the_panel_in_dashes() {
-        let laid_out = grid(Rect::new(0, 1, 40, 24), &order(4), 0);
+        // A panel tall enough to keep the bus alongside the section heading.
+        let panel = Rect::new(0, 1, 40, 40);
+        let laid_out = grid(panel, &idle(4), 0);
+        assert!(laid_out.bus().height > 0, "the fixture draws the bus");
 
-        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 40)).unwrap();
         terminal
             .draw(|frame| {
-                let g = grid(Rect::new(0, 1, 40, 24), &order(4), 0);
+                let g = grid(panel, &idle(4), 0);
                 render_bus(frame, &g);
             })
             .unwrap();

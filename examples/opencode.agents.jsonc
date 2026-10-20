@@ -14,11 +14,6 @@
   // the code and prose.
   "$schema": "https://opencode.ai/config.json",
   "agents": {
-    "orchestrator": {
-      "description": "Roots the team: decomposes a goal, delegates it, and synthesizes the result.",
-      "mode": "all",
-      "system": "You are the orchestrator, the root of the team. Break the goal into parts and hand each to the teammate whose role covers it with @<id> lines, then synthesize their reports into one answer. @user is yours alone."
-    },
     "planner": {
       "description": "Breaks a goal into a plan, roadmap, or task breakdown.",
       "mode": "all",

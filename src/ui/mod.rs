@@ -7,7 +7,7 @@ pub(crate) mod input;
 pub(crate) mod layout;
 mod modal;
 mod models;
-mod pipeline;
+pub(crate) mod pipeline;
 mod projects;
 mod prompt;
 mod robot;
@@ -51,7 +51,7 @@ pub(crate) fn truncate(text: &str, width: usize) -> String {
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
-    let regions = layout::Regions::of(frame.area(), app.mode(), app.orchestrator_is_thinking());
+    let regions = layout::Regions::of(frame.area(), app.mode(), app.prompt_employee_is_thinking());
 
     render_title(frame, app, regions.title);
     render_main(frame, app, regions.main);
@@ -83,8 +83,8 @@ pub fn render(frame: &mut Frame, app: &App) {
 /// split by hand — which is what `docs/acceptance-sidebar.md` §3 requires.
 ///
 /// The band heights here are the *resting* ones (no thinking indicator): the
-/// panels are the same height whether or not the root is mid-turn, which is the
-/// invariant the acceptance matrix pins.
+/// panels are the same height whether or not an employee is mid-turn, which is
+/// the invariant the acceptance matrix pins.
 pub fn sidebar_area(size: (u16, u16)) -> Rect {
     let main = layout::Regions::of(Rect::new(0, 0, size.0, size.1), Mode::Roster, false).main;
     layout::roster_areas(main)[0]
@@ -111,13 +111,12 @@ pub fn prompt_area(size: (u16, u16)) -> Rect {
 ///
 /// This reads the same `pipeline::grid` geometry the renderer draws from, with
 /// the app's current scroll offset, so an acceptance test can click the middle of
-/// a card and know which employee it should select. The order is
-/// [`App::card_order`] — the roster minus the orchestrator — because the root is
-/// the strip above the grid, not one of its cards. The Jev header is not a card
-/// and never appears here either.
+/// a card and know which employee it should select. The order is the app's two
+/// sections — the active employees first, then the idle ones. Jev is not an
+/// employee and never appears here.
 pub fn grid_cells(app: &App, size: (u16, u16)) -> Vec<(usize, Rect)> {
-    let order = app.card_order();
-    pipeline::grid(team_area(size), &order, app.roster_scroll())
+    let sections = app.card_sections();
+    pipeline::grid(team_area(size), &sections, app.roster_scroll())
         .cells
         .into_iter()
         .map(|cell| (cell.employee, cell.area))
@@ -131,34 +130,34 @@ pub fn hit_target_at(app: &App, size: (u16, u16), x: u16, y: u16) -> Option<Targ
 }
 
 /// The largest scroll offset the roster grid accepts for a terminal of `size`
-/// cells and a roster of `count` employees.
+/// cells and a given roster split.
 ///
 /// Crate-internal: [`App::roster_max_scroll`] is the seam the tests use, and it
 /// exists so the clamp and the drawing share one number.
-pub(crate) fn roster_max_scroll(size: (u16, u16), count: usize) -> usize {
-    pipeline::shape(team_area(size), count).max_offset
+pub(crate) fn roster_max_scroll(size: (u16, u16), sections: &pipeline::Sections) -> usize {
+    pipeline::shape(team_area(size), sections).max_offset
 }
 
-/// How many whole card rows fit on screen — the `PgUp`/`PgDn` step.
-pub(crate) fn roster_page(size: (u16, u16), count: usize) -> usize {
-    pipeline::shape(team_area(size), count).visible_rows
+/// How many whole bands fit on screen — the `PgUp`/`PgDn` step.
+pub(crate) fn roster_page(size: (u16, u16), sections: &pipeline::Sections) -> usize {
+    pipeline::shape(team_area(size), sections).visible_rows
 }
 
 /// Columns in the roster grid at this terminal size: three normally, one when
 /// the panel is too narrow for readable cards.
 pub(crate) fn roster_cols(size: (u16, u16)) -> usize {
-    pipeline::shape(team_area(size), 0).cols
+    pipeline::shape(team_area(size), &pipeline::Sections::default()).cols
 }
 
-/// The offset that reveals the card at workflow `position`, scrolling no further
-/// than necessary.
+/// The offset that reveals the card at `position` (in section order), scrolling
+/// no further than necessary.
 pub(crate) fn reveal_roster(
     size: (u16, u16),
-    count: usize,
+    sections: &pipeline::Sections,
     position: usize,
     offset: usize,
 ) -> usize {
-    pipeline::reveal(team_area(size), count, position, offset)
+    pipeline::reveal(team_area(size), sections, position, offset)
 }
 
 fn render_title(frame: &mut Frame, app: &App, area: Rect) {
@@ -442,7 +441,7 @@ fn help_lines() -> Vec<Line<'static>> {
         key("↑↓←→ h/j/k/l", "move around the employee grid"),
         key("PgUp/PgDn", "move a page of cards"),
         key("wheel", "scroll the grid (the selection stays put)"),
-        key("i · Tab", "type a goal for the orchestrator"),
+        key("i · Tab", "type a goal for the selected employee"),
         key("Enter", "chat with the selected employee"),
         key("m", "pick a model"),
         key("p", "choose the working project"),

@@ -18,8 +18,8 @@ Turn OpenCode from a developer tool into a *team of on-screen employees*:
   thinking (shimmer), working, done, or erroring.
 - **Autonomous** — besides manual chat, an employee can start on a **schedule**
   (cron) or a **watch hook**.
-- **A team, not one chat box** — an orchestrator fans one goal out across multiple
-  employees (parallel OpenCode sessions) and aggregates the result.
+- **A team, not one chat box** — employees delegate to each other directly (peer to
+  peer, or a parallel fan-out), and the roster shows the hand-offs as animated wires.
 
 ## 2. Tech Stack
 
@@ -104,7 +104,17 @@ TEA (The Elm Architecture): `Model → Message → Update → View`, the standar
 
 ---
 
-## 8. Orchestrator-rooted team + main-screen prompt + animated delegation (planned)
+## 8. Orchestrator-rooted team + main-screen prompt + animated delegation (**superseded**)
+
+> **Retired.** The orchestrator employee was removed after it shipped. It was
+> meant to fan a goal out across the roster, but in practice it only delegated to
+> its own OpenCode sub-agents: the roster's cards never lit up, so the live
+> delegation diagram showed nothing while work was happening. The team is flat
+> again — every employee is a card, any employee may delegate to any other, and
+> the roster's goal bar addresses the selected card. What survives from this
+> section: the main-screen prompt (`i` / `Tab`), the animated delegation wires
+> (now peer-to-peer between cards), and the Jev strip above the grid. The notes
+> below are kept as the record of what was built and why it did not work.
 
 Turn the *team* into an explicit tree with one **orchestrator** at the root, give the
 main (roster) screen a prompt input that routes to it, and draw delegation as

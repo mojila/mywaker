@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Result, WrapErr};
 
 use crate::role::Role;
-use crate::team::{Employee, ORCHESTRATOR_AGENT_ID};
+use crate::team::Employee;
 
 /// OpenCode's global agents directory. Honors `XDG_CONFIG_HOME` when it is set
 /// to an absolute path, else falls back to `~/.config` — the same resolution
@@ -45,9 +45,9 @@ pub fn path_for(employee: &Employee) -> Option<PathBuf> {
 /// The markdown definition for `employee`: YAML frontmatter plus a role prompt.
 ///
 /// Canonical workflow roles reuse the role prompts documented under
-/// `examples/agents/` (orchestrator, planner, researcher, writer, reviewer — the
-/// engineer prompt has no checked-in file), so a hired teammate starts from the
-/// same prompt the examples show. The asset-creator id (`modeler`) has a mandate
+/// `examples/agents/` (planner, researcher, writer, reviewer — the engineer
+/// prompt has no checked-in file), so a hired teammate starts from the same
+/// prompt the examples show. The asset-creator id (`modeler`) has a mandate
 /// of its own but no [`Role`]; its checked-in `examples/agents/modeler.md` mirrors
 /// the `MODELER` text exactly, and a test keeps the two in step. Any other role
 /// gets a generic identity prompt built from the employee's name and human role.
@@ -72,13 +72,6 @@ pub fn definition(employee: &Employee) -> String {
 /// finally the id (for an employee whose role was left blank).
 fn description(employee: &Employee) -> String {
     let agent_id = employee.agent_id();
-
-    // The orchestrator's agent id is namespaced (`team-orchestrator`) to avoid
-    // colliding with another system's `orchestrator` agent; it still describes
-    // itself as the orchestrator.
-    if agent_id == ORCHESTRATOR_AGENT_ID {
-        return capitalize(Role::Orchestrator.label());
-    }
 
     let role = Role::from_label(agent_id);
     if role != Role::General {
@@ -186,11 +179,7 @@ fn prompt(employee: &Employee) -> String {
 /// `GENERAL` pipeline stage. That is intended — the pipeline orders the team, the
 /// prompt tells the agent how to behave.
 fn role_prompt(employee: &Employee) -> String {
-    if employee.agent_id() == ORCHESTRATOR_AGENT_ID {
-        return ORCHESTRATOR.into();
-    }
     match Role::from_label(employee.agent_id()) {
-        Role::Orchestrator => ORCHESTRATOR.into(),
         Role::Planner => PLANNER.into(),
         Role::Researcher => RESEARCHER.into(),
         Role::Engineer => ENGINEER.into(),
@@ -213,32 +202,10 @@ fn generic_prompt(employee: &Employee) -> String {
         "You are **{}** (`{}`), the team's {}.\n\n\
          Work within your own role and leave work that belongs to a teammate to them: \
          hand it off with a line-leading `@<id> <instruction>` directive. When your part \
-         is finished, report it upward with `@orchestrator <result>` — the orchestrator \
-         synthesizes and `@user` is its alone.",
+         is finished, deliver it with `@user <result>`.",
         employee.name, employee.id, role
     )
 }
-
-const ORCHESTRATOR: &str =
-    "You are the **orchestrator**, the root of the team. A goal reaches the team through
-you, and the finished answer leaves through you.
-
-Break the goal into the parts that need doing, hand each part to the teammate whose role
-covers it, then synthesize what comes back into one answer. Every teammate reports to you;
-`@user` is yours alone.
-
-- Delegate with a line-leading `@<id> <instruction>` directive — one per part, each saying
-  what to produce and what it is for. Do the work yourself only when no teammate's role
-  covers it.
-- Wait for the reports. When a teammate answers you, that is a report, not a deliverable:
-  decide whether it is complete, ask for the missing piece with another directive, or fold
-  it into the synthesis.
-- Synthesize. Resolve overlaps, fill the gaps, and keep the result in one voice. Then
-  deliver it to the user with a single line: `@user <final deliverable>`.
-- For work that genuinely splits across the whole team, use `@parallel <goal>`; you still
-  own the synthesis that follows.
-
-Never hand the user a partial result, and never leave a goal with no owner.";
 
 const PLANNER: &str =
     "You are the **planner**. Produce clear plans, roadmaps, and task breakdowns ONLY.
@@ -246,18 +213,16 @@ const PLANNER: &str =
 Never write implementation, code, or final prose yourself — delegate those to the
 teammate whose role covers them (the software engineer / writer) using line-leading
 `@<id> <instruction>` directives. When the plan is complete, hand off with `@writer`
-(or the relevant teammate) instructions, and report the plan upward to the orchestrator
-with `@orchestrator <summary>`. The orchestrator synthesizes and delivers; `@user` is not
-yours to use.";
+(or the relevant teammate) instructions, and deliver the result with
+`@user <summary>`.";
 
 const RESEARCHER: &str =
     "You are the **researcher**. Investigate, gather, and summarize facts, data, and
 references.
 
 Drafting and implementation belong to the other teammates — hand those off with
-line-leading `@<id> <instruction>` directives. Return your findings upward to the
-orchestrator with `@orchestrator <summary>`; it owns the synthesis and `@user` is its
-alone.";
+line-leading `@<id> <instruction>` directives. Deliver your findings with
+`@user <summary>`.";
 
 const ENGINEER: &str =
     "You are the **engineer**. Implement the requested change in code, tests, and
@@ -265,8 +230,7 @@ configuration, and explain what you changed.
 
 Research and planning belong to the other teammates — hand those off with
 line-leading `@<id> <instruction>` directives. When the change is done and verified,
-report it upward to the orchestrator with `@orchestrator <summary>`. The orchestrator
-synthesizes and delivers; `@user` is not yours to use.";
+deliver it with `@user <summary>`.";
 
 const WRITER: &str =
     "You are the **writer**. Produce clear, accurate prose, documentation, and copy from
@@ -274,17 +238,15 @@ the source material and direction you are given.
 
 Defer to teammates for research (`@researcher`) and planning (`@planner`) when you
 lack the material you need, using line-leading `@<id> <instruction>` directives.
-Report the finished piece upward to the orchestrator with `@orchestrator <text>`. The
-orchestrator synthesizes and delivers; `@user` is not yours to use.";
+Deliver the finished piece with `@user <text>`.";
 
 const REVIEWER: &str =
     "You are the **reviewer**. Inspect deliverables for correctness, quality, and
 consistency, and report problems precisely.
 
 When something is wrong, hand it back with line-leading `@<id> <instruction>`
-directives rather than silently rewriting it. When it passes, approve and report that
-upward to the orchestrator with `@orchestrator <note>`. The orchestrator synthesizes and
-delivers; `@user` is not yours to use.";
+directives rather than silently rewriting it. When it passes, approve and deliver
+that with `@user <note>`.";
 
 /// The canonical id of the asset-creator mandate — the one string both [`prompt`]
 /// and [`description`] key on.
@@ -370,7 +332,6 @@ mod tests {
     #[test]
     fn canonical_ids_reuse_the_documented_role_prompts() {
         for (id, needle) in [
-            ("orchestrator", "You are the **orchestrator**"),
             ("researcher", "You are the **researcher**"),
             ("planner", "You are the **planner**"),
             ("writer", "You are the **writer**"),
@@ -389,15 +350,11 @@ mod tests {
     /// Every checked-in example matches the const it documents: a generated
     /// definition is byte-identical to its file under `examples/agents/`.
     ///
-    /// This is what keeps the examples from drifting. The orchestrator is the one
-    /// employee every roster has, and the workers' prompts are the ones a role
-    /// change is most likely to leave behind — the reporting rule in particular, so
-    /// a stale example would tell a worker to `@user` when the code no longer
-    /// relays it that way.
+    /// This is what keeps the examples from drifting — a stale example would
+    /// tell a worker to hand off in a way the code no longer understands.
     #[test]
     fn every_definition_matches_its_checked_in_example() {
         for (id, name, role, example) in [
-            ("orchestrator", "Otto", "Orchestrator", ORCHESTRATOR_EXAMPLE),
             ("planner", "Dex", "Planner", PLANNER_EXAMPLE),
             ("researcher", "Aria", "Research lead", RESEARCHER_EXAMPLE),
             ("writer", "Bruno", "Writer", WRITER_EXAMPLE),
@@ -412,56 +369,37 @@ mod tests {
     }
 
     /// The checked-in example bodies, one per canonical role.
-    const ORCHESTRATOR_EXAMPLE: &str = include_str!("../examples/agents/orchestrator.md");
     const PLANNER_EXAMPLE: &str = include_str!("../examples/agents/planner.md");
     const RESEARCHER_EXAMPLE: &str = include_str!("../examples/agents/researcher.md");
     const WRITER_EXAMPLE: &str = include_str!("../examples/agents/writer.md");
     const REVIEWER_EXAMPLE: &str = include_str!("../examples/agents/reviewer.md");
 
-    /// No worker prompt tells the employee to deliver to the user: that is the
-    /// orchestrator's alone, and a worker that thinks otherwise answers `@user`
-    /// into a relay it did not expect.
+    /// Every role prompt lets the employee finish its own work: there is no root
+    /// above it to report to any more, so each one delivers with `@user` and
+    /// knows how to hand a sub-task sideways.
     #[test]
-    fn no_worker_prompt_claims_the_user() {
-        for id in ["planner", "researcher", "writer", "reviewer"] {
+    fn every_role_prompt_delivers_and_delegates() {
+        for id in ["planner", "researcher", "writer", "reviewer", "engineer"] {
             let text = definition(&Employee::new(id, "N", "Role"));
             assert!(
-                !text.contains("@user <"),
-                "{id} still delivers to the user: {text}"
+                text.contains("@user <"),
+                "{id} cannot deliver its work: {text}"
             );
             assert!(
-                text.contains("@orchestrator"),
-                "{id} does not know where to report: {text}"
+                !text.contains("@orchestrator"),
+                "{id} still reports to a root that no longer exists: {text}"
             );
         }
     }
 
-    /// The root's contract, stated where the model reads it: it delegates, it
-    /// synthesizes, and it is the only one that delivers.
+    /// A generic employee (an id with no canonical role) gets the same
+    /// protocol: hand off sideways, deliver with `@user`.
     #[test]
-    fn orchestrator_prompt_owns_delegation_synthesis_and_delivery() {
-        let text = definition(&Employee::new("orchestrator", "Otto", "Orchestrator"));
-        assert!(text.contains("@<id> <instruction>"), "must delegate");
-        assert!(text.contains("Synthesize"), "must synthesize");
-        assert!(text.contains("@user"), "must deliver");
-        assert!(
-            text.contains("`@user` is yours alone"),
-            "must state that delivery is the orchestrator's"
-        );
-    }
-
-    /// The namespaced agent id the starter binds the orchestrator to (`agent =
-    /// "team-orchestrator"`) still selects the root prompt — the namespace exists
-    /// only so a foreign `orchestrator` agent can't shadow it, not to change what
-    /// the prompt says.
-    #[test]
-    fn the_namespaced_orchestrator_agent_gets_the_root_prompt() {
-        let mut employee = Employee::new("orchestrator", "Otto", "Orchestrator");
-        employee.agent = Some(ORCHESTRATOR_AGENT_ID.into());
-        let text = definition(&employee);
-        assert!(text.contains("description: \"Orchestrator\""));
-        assert!(text.contains("You are the **orchestrator**"));
-        assert!(text.contains("`@user` is yours alone"));
+    fn the_generic_prompt_has_no_root_to_report_to() {
+        let text = definition(&Employee::new("qa", "Quinn", "QA lead"));
+        assert!(text.contains("`@<id> <instruction>`"), "{text}");
+        assert!(text.contains("`@user <result>`"), "{text}");
+        assert!(!text.contains("@orchestrator"), "{text}");
     }
 
     /// The mandate text the UI and the docs both point at: every skill it names must

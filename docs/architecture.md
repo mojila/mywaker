@@ -99,7 +99,7 @@ enum EmployeeStatus { Idle, Thinking, Working, Done, Error(String) }
 struct Task {
     id: TaskId,                 // newtype(uuid)
     goal: String,               // natural-language goal
-    assigned_to: Option<String>,// employee id (None = orchestrator)
+    assigned_to: Option<String>,// employee id (None = unassigned)
     status: TaskStatus,
     attempts: u8,
     session_id: Option<String>, // OpenCode session id
@@ -257,13 +257,21 @@ consts; no per-frame allocation.
   it (`pipeline::reveal`), and both the offset and the card rects are clamped so
   only whole rows are ever drawn. The selection is the *team index*, not a grid
   position, so the order still comes from `App::workflow_order()`.
+- The grid is split into **two sections** (`pipeline::Sections`, built by
+  `App::card_sections`): employees that are mid-turn (`Thinking` / `Working`) are
+  drawn on top under a `◆ working · N` heading, and everyone else below under
+  `◇ idle · N`. Both lists keep workflow order, so a card only moves when its
+  status changes. A section heading is *sticky*: scrolled into the middle of a
+  section, it stays pinned above the cards so the label never leaves the group it
+  names. The title carries the active count (`team · N · M working`) because that
+  is the number the split exists to surface.
 - The employee grid degrades in a fixed order: the Jev header strip is dropped
   first (it is a status line, not work), then whole card rows. A card row is only
-  counted when its full height fits, so a short main area can never produce a box
-  with a top border and no body, and a partial row is never drawn at the bottom
-  of the viewport either. The same rule covers the horizontal axis: below a
-  12-column card the grid falls back to one full-width column instead of
-  squeezing three unreadable ones.
+  counted when its full height (plus its section heading, on a section's first
+  row) fits, so a short main area can never produce a box with a top border and
+  no body, and a partial row is never drawn at the bottom of the viewport either.
+  The same rule covers the horizontal axis: below a 12-column card the grid falls
+  back to one full-width column instead of squeezing three unreadable ones.
 
 ---
 
@@ -383,9 +391,9 @@ unrelated to model selection.
 
 ## 10. Delegation (employee ↔ employee hand-off)
 
-Employees collaborate by **delegating**, not by a single orchestrator scheduling a
-fixed role chain. Any employee can hand a sub-task to any other, and any employee
-can hand the final result back to the user.
+Employees collaborate by **delegating**, as peers — there is no orchestrator
+scheduling a fixed role chain. Any employee can hand a sub-task to any other, and
+any employee can hand its finished result to the user.
 
 1. **Protocol** (`src/workflow.rs`) — an assistant reply ends with one or more
    line-leading directives of the form `@<id> <instruction>` (`@writer draft the
@@ -403,10 +411,11 @@ can hand the final result back to the user.
    scans the finished assistant reply for directives (idempotent per message id via
    `Chat::handled_message_ids`). Teammate targets are relayed via
    `send_to_employee` → `flush_outbox` (creating the target's session on demand and
-   queueing instructions until it is ready); final targets reroute the answer back to
+   queueing instructions until it is ready); final targets deliver the answer to
    the origin chat (`App::origin_of`, a per-chain map larger than the old single
-   `delegation_origin` global). Two caps stop `A → B → A` cycles: a per-chain
-   `depth_of` bound (`MAX_CHAIN_DEPTH`) and a run-wide `DELEGATION_TOTAL_LIMIT`.
+   `delegation_origin` global), so a hand-off chain still ends with one answer in
+   one place. Two caps stop `A → B → A` cycles: a per-chain `depth_of` bound
+   (`MAX_CHAIN_DEPTH`) and a run-wide `DELEGATION_TOTAL_LIMIT`.
 
 4. **Form auto-answer** — `form.created` events, which pause a session until the
    user supplies typed input for one or more fields, are resolved out-of-band in
@@ -430,7 +439,9 @@ can hand the final result back to the user.
    cards — `jev ◆ on — @jev` with the decision model — so the "every employee
    delegates questions to Jev" relationship is still legible without spending a
    card on a non-employee. The header is the first band dropped when the panel is
-   short, and it is never a hit target.
+   short, and it is never a hit target. The dashed **bus** under it is the shared
+   wire every card column hangs off, so a peer-to-peer hand-off reads as a packet
+   travelling from one card's riser to another's (`ui::wires`).
 
 6. **Parallel fan-out + aggregation** — `@parallel <goal>` (aliases `@all` /
    `@fanout` / `@team`) broadcasts one goal to every teammate except the source
