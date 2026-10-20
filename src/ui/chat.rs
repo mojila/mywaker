@@ -1098,7 +1098,6 @@ mod tests {
         assert!(list_item("1.").is_none());
     }
 
-    #[test]
     /// Code blocks render inside a drawn box: an opening rule (with the
     /// language tag when the fence names one), `│ `-prefixed content lines, and
     /// a closing rule. The raw fence lines never reach the transcript.

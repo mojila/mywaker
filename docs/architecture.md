@@ -312,25 +312,18 @@ consts; no per-frame allocation.
 
 ## 6. Config
 
-`~/.config/mywaker/config.toml` (via `dirs`):
+Two files, both under the config dir (`dirs::config_dir()`), split by what they
+own: app behaviour in `config.toml`, the team in `team.toml`.
+
+`~/.config/mywaker/config.toml` — app behaviour:
 
 ```toml
-[opencode]
-endpoint = "http://localhost:4096"
-workdir  = "~"                 # default location.directory for sessions
+tick_rate = "100ms"            # event-loop tick (default 100ms)
+workdir   = "/Users/me"        # default location.directory for sessions (absolute;
+                               # `~` is not expanded here — only watch paths are)
 
-[[employees]]
-id = "researcher"
-name = "Rex"
-role = "Research lead"
-agent_id = "researcher"
-model = "anthropic/claude-sonnet-4-5"
-
-[[employees]]
-id = "designer"
-name = "Juno"
-role = "UI/UX designer"
-model = "deepseek-v4-1-flash"
+[ui]
+thinking = "indicator"         # indicator | hidden | full
 
 [[schedules]]                  # cron triggers for autonomous start
 cron = "0 9 * * 1-5"
@@ -344,8 +337,36 @@ goal = "Review the change to {path}"   # `{path}` = the changed path
 recursive = true
 ```
 
-Employees without a `schedule` are manual/chat-only. Configuration is validated at
-load (serde `deny_unknown_fields`).
+The OpenCode endpoint is **not** configured here: it is discovered at startup from
+`opencode service status` (see §3), so there is no `[opencode]` table and no
+endpoint key to set.
+
+`~/.config/mywaker/team.toml` — the roster, written by `mywaker employee …`:
+
+```toml
+[[employees]]
+id = "researcher"
+name = "Rex"
+role = "Research lead"
+model = "anthropic/claude-sonnet-4-5"
+model_provider = "anthropic"
+skills = []
+onboarded = "2026-10-16"
+
+[[employees]]
+id = "designer"
+name = "Juno"
+role = "UI/UX designer"
+model = "deepseek-v4-1-flash"
+model_provider = "kenari"
+skills = ["unslop-ui"]
+onboarded = "2026-10-20"
+```
+
+`agent` is the optional OpenCode-agent override; it is normally absent, because the
+employee's `id` doubles as its agent id (see §10.7). Employees without a `schedule`
+or `watch` are manual/chat-only. Configuration is validated at load (serde
+`deny_unknown_fields`).
 
 ### Cron field counts
 

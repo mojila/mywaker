@@ -194,6 +194,17 @@ If an employee's agent id still isn't defined anywhere, the employee starts a
 session anyway — it falls back to OpenCode's default agent (with a note in the log)
 rather than failing with `Agent not found`.
 
+The `designer` mandate names one skill — `unslop-ui` — so install it in a scope
+OpenCode reads before expecting the designer to audit against it:
+
+```bash
+mywaker skills add yuwen-lu/unslop-ui -g     # → ~/.agents/skills/unslop-ui
+mywaker employee skill designer unslop-ui    # attach it to the employee
+```
+
+A copy that lives only in another editor's scope is invisible to the session, so
+the designer would name a skill it cannot load.
+
 ## Controls
 
 | Key | Action |
