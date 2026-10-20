@@ -1,4 +1,6 @@
-//! The chat panel — a scrollable, markdown-aware transcript, a slash-command
+//! The chat panel — a scrollable, markdown-aware transcript (fenced code
+//! blocks, headings, blockquotes, and inline `` `code` ``, `**bold**`,
+//! `*italic*`, `~~strike~~`, and `[text](url)` links), a slash-command
 //! autocomplete menu, and a cursor-editing input prompt.
 
 use ratatui::{
@@ -24,7 +26,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 // --- transcript ---
 
 fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
-    let name = app.chat_employee_name().unwrap_or("chat");
+    let name = app.chat_employee_name();
     let inner_width = area.width.saturating_sub(2) as usize;
     let inner_height = area.height.saturating_sub(2) as usize;
 
@@ -35,24 +37,7 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let thinking = app.thinking_line(inner_width);
     let body_height = inner_height.saturating_sub(usize::from(thinking.is_some()));
 
-    let mut lines: Vec<Line> = Vec::new();
-    for entry in app.transcript() {
-        transcript_block(&mut lines, entry, inner_width);
-    }
-    let streaming = app.streaming_text();
-    if !streaming.is_empty() {
-        tagged_block(
-            &mut lines,
-            "◔ ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-            streaming,
-            Style::default().fg(Color::Yellow),
-            None,
-            inner_width,
-        );
-    }
+    let lines = transcript_lines(app.transcript(), name, app.streaming_text(), inner_width);
 
     // Scroll to the visible window (stick to the live tail unless the user has
     // paged up to read back through history).
@@ -65,8 +50,8 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let title = match app.chat_employee_status() {
-        Some(status) => format!(" chat · {name} · {} ", status.label()),
-        None => format!(" chat · {name} "),
+        Some(status) => format!(" chat · {} · {} ", name.unwrap_or("chat"), status.label()),
+        None => format!(" chat · {} ", name.unwrap_or("chat")),
     };
 
     let block = Block::default()
@@ -82,12 +67,53 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(visible).block(block), area);
 }
 
+/// Build the transcript's display lines: one blank spacer `Line` before each
+/// message after the first, and before a non-empty streaming tail, so messages
+/// read as visually distinct blocks. Spacers are ordinary lines — the scroll
+/// math in `render_transcript` needs no special-casing for them.
+fn transcript_lines(
+    entries: &[TranscriptLine],
+    name: Option<&str>,
+    streaming: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for entry in entries {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        transcript_block(&mut lines, entry, width, name);
+    }
+    if !streaming.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        tagged_block(
+            &mut lines,
+            "◔ ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            streaming,
+            Style::default().fg(Color::Yellow),
+            None,
+            width,
+        );
+    }
+    lines
+}
+
 /// Render one transcript entry into wrapped, styled display lines.
-fn transcript_block(lines: &mut Vec<Line>, entry: &TranscriptLine, width: usize) {
-    let (tag, tag_style, base) = role_mapping(entry.role);
+fn transcript_block(
+    lines: &mut Vec<Line>,
+    entry: &TranscriptLine,
+    width: usize,
+    name: Option<&str>,
+) {
+    let (tag, tag_style, base) = role_mapping(entry.role, name);
     tagged_block(
         lines,
-        tag,
+        &tag,
         tag_style,
         &entry.text,
         base,
@@ -131,34 +157,48 @@ fn tagged_block(
     }
 }
 
-fn role_mapping(role: TranscriptRole) -> (&'static str, Style, Style) {
+/// Map a transcript role to its `(tag, tag_style, base_style)`. The assistant
+/// tag carries the employee's actual name (falling back to `"assistant"` when
+/// unknown) so a reply reads as the named worker speaking, not an opaque "wkr".
+fn role_mapping(role: TranscriptRole, name: Option<&str>) -> (String, Style, Style) {
     match role {
         TranscriptRole::User => (
-            "you ",
+            "you ".to_string(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
             Style::default(),
         ),
-        TranscriptRole::Assistant => (
-            "wkr ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            Style::default(),
-        ),
+        TranscriptRole::Assistant => {
+            let label = name
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("assistant");
+            (
+                format!("{label} "),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                Style::default(),
+            )
+        }
         TranscriptRole::Error => (
-            "err ",
+            "error ".to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Red),
         ),
-        TranscriptRole::Info => ("", Style::default(), Style::default().fg(Color::DarkGray)),
+        TranscriptRole::Info => (
+            "".to_string(),
+            Style::default(),
+            Style::default().fg(Color::DarkGray),
+        ),
     }
 }
 
 /// Lightweight markdown: fenced code blocks (cyan/dim), headings (bold),
-/// blockquotes (dim), and inline `` `code` `` (cyan). Everything word-wraps to
-/// `width`; code lines are chunked without collapsing indentation.
+/// blockquotes (dim), and inline styling — `` `code` ``, `**bold**`, `*italic*`,
+/// `~~strike~~`, and `[text](url)` links. Everything word-wraps to `width`;
+/// code lines are chunked without collapsing indentation.
 fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_code = false;
@@ -203,7 +243,7 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
             (base, raw)
         };
         for seg in wrap_text(body, width) {
-            out.push(inline_code_line(&seg, style));
+            out.push(inline_line(&seg, style));
         }
     }
 
@@ -293,20 +333,168 @@ fn chunk_lines(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Style inline `` `code` `` spans (odd segments) in cyan.
-fn inline_code_line(seg: &str, base: Style) -> Line<'static> {
+/// Style inline markdown within an already-wrapped segment: `` `code` ``
+/// (cyan), `**bold**` / `__bold__`, `*italic*` / `_italic_`, `~~strike~~`, and
+/// `[text](url)` links (rendered as just `text`, cyan and underlined).
+///
+/// Single-pass and deterministic, matching markers in precedence order — code,
+/// then bold, then strikethrough, then italic, then links — so an unbalanced
+/// marker falls back to literal text.
+fn inline_line(seg: &str, base: Style) -> Line<'static> {
+    let chars: Vec<char> = seg.chars().collect();
+    let n = chars.len();
+
     let mut spans: Vec<Span> = Vec::new();
-    let mut toggle = false;
-    for part in seg.split('`') {
-        let style = if toggle {
-            Style::default().fg(Color::Cyan)
-        } else {
-            base
-        };
-        spans.push(Span::styled(part.to_string(), style));
-        toggle = !toggle;
+    let mut cur = String::new();
+    let flush = |spans: &mut Vec<Span>, cur: &mut String| {
+        if !cur.is_empty() {
+            spans.push(Span::styled(std::mem::take(cur), base));
+        }
+    };
+
+    let mut i = 0;
+    while i < n {
+        if chars[i] == '`'
+            && let Some(j) = find_pair(&chars, i, '`')
+        {
+            flush(&mut spans, &mut cur);
+            spans.push(Span::styled(
+                chars[i + 1..j].iter().collect::<String>(),
+                Style::default().fg(Color::Cyan),
+            ));
+            i = j + 1;
+            continue;
+        }
+        if i + 1 < n
+            && chars[i] == chars[i + 1]
+            && (chars[i] == '*' || chars[i] == '_')
+            && let Some(j) = find_double(&chars, i + 2, chars[i])
+        {
+            flush(&mut spans, &mut cur);
+            spans.push(Span::styled(
+                chars[i + 2..j].iter().collect::<String>(),
+                base.add_modifier(Modifier::BOLD),
+            ));
+            i = j + 2;
+            continue;
+        }
+        if i + 1 < n
+            && chars[i] == '~'
+            && chars[i + 1] == '~'
+            && let Some(j) = find_double(&chars, i + 2, '~')
+        {
+            flush(&mut spans, &mut cur);
+            spans.push(Span::styled(
+                chars[i + 2..j].iter().collect::<String>(),
+                base.add_modifier(Modifier::CROSSED_OUT),
+            ));
+            i = j + 2;
+            continue;
+        }
+        if (chars[i] == '*' || chars[i] == '_')
+            && italic_open_ok(&chars, i)
+            && let Some(j) = find_italic_end(&chars, i)
+        {
+            flush(&mut spans, &mut cur);
+            spans.push(Span::styled(
+                chars[i + 1..j].iter().collect::<String>(),
+                base.add_modifier(Modifier::ITALIC),
+            ));
+            i = j + 1;
+            continue;
+        }
+        if chars[i] == '['
+            && let Some((j, k)) = find_link(&chars, i)
+        {
+            flush(&mut spans, &mut cur);
+            spans.push(Span::styled(
+                chars[i + 1..j].iter().collect::<String>(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::UNDERLINED),
+            ));
+            i = k + 1;
+            continue;
+        }
+        cur.push(chars[i]);
+        i += 1;
     }
+    flush(&mut spans, &mut cur);
+
     Line::from(spans)
+}
+
+/// Index of the next single `marker` after `open`, if any.
+fn find_pair(chars: &[char], open: usize, marker: char) -> Option<usize> {
+    chars[open + 1..]
+        .iter()
+        .position(|&c| c == marker)
+        .map(|offset| open + 1 + offset)
+}
+
+/// Index of the next `marker` doubled (`**`/`__`/`~~`) on or after `from`.
+fn find_double(chars: &[char], from: usize, marker: char) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < chars.len() {
+        if chars[i] == marker && chars[i + 1] == marker {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `chars[i]` may open an italic span. `*` always may; `_` may only
+/// when it is not wedged between two word characters (`snake_case` stays
+/// literal).
+fn italic_open_ok(chars: &[char], i: usize) -> bool {
+    if chars[i] == '*' {
+        return true;
+    }
+    !(i > 0 && i + 1 < chars.len() && is_word_char(chars[i - 1]) && is_word_char(chars[i + 1]))
+}
+
+/// Index of the italic span's closing marker, or `None`. The content must be a
+/// non-empty, non-space run; an underscore closer that is itself intraword is
+/// rejected too.
+fn find_italic_end(chars: &[char], open: usize) -> Option<usize> {
+    let marker = chars[open];
+    let mut j = open + 1;
+    while j < chars.len() {
+        if chars[j] == marker {
+            let content = &chars[open + 1..j];
+            let non_space = !content.is_empty() && content.iter().all(|&c| !c.is_whitespace());
+            let closing_ok = marker != '_'
+                || !(j + 1 < chars.len()
+                    && is_word_char(chars[j - 1])
+                    && is_word_char(chars[j + 1]));
+            if non_space && closing_ok {
+                return Some(j);
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+/// The `]` and `)` positions bounding a `[text](url)` link, or `None`.
+fn find_link(chars: &[char], open: usize) -> Option<(usize, usize)> {
+    let mut j = open + 1;
+    while j < chars.len() && chars[j] != ']' {
+        j += 1;
+    }
+    if j == chars.len() || chars.get(j + 1) != Some(&'(') {
+        return None;
+    }
+    let mut k = j + 2;
+    while k < chars.len() && chars[k] != ')' {
+        k += 1;
+    }
+    (k < chars.len() && j > open + 1).then_some((j, k))
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 // --- input ---
@@ -395,6 +583,14 @@ fn render_command_menu(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
 
+    fn entry(role: TranscriptRole, text: &str) -> TranscriptLine {
+        TranscriptLine {
+            role,
+            text: text.to_string(),
+            meta: None,
+        }
+    }
+
     #[test]
     fn wrap_text_word_wraps_and_preserves_blank_lines() {
         let out = wrap_text("hello world foo\n\nbar", 8);
@@ -423,10 +619,129 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_splits_on_backticks() {
-        let line = inline_code_line("see `let x = 1;` here", Style::default());
-        // plain / code / plain(empty) / plain — at least 3 spans.
-        assert!(line.spans.len() >= 3);
+    fn inline_line_styles_bold_italic_and_strike() {
+        let line = inline_line("a **bold** and *italic* and ~~gone~~", Style::default());
+        let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(
+            texts,
+            vec!["a ", "bold", " and ", "italic", " and ", "gone"]
+        );
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(line.spans[3].style.add_modifier.contains(Modifier::ITALIC));
+        assert!(
+            line.spans[5]
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+    }
+
+    #[test]
+    fn inline_line_styles_code() {
+        let line = inline_line("run `cargo test` now", Style::default());
+        let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(texts, vec!["run ", "cargo test", " now"]);
+        assert_eq!(line.spans[1].style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn inline_line_renders_link_text_only() {
+        let line = inline_line("see [the docs](https://example.com) here", Style::default());
+        let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
+        // The `(url)` is dropped; `text` is cyan and underlined.
+        assert_eq!(texts, vec!["see ", "the docs", " here"]);
+        assert_eq!(line.spans[1].style.fg, Some(Color::Cyan));
+        assert!(
+            line.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn inline_line_leaves_intraword_underscore_literal() {
+        let line = inline_line("snake_case stays", Style::default());
+        let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(texts, vec!["snake_case stays"]);
+    }
+
+    #[test]
+    fn inline_line_underscore_italics_when_flanked_by_space() {
+        let line = inline_line("say _hello_ now", Style::default());
+        let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(texts, vec!["say ", "hello", " now"]);
+        assert!(line.spans[1].style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn inline_line_unbalanced_markers_fall_back_to_literal() {
+        for input in ["**unclosed", "*half", "~~miss", "`oops", "and [link](never"] {
+            let line = inline_line(input, Style::default());
+            let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
+            assert_eq!(texts, vec![input.to_string()], "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn role_mapping_labels_assistant_with_employee_name() {
+        let (tag, style, base) = role_mapping(TranscriptRole::Assistant, Some("writer"));
+        assert_eq!(tag, "writer ");
+        assert_eq!(style.fg, Some(Color::Green));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(base, Style::default());
+
+        // Unknown / blank name falls back to a generic label.
+        assert_eq!(
+            role_mapping(TranscriptRole::Assistant, None).0,
+            "assistant "
+        );
+        assert_eq!(
+            role_mapping(TranscriptRole::Assistant, Some("  ")).0,
+            "assistant "
+        );
+    }
+
+    #[test]
+    fn role_mapping_expands_error_tag() {
+        let (tag, _style, base) = role_mapping(TranscriptRole::Error, None);
+        assert_eq!(tag, "error ");
+        assert_eq!(base.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn transcript_lines_insert_spacers_between_messages() {
+        let entries = [
+            entry(TranscriptRole::User, "hi"),
+            entry(TranscriptRole::Assistant, "hello"),
+        ];
+        // user block + spacer + assistant block.
+        let lines = transcript_lines(&entries, Some("writer"), "", 80);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].spans.is_empty());
+
+        // The first message never gets a leading spacer.
+        let one = transcript_lines(&entries[..1], Some("writer"), "", 80);
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn transcript_lines_inserts_spacer_before_streaming() {
+        let entries = [entry(TranscriptRole::User, "hi")];
+
+        // user block + spacer + streaming block.
+        let lines = transcript_lines(&entries, None, "still going", 80);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].spans.is_empty());
+
+        // Empty streaming text adds nothing (no trailing spacer).
+        let none = transcript_lines(&entries, None, "", 80);
+        assert_eq!(none.len(), 1);
+
+        // Streaming with an empty transcript starts immediately.
+        let empty = transcript_lines(&[], None, "streaming...", 80);
+        assert_eq!(empty.len(), 1);
+        assert!(!empty[0].spans.is_empty());
     }
 
     #[test]
