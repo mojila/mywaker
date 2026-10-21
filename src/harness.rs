@@ -31,6 +31,17 @@ pub const HANDOFF_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct PendingDelivery {
     /// The instruction handed to the employee (for the retry preamble).
     pub instruction: String,
+    /// The kind this delivery was sent as, kept so a **resend** can repeat it.
+    /// The kind is part of the admission id, so re-offering a delivery under a
+    /// different kind would change its id and defeat deduplication.
+    pub kind: PromptKind,
+    /// The delivery's identity token, minted once when it was queued.
+    ///
+    /// A **resend** reuses this, so the admission id repeats and a service that
+    /// already admitted the delivery deduplicates the second attempt instead of
+    /// running the work twice. A silent-worker re-issue deliberately does *not*
+    /// reuse it: that is new work, and it mints a fresh token.
+    pub token: String,
     /// Number of deliveries already made (0 = the original send).
     pub attempts: u8,
     /// When the delivery's turn actually started, or the last liveness
@@ -48,9 +59,11 @@ pub struct PendingDelivery {
 }
 
 impl PendingDelivery {
-    pub fn new(instruction: String) -> Self {
+    pub fn new(instruction: String, kind: PromptKind, token: String) -> Self {
         Self {
             instruction,
+            kind,
+            token,
             attempts: 0,
             since: Instant::now(),
             armed: false,
@@ -189,35 +202,36 @@ const ADMISSION_PREFIX: &str = "msg_mywaker";
 
 /// A fresh token identifying one logical delivery.
 ///
-/// The `(kind, employee, depth, attempt)` tuple alone does **not** identify a
-/// delivery: a user's second prompt to the same employee, a fresh session after
-/// `/new`, and two independent chains that reach the same employee at the same
-/// depth all produce the same tuple. OpenCode's admission ids are unique across
-/// the whole service (a repeat in *another* session is a `409 ConflictError`),
-/// and within one session a repeat is silently deduplicated — the second message
-/// would be swallowed. So each delivery carries its own token, minted once when
-/// the delivery is created and reused only if that exact delivery is re-sent.
+/// The `(kind, employee, depth)` tuple alone does **not** identify a delivery: a
+/// user's second prompt to the same employee, a fresh session after `/new`, and
+/// two independent chains that reach the same employee at the same depth all
+/// produce the same tuple. OpenCode's admission ids are unique across the whole
+/// service (a repeat in *another* session is a `409 ConflictError`), and within
+/// one session a repeat is silently deduplicated — the second message would be
+/// swallowed. So each delivery carries its own token, minted once when the
+/// delivery is created and reused only if that exact delivery is re-sent.
 pub fn delivery_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-/// The admission id for one delivery: `(kind, employee, chain depth, attempt,
-/// token)`.
+/// The admission id for one delivery: `(kind, employee, chain depth, token)`.
 ///
 /// The id starts with `msg_` because OpenCode requires it, and it is unique per
 /// logical delivery because of the token. Re-sending the *same* delivery (same
 /// tuple, same token) repeats the id, which is what lets the service deduplicate
 /// it instead of starting a second turn; a genuinely different delivery (another
-/// employee, one step deeper, a later attempt, a new token) gets a different id.
-pub fn admission_id(
-    kind: PromptKind,
-    employee: &str,
-    depth: usize,
-    attempt: u8,
-    token: &str,
-) -> String {
+/// employee, one step deeper, a new token) gets a different id.
+///
+/// The retry **attempt** is deliberately not part of the id. It is the sender's
+/// own budget — how many times this app has tried — not part of what is being
+/// delivered, so folding it in made every resend look like a new message and
+/// defeated the deduplication the token exists for. Two re-issues therefore
+/// differ by *token*, not by attempt: a resend of a delivery that never landed
+/// keeps its token (and so its id), while a silent worker being asked again is
+/// new work and mints a fresh one.
+pub fn admission_id(kind: PromptKind, employee: &str, depth: usize, token: &str) -> String {
     format!(
-        "{ADMISSION_PREFIX}:{}:{employee}:{depth}:{attempt}:{token}",
+        "{ADMISSION_PREFIX}:{}:{employee}:{depth}:{token}",
         kind.label()
     )
 }
@@ -228,12 +242,11 @@ pub fn prompt_options(
     kind: PromptKind,
     employee: &str,
     depth: usize,
-    attempt: u8,
     token: &str,
 ) -> PromptOptions {
     PromptOptions::new(
         delivery_for(kind),
-        admission_id(kind, employee, depth, attempt, token),
+        admission_id(kind, employee, depth, token),
     )
 }
 
@@ -268,35 +281,34 @@ mod tests {
     #[test]
     fn admission_ids_are_stable_per_delivery_and_distinct_across_deliveries() {
         let token = "abc123";
-        let first = admission_id(PromptKind::Delegation, "writer", 2, 0, token);
+        let first = admission_id(PromptKind::Delegation, "writer", 2, token);
 
-        // Same employee, same depth, same attempt, same token → the same id.
+        // Same employee, same depth, same token → the same id.
         assert_eq!(
             first,
-            admission_id(PromptKind::Delegation, "writer", 2, 0, token)
+            admission_id(PromptKind::Delegation, "writer", 2, token)
         );
 
-        // A retry of the same hand-off is a *different* delivery.
+        // The retry budget is not part of the identity: re-sending this exact
+        // delivery is the *same* admission however many times it has been tried.
+        // Folding the attempt in here would give every resend a new id and the
+        // service would admit the work twice instead of deduplicating it.
+        assert_eq!(first, "msg_mywaker:delegation:writer:2:abc123");
+
+        // A different delivery gets a different id: another employee, another
+        // kind, one step deeper, or a fresh token.
         assert_ne!(
             first,
-            admission_id(PromptKind::Delegation, "writer", 2, 1, token)
-        );
-        // As is one step deeper, another employee, another kind, or a new token.
-        assert_ne!(
-            first,
-            admission_id(PromptKind::Delegation, "writer", 3, 0, token)
-        );
-        assert_ne!(
-            first,
-            admission_id(PromptKind::Delegation, "coder", 2, 0, token)
+            admission_id(PromptKind::Delegation, "writer", 3, token)
         );
         assert_ne!(
             first,
-            admission_id(PromptKind::Report, "writer", 2, 0, token)
+            admission_id(PromptKind::Delegation, "coder", 2, token)
         );
+        assert_ne!(first, admission_id(PromptKind::Report, "writer", 2, token));
         assert_ne!(
             first,
-            admission_id(PromptKind::Delegation, "writer", 2, 0, "other")
+            admission_id(PromptKind::Delegation, "writer", 2, "other")
         );
 
         // It names the kind and the employee, so a log line is readable.
@@ -317,31 +329,19 @@ mod tests {
             PromptKind::Retry,
             PromptKind::AutonomousTask,
         ] {
-            let id = admission_id(kind, "orchestrator", 0, 0, &delivery_token());
+            let id = admission_id(kind, "orchestrator", 0, &delivery_token());
             assert!(id.starts_with("msg_"), "{kind:?} produced {id}");
         }
     }
 
-    /// Two deliveries that share `(kind, employee, depth, attempt)` are still
-    /// distinct: a user's second prompt, or a fresh session after `/new`, must
-    /// not reuse an admission id. Reusing one makes the service swallow the
-    /// message (same session) or reject it with a 409 (another session).
+    /// Two deliveries that share `(kind, employee, depth)` are still distinct: a
+    /// user's second prompt, or a fresh session after `/new`, must not reuse an
+    /// admission id. Reusing one makes the service swallow the message (same
+    /// session) or reject it with a 409 (another session).
     #[test]
     fn two_deliveries_with_the_same_shape_get_different_ids() {
-        let first = admission_id(
-            PromptKind::UserPrompt,
-            "orchestrator",
-            0,
-            0,
-            &delivery_token(),
-        );
-        let second = admission_id(
-            PromptKind::UserPrompt,
-            "orchestrator",
-            0,
-            0,
-            &delivery_token(),
-        );
+        let first = admission_id(PromptKind::UserPrompt, "orchestrator", 0, &delivery_token());
+        let second = admission_id(PromptKind::UserPrompt, "orchestrator", 0, &delivery_token());
         assert_ne!(first, second);
     }
 
@@ -350,20 +350,21 @@ mod tests {
     #[test]
     fn prompt_options_carry_both_the_policy_and_the_id() {
         let token = delivery_token();
-        let options = prompt_options(PromptKind::Report, "writer", 1, 0, &token);
+        let options = prompt_options(PromptKind::Report, "writer", 1, &token);
         assert_eq!(options.delivery, Delivery::Queue);
         assert_eq!(
             options.admission_id.as_deref(),
-            Some(admission_id(PromptKind::Report, "writer", 1, 0, &token).as_str())
+            Some(admission_id(PromptKind::Report, "writer", 1, &token).as_str())
         );
 
-        let user = prompt_options(PromptKind::UserPrompt, "writer", 0, 0, &token);
+        let user = prompt_options(PromptKind::UserPrompt, "writer", 0, &token);
         assert_eq!(user.delivery, Delivery::Steer);
     }
 
     #[test]
     fn pending_delivery_retry_and_exhaustion() {
-        let mut p = PendingDelivery::new("draft the doc".into());
+        let mut p =
+            PendingDelivery::new("draft the doc".into(), PromptKind::Delegation, "tok".into());
         assert!(!p.exhausted());
         assert_eq!(p.attempts, 0);
 
@@ -382,7 +383,7 @@ mod tests {
 
     #[test]
     fn pending_delivery_expiry_and_heartbeat() {
-        let mut p = PendingDelivery::new("x".into());
+        let mut p = PendingDelivery::new("x".into(), PromptKind::Delegation, "tok".into());
         assert!(!p.expired(Instant::now()));
 
         // An admitted-but-not-started delivery is never "silent": it is waiting

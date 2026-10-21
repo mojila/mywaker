@@ -123,6 +123,15 @@ renderer already draws.
 | **U11** | Error taxonomy | `transient` · `actionable` · `fatal` | 0 · 0 · 0 | P3 |
 | **U12** | Delivery receipts | `acknowledged` | 0 | P3 |
 
+**U12's marker at the floor and at usable 10–11 (rev 17).** `acknowledged` is
+composed by the tasks panel wherever the card cannot hold a receipt: at 60×16,
+where the floor entry is 3 columns and a receipt glyph would make it 4 (§3,
+`docs/keymap.md` §5.5, §8 C5), and at usable width 10–11 — 100×30's 13-wide card —
+where §2.7's frozen ladder drops the receipt glyph. The marker is still unique — it
+appears in one surface at a given size — but *which* surface composes it is
+size-dependent, so the assertion reads the tasks panel below usable 12 and either
+surface above it. This is the scope clause, not a second marker.
+
 **U4's marker note.** `help` already appears in the hint bar as a description
 (`("?", "help")`, `src/ui/mod.rs:343`), so the bare word is not unique. The marker
 is therefore the **bordered title** ` help ` — the string drawn inside a `Block`
@@ -177,18 +186,24 @@ below `MIN_CELL_WIDTH` (12, `:102`) the grid falls back to one full-width column
 (`:302-306`). That is why 80×24 is the single-column case and why its card is
 *wider* than 120×40's — the fallback trades columns for legibility.
 
-**The only width-driven relaxation in this spec.** At 60×16 the card is **3 columns
-wide** and, per [`keymap.md`](keymap.md) §5.5, is drawn as a **1-row frameless
-entry** rather than a 7-row framed card — so U6 requires the status glyph but not
-the `waiting on` **text** and not the queue count, which the tasks panel carries:
-`waiting on researcher` cannot fit in 3 columns, and a truncated `wai…` tells the
-user nothing. The relaxation is keyed to the drawn card
-width being below `MIN_CELL_WIDTH` (12, `src/ui/pipeline.rs:102`), which at every
-size in §3 is **60×16 and no other** — 80×24 falls back to a single *23-column*
-card, which has room for the text. This is a rendering relaxation,
-never a presence relaxation: the criterion is still asserted at that size, on the
-glyph and the count. It is modelled on A4's narrow-width clause in the sidebar
-spec, and it is the *only* one here.
+**The only width-driven relaxation in this spec — the §3 scope clause.** At 60×16
+the card is **3 columns wide** and, per [`keymap.md`](keymap.md) §5.5, is drawn as
+a **1-row frameless entry** rather than a 7-row framed card — so U6 requires the
+status glyph but not the `waiting on` **text** and not the queue count, which the
+tasks panel carries: `waiting on researcher` cannot fit in 3 columns, and a
+truncated `wai…` tells the user nothing. **U12 is scoped the same way**, and by the
+same ladder rather than by a new rule: a receipt glyph needs a head row with room
+for it, so it is required on the **tasks panel** and not on the card wherever the
+card cannot hold it — below `MIN_CELL_WIDTH` (the floor's 3-column entry, where a
+receipt glyph would make it 4 cells) and at usable width 10–11, where
+[`keymap.md`](keymap.md) §2.7's frozen ladder already drops the receipt. The
+clause is keyed to the drawn card, so it applies at **60×16 and 100×30** (card 13,
+usable 11) and at no other pinned size — 80×24 falls back to a single *23-column*
+card, which has room for the text and the receipt. This is a rendering relaxation,
+never a presence relaxation: each criterion is still asserted at that size — U6 on
+the glyph and the count, U12 on the tasks panel. It is modelled on A4's
+narrow-width clause in the sidebar spec, and it is the *only* one here, applied to
+U6 and U12.
 
 **One size is deliberately not pinned: 40×24.**
 
@@ -219,7 +234,7 @@ wording; the matrix (§4.1) is a generated restatement, and if the two disagree,
 | **U9** | Fit is reported | When the roster grid hides card rows, the app reports **how many are hidden**, as `hidden N`, in addition to the existing `rows a-b/c` affordance. It is drawn on the grid's title while the title can hold it, and on the roster's **notice row** (§4.2) below that — one host or the other, never both and never neither. The count must agree with the drawn viewport (`N = total − visible`), and must disappear when nothing is hidden — a `hidden 0` is a FAIL. **The sidebar clause is deliberately deferred** — see the note below. |
 | **U10** | Connection health | Connection is a first-class state — `connected` · `reconnecting` · `down` — not a spinner. A banner names the state and the age of the last successful event. On reconnect the app re-subscribes to the event stream and re-syncs the roster **without losing queued work**: a prompt queued while down is still queued (or delivered) afterwards, and is never silently dropped. |
 | **U11** | Error taxonomy | Every error carries a class — `transient` · `actionable` · `fatal` — a **stable id**, a one-line cause, and a bound action (`r` retry · `c` copy · `?` detail). Every `push_error_log` call site is classified: 9 sites at hand-off (§0 B8), and **0** may remain unclassified. A `fatal` error is never dismissible into silence; a `transient` one is retried before it is shown twice. |
-| **U12** | Delivery receipts | Every prompt shows its delivery state per employee — queued → sent → `acknowledged` → completed — on the card and in the tasks panel. A failed delivery offers in-place retry, and the retry re-sends the **same** admission id, so the service deduplicates it: a retried prompt is never delivered twice. |
+| **U12** | Delivery receipts | Every prompt shows its delivery state per employee — queued → sent → `acknowledged` → completed — on the card and in the tasks panel. Where the drawn card cannot carry it — below `MIN_CELL_WIDTH`, or at a usable width where [`keymap.md`](keymap.md) §2.7's ladder drops the receipt (usable 10–11) — the receipt is **not** required on the card and the **tasks panel** carries it (§3); the criterion is still asserted at that size, on the tasks panel, and the card's absence of a receipt is the contract, not a failure. A failed delivery offers in-place retry, and the retry re-sends the **same** admission id, so the service deduplicates it: a retried prompt is never delivered twice. |
 
 ### U9's deferred clause — recorded, not quietly dropped
 
@@ -262,7 +277,7 @@ Cells are filled in run 1 (§8). A cell with no covering test is recorded as
 Every cell cites the §6 symbol that will assert it and that symbol does not resolve
 yet (§8 records `resolved=0 of 31` at run 1; §6 gained one more frozen name in rev
 9, two guard citations in rev 10, and two U4 names in rev 15, so the current
-inventory is **34 unresolved + 3 existing**, none of the 34 resolving). That
+inventory is **34 unresolved + 4 existing**, none of the 34 resolving). That
 is the expected result for a spec frozen before implementation, not a failure of
 this run.
 
@@ -540,10 +555,10 @@ Measured geometry for the four axes, read from the renderer's own seams
 
 | ID | Size | Pass condition at this size | Observable | Evidence |
 |---|---|---|---|---|
-| U12 | 120×40 | Every prompt shows queued → sent → `acknowledged` → completed per employee, **on the card and in the tasks panel**; a failed delivery offers in-place retry; retry re-sends the **same** admission id. | buffer + model | `u12_receipt_walks_queued_to_completed` · `u12_retry_reuses_the_admission_id` — **not evidenced** |
-| U12 | 100×30 | As above; card 13 wide — the receipt must be a glyph/word that fits, with the tasks panel (32) carrying the full text. | buffer | same symbols — **not evidenced** |
-| U12 | 80×24 | As above; card 23 wide, tasks panel 32 — both surfaces must show it. | buffer | same symbols — **not evidenced** |
-| U12 | 60×16 | As above; the card is a 1-row frameless 3-column entry, so a receipt glyph would make it 4 cells and cannot be drawn there (`docs/keymap.md` §5.5, §8 C5). The **tasks panel** (32 of 60) is the surface that must carry `acknowledged`; the card carries no receipt at this size, and that absence is the contract, not a failure. | buffer + tasks panel | same symbols — **not evidenced** |
+| U12 | 120×40 | Every prompt shows queued → sent → `acknowledged` → completed per employee, **on the card and in the tasks panel**; a failed delivery offers in-place retry; retry re-sends the **same** admission id. The card is 19 wide, usable 17, inside §2.7's 12–20 band where the head row carries the receipt — so §3's scope clause does not apply and both surfaces are required. | buffer + model | `u12_receipt_walks_queued_to_completed` · `u12_retry_reuses_the_admission_id` — **not evidenced** |
+| U12 | 100×30 | §3's scope clause applies here too: card 13 wide, usable 11, and [`keymap.md`](keymap.md) §2.7's ladder drops the receipt glyph at usable 10–11 (`▶ Aria ×2`, no receipt). So the **tasks panel** (32) must carry `acknowledged`; the card carries the count and the name, and its absence of a receipt is the contract. | buffer + tasks panel | same symbols — **not evidenced** |
+| U12 | 80×24 | As above; card 23 wide (single-column fallback), usable 21, inside §2.7's ≥21 band — the receipt and the count both fit, so both surfaces are required and §3's scope clause does not apply. | buffer | same symbols — **not evidenced** |
+| U12 | 60×16 | §3's scope clause applies to U12: the card is a 1-row frameless 3-column entry, so a receipt glyph would make it 4 cells and cannot be drawn there (`docs/keymap.md` §5.5, §8 C5). The receipt is therefore **not** required on the card; the **tasks panel** (32 of 60) is the surface that must carry `acknowledged`, and the card's absence is the contract, not a failure. | buffer + tasks panel | same symbols — **not evidenced** |
 
 ---
 
@@ -566,20 +581,26 @@ gap is recorded here rather than only in review.
 ## 6. Frozen test names
 
 So the evidence column cites a symbol that must exist rather than describing a
-run. The list holds **34 new names plus 3 existing tests**; the 34 do not exist
+run. The list holds **34 new names plus 4 existing tests**; the 34 do not exist
 yet — that is the point of freezing them before implementation, and it is recorded
-as a gap rather than glossed (§8). The three that already exist are named in the
-final "cited as-is" bullet: **three existing test symbols** —
-`clicking_outside_a_target_keeps_the_selection` (the selection invariant) and the
-two `main`-height guards added in rev 10,
+as a gap rather than glossed (§8). The four that already exist are **three existing
+test symbols** — `clicking_outside_a_target_keeps_the_selection` (the selection
+invariant) and the two `main`-height guards added in rev 10,
 `the_prompt_band_does_not_shrink_the_panels` and
-`the_roster_prompt_band_comes_out_of_the_log` — together with **two guard test
-files**, `tests/grid.rs` and `tests/sidebar.rs`, whose suites must stay green. They
-are cited so a criterion can name a guard it must not disturb. Counted precisely
-because "none of these exist" is false for that bullet: **34 unresolved, 3
-resolved**, which is what `resolved=0 of 31` in §4.1 and §8 means — that figure is
+`the_roster_prompt_band_comes_out_of_the_log` — plus, added in rev 17, the harness
+admission-id test `admission_ids_are_stable_per_delivery_and_distinct_across_deliveries`
+(`src/harness.rs:269`), which guards the corrected claim behind U12's dedup clause.
+The first three are named in the final "cited as-is" bullet; the harness test is
+cited in the paragraph just below it, and for a different reason — it guards a
+*claim*, not a surface. Together with **two guard test files**, `tests/grid.rs` and
+`tests/sidebar.rs`, whose suites must stay green, they are cited so a criterion can
+name a guard it must not disturb. Counted precisely because "none of these exist"
+is false for that bullet: **34 unresolved, 4 resolved**, which is what
+`resolved=0 of 31` in §4.1 and §8 means — that figure is
 run 1's, taken before `u5_notice_survives_the_thinking_state` (rev 9), the two
-guards (rev 10), and U4's search and dismiss names (rev 15) were added.
+guards (rev 10), and U4's search and dismiss names (rev 15) were added. Rev 17
+added no frozen name: the frozen inventory stays **34**, and the as-is count moved
+from 3 to 4.
 
 - `tests/ux.rs` — `u1_every_surface_reads_the_registry`,
   `u1_no_key_literal_outside_the_registry`,
@@ -627,6 +648,19 @@ guards (rev 10), and U4's search and dismiss names (rev 15) were added.
   (`src/ui/layout.rs:213`, whose `assert_eq!(roster.main, chat.main, …)` at `:222`
   is the layout-level form). Both assert `main` is unchanged; the reserved-row
   decision holds the prompt band at `PROMPT_HEIGHT`, so both must pass unmodified.
+
+Within that as-is set, and for a different reason from the guards above:
+`admission_ids_are_stable_per_delivery_and_distinct_across_deliveries`
+(`src/harness.rs:269`), the harness test whose retry comment rev 17 corrects. Its
+corrected claim is the narrower one — re-sending the **same** delivery (same kind,
+employee, depth, attempt, and token) repeats the id and is deduplicated, while a
+bumped `attempt`, a fresh token, another employee, or another kind is a *different*
+delivery with a different id. The old blanket "a retry of the same hand-off is a
+*different* delivery" (`:279`, the comment this revision rewrote) read as a
+guarantee about retries and was not one.
+It guards a *claim* rather than a surface, and is cited so U12's dedup clause is
+measured against the corrected claim — under which the retry path in `src/app.rs`,
+which bumps the attempt and mints a fresh token, does **not** yet reuse the id.
 
 ---
 
@@ -690,9 +724,10 @@ only be filled with a symbol that exists plus observed output (§7 rule 2), so a
 their host (§4.2), which weakened no requirement but did add a host clause to each
 and a "never both and never neither" obligation to U9. Reporting anything else here
 would be a claim dressed as evidence. *(Run 1 measured 31; §6 has since gained
-`u5_notice_survives_the_thinking_state` (rev 9), two guard citations (rev 10), and
-U4's search and dismiss names (rev 15), so the current inventory is **34 new + 3
-existing**. None of the 34 resolves either way.)*
+`u5_notice_survives_the_thinking_state` (rev 9), two guard citations (rev 10),
+U4's search and dismiss names (rev 15), and one as-is harness citation (rev 17),
+so the current inventory is **34 new + 4 existing**. None of the 34 resolves either
+way.)*
 
 **Marker baseline at the four axes** (a 12-employee roster so the grid overflows
 and U9 has rows to hide). **None of the 14 §2 markers appears in any frame:**
@@ -744,13 +779,16 @@ become passes:
 
 - **Every U-criterion is un-evidenced.** No test in the tree asserts any of them;
   run 1 confirms `resolved=0 of 31` §6 names.
-- **The §6 test names are requirements, not symbols — with three exceptions.** Of
-  the names frozen there, three exist: `clicking_outside_a_target_keeps_the_selection`
-  (`src/app/tests.rs:4219`), and the two layout guards
+- **The §6 test names are requirements, not symbols — with four exceptions.** Of
+  the names frozen there, four exist: `clicking_outside_a_target_keeps_the_selection`
+  (`src/app/tests.rs:4219`), the two layout guards
   `the_prompt_band_does_not_shrink_the_panels` (`src/app/tests.rs:2205`) and
-  `the_roster_prompt_band_comes_out_of_the_log` (`src/ui/layout.rs:213`). All three
-  are cited to stay green, not as new obligations. Every other name is a
-  requirement: `tests/ux.rs` and `src/ui/actions.rs` do not exist.
+  `the_roster_prompt_band_comes_out_of_the_log` (`src/ui/layout.rs:213`), and — cited
+  in rev 17 for the corrected admission-id claim — the harness test
+  `admission_ids_are_stable_per_delivery_and_distinct_across_deliveries`
+  (`src/harness.rs:269`). All four are cited to stay green, not as new obligations.
+  Every other name is a requirement: `tests/ux.rs` and `src/ui/actions.rs` do not
+  exist.
 - **The two former `blocked` cells are decided** (§4.2, rev 5) and are now
   *not evidenced* like the rest. Both were blocked on the assumption that the grid
   panel had to host the prose; it does not. The callout (U5) and the `hidden N`
@@ -789,3 +827,4 @@ become passes:
 | 14 | 2026-10-21 | **§6's inventory count corrected to 32 new + 3 existing, and `docs/verification-matrix-ux.md` reconciled to this file.** Rev 10 added two pre-existing guard tests to §6's stay-green list (`the_prompt_band_does_not_shrink_the_panels`, `src/app/tests.rs:2205`; `the_roster_prompt_band_comes_out_of_the_log`, `src/ui/layout.rs:213`) but left §6's own count saying "32 new names plus 1 existing test". The true inventory is **35 symbols: 32 new + 3 existing** (the selection invariant and the two `main`-height guards), so §6's preamble, §4.1's header, §8's "Why 0/48" paragraph and §8's requirements bullet now all say 32 + 3. The matrix companion was regenerated against the current bytes and reconciled: its pin now names **rev 13** rather than the rev 12 label an earlier pass had put on bytes that already contained rev 13; its §4.4 audit now states it covers the 32 *new* names and lists the 3 guards separately as existing tests that can back no cell by construction (verified: no cell cites any of the three); and its rev-5/rev-9 prose was reworded to "no requirement weakened … the criteria did grow", matching rev 13 here. All 48 matrix rows were re-compared to §4.1 by script and are **byte-identical, 48/48**, none `blocked`. The reported stale pin (`fcafe12f`/"rev 3"), the 2 stale `blocked` rows, and the "(freeze rule 3)" reference were already corrected in the concurrently regenerated matrix before this entry — verified absent at this revision — so they are recorded as closed rather than re-fixed. No U-criterion, marker, cell, or cell status was altered. |
 | 15 | 2026-10-21 | **Two author decisions taken on U4's frozen names (§6, §2, §4.1) — additive, no criterion weakened.** (a) **U4's `/` search and dismiss clauses gain their own frozen names.** U4 asserted four things but §6 froze only two U4 names, both scoped to coverage/fit/counter; the U4 @ 60×16 cell demanded *"scrolling and `/` search must both work"* while citing symbols whose names scope that out, making the cell **unfillable as written** under rule 2. §6 now also freezes `u4_help_search_filters_in_place` (typing `/` filters in place, counter tracks the filtered total) and `u4_help_dismiss_key_has_no_side_effects` (a dismiss key closes the overlay and leaves the screen beneath unchanged — the behaviour `src/app.rs` currently lacks, since any key dismisses). This follows the sidebar spec's precedent of one name per decisive clause, and no U4 clause was dropped. (b) **`help_overlay_is_a_window` is the bordered-title marker assertion, not a scroll-only seam.** §2 already promised that U4's §6 test "asserts on structure rather than on a string"; this names which symbol does it — the bordered title ` help ` plus the `rows a-b/n` window chrome. U4's cells now cite it alongside the four `tests/ux.rs` names, and §6 labels it (with `hint_bar_keeps_the_help_hint` labelled as U3(c) at unit level). No third name was needed for the border. §6's inventory moves to **34 new + 3 existing = 37**; §4.1's header and §8's "Why 0/48" paragraph follow. Also fixed: **UX3's evidence cell now cites the deprecation register at `docs/keymap.md` §3.7** (`:662`), matching `docs/verification-matrix-ux.md` §5, which already said so — the spec was behind its own restatement. No pass condition, marker, or cell status changed; all 48 cells remain `not evidenced`. |
 | 16 | 2026-10-21 | **§6's preamble and §8's "Why 0/48" sentence restated to match the list — no criterion changed.** The preamble said "32 new + **1** existing … 32 unresolved, **1** resolved" and pointed at "the last bullet" as holding "the one that already exists". Neither matched the list, which holds **34 new + 3 existing = 37**: rev 10 had added `the_prompt_band_does_not_shrink_the_panels` and `the_roster_prompt_band_comes_out_of_the_log` to that bullet as reserved-row guards, and rev 15 added U4's two clause names. The preamble now reads **34 unresolved + 3 resolved**, and describes the final "cited as-is" bullet accurately: **three existing test symbols** (the selection invariant plus the two `main`-height guards) and **two guard test files** (`tests/grid.rs`, `tests/sidebar.rs`), which is what that bullet actually names. §8's "Why 0/48 is the expected result" also led with "§6 freezes 31 new test names" while its own parenthetical three lines later said 32 — the leading figure is now **34**, and the parenthetical is rewritten to trace 31 → 34 (rev 9's name, rev 10's two guards, rev 15's two U4 names) instead of stopping at 32. Verified by script against the §6 list: 37 unique symbols, 34 new, 3 existing. §4.1's header already read 34 + 3 and is unchanged. No U-criterion, marker, cell, or pass condition was touched. |
+| 17 | 2026-10-21 | **U12 now carries §3's scope clause in §4, and U12 is normative for its cells — plus a corrected harness claim.** (a) **§3's scope clause applied to U12.** §3 granted exactly one width-driven relaxation, and applied it only to U6 (glyph yes, `waiting on` text and queue count no). U12's "on the card **and** in the tasks panel" had no such clause, so its floor cell could only be stated by making an exception *in the generated matrix*. §4 U12 now says, normatively: *where the drawn card cannot carry it — below `MIN_CELL_WIDTH`, or at a usable width where `keymap.md` §2.7's ladder drops the receipt (usable 10–11) — the receipt is **not** required on the card and the tasks panel carries it (§3); the criterion is still asserted at that size, on the tasks panel, and the card's absence of a receipt is the contract, not a failure.* §3's paragraph now names both criteria as within the one relaxation, keyed to the drawn card. **The clause is not floor-only, and that is the substantive correction:** §2.7's frozen ladder drops the receipt glyph at usable 10–11, which is 100×30 (card 13, usable 11) — so U12's receipt is carried by the tasks panel at **two** pinned sizes, not one. The earlier draft of this entry and the first pass at the cells had 100×30 requiring both surfaces, which contradicted `keymap.md` §2.7 and would have encoded a false pass at that size; the cells now state the ladder's band explicitly (usable 17 at 120×40 and 21 at 80×24 carry the receipt; usable 11 at 100×30 and 3 at 60×16 do not). This is a deliberate criterion edit under rule 1, and it is **not a weakening**: U12 is still asserted at all four sizes, with the assertion moved to the surface that can physically draw the receipt, exactly as U6's queue count already was at the floor. (b) **U12 is normative.** §4.1's own rule is that §4 wins over a generated restatement; the floor's card-absence clause now lives in §4, so the matrix rows are a restatement of it rather than the authority for it. `docs/verification-matrix-ux.md` was corrected to match: its four U12 rows state the ladder band explicitly (usable 17 at 120×40 and 21 at 80×24 carry the receipt; usable 11 at 100×30 and 3 at 60×16 leave it to the tasks panel), and its §4.2 at-risk bullet now cites the clause instead of asserting a cell-level judgement. **Rejected alternative:** leaving the exception in the U12 @ 60×16 matrix cell and in the matrix's §4.2 prose while §4 U12 kept the unqualified "on the card and in the tasks panel". That was rejected because it inverts the file's hierarchy — a generated cell would be the de-facto definition of the criterion, §4 would contradict it, and a reader applying §4 as written would score a correct floor as a FAIL. Restating the criterion is the honest fix; making the cell the authority is not. (c) **`src/harness.rs:279`'s blanket claim corrected.** The comment above the attempt-bump assertion read "A retry of the same hand-off is a *different* delivery", which states a rule about *retries* when the assertion only establishes that a bumped `attempt` (with the same token) is a different delivery. As written it also contradicts the dedup case asserted three lines above it. The comment now says the narrower, true thing: a bumped attempt or a fresh token is a different delivery, while re-sending the same delivery (same tuple, same token) repeats the id, and a retry is deduplicated only if it preserves the token and the attempt. Only the comment changed; no assertion, function, or behaviour. (d) **The false "assertable today" claim is withdrawn.** `docs/verification-matrix-ux.md` §4.3, `docs/todos.md` and `docs/architecture.md` §14.3 all said U12's "re-sends the same id" was already assertable and only the visible receipt state was missing. It is not: `retry_or_abandon` bumps `attempt` (`src/app.rs:3429`) and re-sends through `send_to_employee` → `Outgoing::new`, which mints a **fresh** `delivery_token` (`src/app.rs:101-108`), with the kind changed to `PromptKind::Retry` (`:3446`) — three of the five inputs to `admission_id` differ, so the retry is admitted as a second message instead of being deduplicated. U12's dedup clause therefore needs a code change to preserve the original token/attempt/kind, not just a test. The harness test that pins the real guarantee is cited in §6 as-is and **adds no frozen name**: the frozen inventory stays **34 new names**, and the as-is citation count moves from 3 to 4 existing tests (§6 now reads **34 new + 4 existing**, 38 symbols). (e) **`docs/keymap.md`'s C5 corrected, because this revision cites it.** C5 read "the card carries it from 100×30 up (usable 11)", which contradicted `keymap.md` §2.7's own ladder — that ladder drops the receipt at usable 10–11, and 100×30's 13-wide card has usable 11. Since (a) makes U12's receipt a tasks-panel requirement at exactly those widths and points at C5, the citation would have sent a reader to the opposite rule. C5 now says the tasks panel carries the receipt wherever the ladder drops it (the floor and usable 10–11) and the card carries it only at usable ≥ 12 (120×40's 17, 80×24's 21); the change is logged as `keymap.md` rev 10. No binding, breakpoint, token, tier, or decision changed. No other criterion, marker, or cell status changed; all 48 cells remain `not evidenced`. |

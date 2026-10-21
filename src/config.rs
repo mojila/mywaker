@@ -12,6 +12,12 @@ pub struct Config {
     /// Working directory OpenCode sessions are rooted at. Defaults to the
     /// current directory when unset.
     pub workdir: Option<PathBuf>,
+    /// Whether every employee's OpenCode session is created up front when the
+    /// app connects, so a delegation hop starts instantly instead of paying an
+    /// on-demand `create_session` round-trip on the chain's critical path. Turn
+    /// off to keep sessions lazy (fewer live sessions, at the cost of a cold
+    /// start per first hand-off).
+    pub prewarm_sessions: bool,
     /// Optional Jev (System One) classifier settings.
     pub jev: JevConfig,
     /// Presentation settings.
@@ -118,6 +124,7 @@ impl Default for Config {
         Self {
             tick_rate: Duration::from_millis(100),
             workdir: None,
+            prewarm_sessions: true,
             jev: JevConfig::default(),
             ui: UiConfig::default(),
             schedules: Vec::new(),
@@ -269,6 +276,19 @@ mod tests {
         assert_eq!(cfg.watches[0].employee, "reviewer");
         assert_eq!(cfg.watches[0].goal, "Review the latest change to {path}");
         assert!(!cfg.watches[0].recursive);
+    }
+
+    #[test]
+    fn prewarm_sessions_is_enabled_by_default_and_disableable() {
+        // Absent from config → sessions are pre-warmed (the bottleneck-avoiding
+        // default), not left lazy.
+        let cfg: Config = toml::from_str("tick_rate = \"100ms\"\n").expect("parse config");
+        assert!(cfg.prewarm_sessions);
+
+        // An explicit `false` keeps sessions lazy.
+        let cfg: Config =
+            toml::from_str("tick_rate = \"100ms\"\nprewarm_sessions = false\n").expect("parse config");
+        assert!(!cfg.prewarm_sessions);
     }
 
     #[test]

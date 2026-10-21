@@ -307,6 +307,11 @@ consts; no per-frame allocation.
   a partial row is never drawn at the bottom of the viewport either.
   The same rule covers the horizontal axis: below a 12-column card the grid falls
   back to one full-width column instead of squeezing three unreadable ones.
+- The card's head row currently carries **glyph + name only** (`node_head`,
+  `src/ui/pipeline.rs:794`). The per-employee **queue depth** (`×<n>`) and the
+  delivery **receipt glyph** that [`keymap.md`](keymap.md) §6.4 freezes into that
+  row are specified but **not drawn** — see §14 for the contract, what exists
+  today, and why the suite being green is not evidence that it landed.
 
 ---
 
@@ -627,3 +632,128 @@ Interactive chat is the different case — re-entering an employee's chat contin
 chat's `session_id`, which is why the two paths must not be described as the same thing.
 Should task resume ever continue a session, it is recorded as future work in
 [`todos.md`](todos.md).
+
+---
+
+## 14. Per-employee queue surface (specified, not built)
+
+The roster answers "what is each employee doing" from the card alone. This section
+records the queue half of that contract — [`acceptance-ux.md`](acceptance-ux.md) U6
+and U12, drawn to [`keymap.md`](keymap.md) §2.7 and §6.4 — together with what the
+tree actually has. **It is specified, not implemented**; the two layers below must
+not be read as one.
+
+### 14.1 Two different queues, one name
+
+There are two mechanisms called "queue", and conflating them is the error this
+section exists to prevent:
+
+| | `Chat::queue_running` | `Delivery::Queue` |
+|---|---|---|
+| What it holds | prompts **mywaker** is holding | an instruction to **OpenCode** |
+| Where | `src/app.rs:182`, per employee, in memory | `src/opencode/mod.rs:28`, on the wire |
+| When it applies | the employee is mid-turn or its session is not ready | the service should admit behind the turn in flight |
+| Drained by | `pump_employee_queue` (`:2233`), one per completed turn | nothing — the service owns it |
+
+The first is why a prompt typed at a busy employee is never lost. The second is
+what mywaker *tells* the service once it is ready to send — `harness::delivery_for`
+is the single place that policy is decided, and a user's chat prompt steers while
+background hand-offs queue. Neither is a delivery receipt.
+
+### 14.2 The model layer (built)
+
+The queue model is complete and tested:
+
+- `App::can_prompt` (`src/app.rs:2202`) — ready session **and** not busy. Both
+  queue points gate on it, so "queue it instead of sending it" has one definition.
+- `App::enqueue_prompt` (`:2214`) — records the prompt, logs `queued for <name>`,
+  and asks for a session so the queue can drain once one exists.
+- `App::next_queued` (`:2247`) — pops the oldest prompt only when `can_prompt`
+  holds; otherwise `None`, leaving the queue intact.
+- `App::pump_employee_queue` (`:2233`) — sends at most one prompt per call, since
+  dispatch marks the employee `Thinking`. Hooked into transcript completion
+  (`:2789`), session creation (`:2110`), and delivery failure (`:3536`), so a turn
+  ending by any of those routes lets the next prompt through. `/new` clears the
+  queue with the old conversation (`:1863`).
+- `App::queued_prompts()` (`:4727`) — the **aggregate** depth, summed across chats.
+  The sidebar's inspector draws it as `session live · N queued`
+  (`src/ui/sidebar.rs:530-531`), but both numbers there are team-wide — `live_sessions()`
+  counts every live chat and `queued_prompts()` sums every queue — so the row is a
+  roll-up that happens to sit in the selected-employee block, not that employee's depth.
+
+There is deliberately **no per-employee accessor**: `queued_prompts()` is a sum,
+and a card cannot read its own depth without reaching into `App::chats`.
+
+### 14.3 The surface layer (card not built; panel built)
+
+The **card** rows below are not drawn and no test asserts them. The **tasks panel**
+half is built (Phase C, [`phase-b-queue-rows.md`](phase-b-queue-rows.md)); each line
+says which. The `×` claim in the card row below still holds: the panel draws `×N` in
+its group header, but `node_head` (`src/ui/pipeline.rs:794`) has no count span.
+
+| Required (U6 / U12) | Today |
+|---|---|
+| Card head `▶ Aria ◐ ×2` — receipt glyph and queue depth after the name | `node_head` (`src/ui/pipeline.rs:794`) emits glyph + space + name; no count span, no receipt span. The panel carries `×N`, but the card does not |
+| Activity row `waiting on <target>` when waiting on an employee or a session | the literal does not appear in `src/`; the row draws only the status word and the progress bar |
+| Activity row `stalled` after 30 s with no event | the literal does not appear in `src/` at all |
+| A `Receipt` state walking queued → sent → `acknowledged` → completed | no `Receipt` type and no `acknowledged` state in `App`, `Task`, or `Message` |
+| Retry re-sends the **same** admission id | the id is minted — `harness::admission_id` (`src/harness.rs:212`), prefix at `:188` — but the retry path does **not** reuse it: `retry_or_abandon` bumps `attempt` (`src/app.rs:3429`) and re-sends through `send_to_employee` → `Outgoing::new`, which mints a fresh `delivery_token` (`src/app.rs:101-108`), with the kind changed to `PromptKind::Retry` (`:3446`), so the service admits a second message instead of deduplicating. Both the visible receipt state and the id-preserving retry are missing |
+| The tasks panel as the floor's fallback carrier (`keymap.md` §8, C3) | **built** — the block's group header carries the employee's true depth as `×N`, and the block is height-capped at `⌊H/2⌋` so the board survives. The **receipt** half of the fallback is still missing with the receipt state itself |
+
+The width ladder that governs all of this is frozen in `keymap.md` §2.7 and is not
+restated here: both the count and the receipt survive at usable width 12–20, the
+receipt drops at 10–11 while `×<n>` stays, the name survives to 7–9, and at the
+60×16 floor the card is a 1-row frameless entry 3 columns wide where only the glyph
+is required.
+
+### 14.4 Why "the tests pass" does not mean this shipped
+
+At `296a163` the full suite was green — 490 passed, 0 failed, 4 ignored — and **no
+test in that run asserted any row of §14.3.** The five frozen symbols that would —
+`u6_card_names_what_it_waits_on`, `u6_stalled_after_30s_without_an_event`,
+`u12_receipt_walks_queued_to_completed`, `u12_retry_reuses_the_admission_id`
+(`tests/ux.rs`, which does not exist) and `card_keeps_its_glyph_below_twelve_columns`
+(`src/ui/pipeline.rs`) — are still absent from the tree. The two `harness` unit tests
+that do exist (`src/harness.rs:269`, `:315`) pin id stability for the *same* delivery
+and the required `msg_` prefix; neither covers the retry path, which mints a new id
+(§14.3).
+
+What that run was evidence for is the **model**: `send_prompt_queues_when_employee_is_busy`
+(`src/app/tests.rs:3729`), `next_queued_requires_idle_and_ready_session` (`:3751`),
+`pump_is_a_noop_without_a_client` (`:3778`),
+`enqueue_prompt_starts_a_session_once_and_keeps_the_queue` (`:3920`), and
+`aggregate_accessors_count_states` (`:4769`, pinning `queued_prompts()` at 3 across
+two chats). None of them draws a card.
+
+**What has landed since** is the tasks-panel block and its accessors, each with its
+own test: `queued_prompts_for_reads_one_employee`, `tasks_for_returns_one_employees_tasks_in_queue_order`,
+`held_tasks_counts_only_paused`, `unassigned_tasks_are_the_dash_group`,
+`the_block_never_outgrows_its_allowance`,
+`the_overflow_count_reconciles_with_the_group_depths`,
+`the_block_is_closed_by_one_blank_row`, `the_floor_draws_a_whole_queue_as_one_count`
+and `the_floor_keeps_the_held_row_beside_the_count`. That is the panel half of §14.3
+closed; the card rows and the receipt remain open, which is why
+`acceptance-ux.md` §4.1 still records **0/48** cells evidenced — §7 rule 2 forbids
+filling one on inspection, and none of the five frozen symbols exists yet.
+
+### 14.5 What would close it
+
+The acceptance gate for this surface is frozen in
+[`acceptance-ux.md`](acceptance-ux.md) §4 as U6 and U12, and restated as a
+milestone gate in [`todos.md`](todos.md) M9 §"Acceptance". In dependency order:
+
+1. **Per-employee depth** — an accessor beside `queued_prompts()`, since a card
+   cannot reach into `App::chats` (§14.2).
+2. **Receipt state** — a `Receipt` on the delivery path (`Message`/`App`), walking
+   queued → sent → `acknowledged` → completed. The id *format* and its
+   same-delivery stability already exist (`harness::admission_id`,
+   `src/harness.rs:212`), but stability is not reuse: the retry path currently
+   bumps `attempt` and mints a fresh `delivery_token`, so it must also change to
+   preserve the tuple and the token before U12's dedup clause can hold (§14.3).
+3. **The card** — the head spans (`×<n>`, receipt glyph) and the activity row
+   (`waiting on <target>`, `stalled`), drawn to the §2.7 ladder rather than to a
+   fixed layout, so each width drops what the ladder says it drops.
+4. **The tasks panel** — the floor's carrier for the count and the receipt
+   (`keymap.md` §8 C3/C5), which does not exist yet.
+5. **Evidence** — the five frozen symbols, then a reviewer run that fills the
+   matrix. Step 5 is not the writer's, and no box flips before it.

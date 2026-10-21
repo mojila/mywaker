@@ -25,24 +25,26 @@ be read the same way.
 > changing a criterion is **rule 1** (rule 3 is the sidebar-budget boundary, which
 > this file does not invoke).
 
-**Provenance.** Regenerated from `docs/acceptance-ux.md` at `shasum a04cf603…`
-(85,791 bytes), the **rev 15** revision. Its eight tree-pin hashes were each
-re-verified against the working tree and all eight match: `src/app.rs`
-`a95d056f`, `src/ui/mod.rs` `4402b0e5`, `src/ui/layout.rs` `c1fdd460`,
-`src/ui/hit.rs` `6f9bfb21`, `src/ui/sidebar.rs` `36dfd841`,
-`src/ui/pipeline.rs` `a39e722e`, `src/ui/tasks.rs` `cb5a9772`, `src/team.rs`
-`fc4d28ea`. The source tree is unchanged since the suite run cited in §7.
+**Provenance.** Regenerated from `docs/acceptance-ux.md` at `shasum 26347292…`
+(96,606 bytes), the **rev 17** revision. The eight tree-pin hashes it records were
+verified against the working tree at the previous pin and are unaffected by rev
+17, which changes no source file except one comment: `src/app.rs` `a95d056f`,
+`src/ui/mod.rs` `4402b0e5`, `src/ui/layout.rs` `c1fdd460`, `src/ui/hit.rs`
+`6f9bfb21`, `src/ui/sidebar.rs` `36dfd841`, `src/ui/pipeline.rs` `a39e722e`,
+`src/ui/tasks.rs` `cb5a9772`, `src/team.rs` `fc4d28ea`. The retry comment corrected
+in rev 17 sits in `src/harness.rs`, which carries no pin hash.
 
-> **Pin note.** The pinned bytes (`a04cf603`, 85,791) contain **rev 15**. Earlier
+> **Pin note.** The pinned bytes (`26347292`, 96,606) contain **rev 17**. Earlier
 > passes of this file were labelled "rev 3" over bytes that already contained rev
 > 4, then "rev 12" over bytes containing rev 13, and were asked to target rev 8,
 > rev 9 (`776df44b`) and rev 11 (`ae103994`) at various points — a revision
 > *number* is a label that drifts when the spec is edited concurrently, whereas the
 > `shasum` and byte count are reproducible. Revs 10–15 changed no criterion, no
-> cell and no pass condition (they corrected citations, stale §8/§5 statements,
-> rev 5's overstated "no pass condition changed", and §6's inventory count), so the
-> 48 cells below are identical to what rev 9 would have produced — verified by
-> script, 48/48 byte-identical.
+> cell and no pass condition, and the 48 cells were byte-identical to what rev 9
+> would have produced, verified by script. **Rev 17 does change cells**: U12 gained
+> §3's scope clause in §4, and all four U12 rows were restated to carry it — the
+> other 44 rows are unchanged, and all 48 still match §4.1 byte-for-byte, verified
+> by script at the bytes above.
 
 The 48 rows in §3 below are **extracted from §4.1 by script, not retyped**
 (`acceptance-ux.md` §7 rule 5). If the two ever differ, this file is stale and is
@@ -256,10 +258,10 @@ Status vocabulary: **`not evidenced`** (no test exists; §6 name frozen) ·
 
 | ID | Size | Pass condition at this size | Observable | Evidence |
 |---|---|---|---|---|
-| U12 | 120×40 | Every prompt shows queued → sent → `acknowledged` → completed per employee, **on the card and in the tasks panel**; a failed delivery offers in-place retry; retry re-sends the **same** admission id. | buffer + model | `u12_receipt_walks_queued_to_completed` · `u12_retry_reuses_the_admission_id` — **not evidenced** |
-| U12 | 100×30 | As above; card 13 wide — the receipt must be a glyph/word that fits, with the tasks panel (32) carrying the full text. | buffer | same symbols — **not evidenced** |
-| U12 | 80×24 | As above; card 23 wide, tasks panel 32 — both surfaces must show it. | buffer | same symbols — **not evidenced** |
-| U12 | 60×16 | As above; the card is a 1-row frameless 3-column entry, so a receipt glyph would make it 4 cells and cannot be drawn there (`docs/keymap.md` §5.5, §8 C5). The **tasks panel** (32 of 60) is the surface that must carry `acknowledged`; the card carries no receipt at this size, and that absence is the contract, not a failure. | buffer + tasks panel | same symbols — **not evidenced** |
+| U12 | 120×40 | Every prompt shows queued → sent → `acknowledged` → completed per employee, **on the card and in the tasks panel**; a failed delivery offers in-place retry; retry re-sends the **same** admission id. The card is 19 wide, usable 17, inside §2.7's 12–20 band where the head row carries the receipt — so §3's scope clause does not apply and both surfaces are required. | buffer + model | `u12_receipt_walks_queued_to_completed` · `u12_retry_reuses_the_admission_id` — **not evidenced** |
+| U12 | 100×30 | §3's scope clause applies here too: card 13 wide, usable 11, and [`keymap.md`](keymap.md) §2.7's ladder drops the receipt glyph at usable 10–11 (`▶ Aria ×2`, no receipt). So the **tasks panel** (32) must carry `acknowledged`; the card carries the count and the name, and its absence of a receipt is the contract. | buffer + tasks panel | same symbols — **not evidenced** |
+| U12 | 80×24 | As above; card 23 wide (single-column fallback), usable 21, inside §2.7's ≥21 band — the receipt and the count both fit, so both surfaces are required and §3's scope clause does not apply. | buffer | same symbols — **not evidenced** |
+| U12 | 60×16 | §3's scope clause applies to U12: the card is a 1-row frameless 3-column entry, so a receipt glyph would make it 4 cells and cannot be drawn there (`docs/keymap.md` §5.5, §8 C5). The receipt is therefore **not** required on the card; the **tasks panel** (32 of 60) is the surface that must carry `acknowledged`, and the card's absence is the contract, not a failure. | buffer + tasks panel | same symbols — **not evidenced** |
 
 ---
 
@@ -295,11 +297,17 @@ obligation — a strengthening, not a neutral edit.
 - **U11 @ 60×16** — class + id + cause + action in 60 columns on a 4-row band. If
   the row must be ellipsised, the class must be what survives (it is the
   load-bearing token); the test should assert the class, not the whole string.
-- **U12 @ 60×16** — **the card cannot carry the receipt at the floor** (C5): the
-  entry is 3 usable columns and a receipt glyph would make it 4. The **tasks panel**
-  (32 of 60) is the surface that must carry `acknowledged`; asserting "on the card"
-  at this size is a false pass waiting to happen, so the cell is asserted per
-  surface, with the card's *absence* of a receipt as the contract.
+- **U12 @ 60×16 and 100×30** — the card cannot carry the receipt at either size,
+  and since rev 17 that is not a cell-level judgement but **U12's own scope
+  clause** (§3): at the floor the entry is 3 usable columns and a receipt glyph
+  would make it 4 (C5); at 100×30 the card is 13 wide → usable 11, and
+  `keymap.md` §2.7's frozen ladder drops the receipt at usable 10–11 (`▶ Aria ×2`).
+  The criterion therefore requires the tasks panel (32 of 60 / 32 of 100) to carry
+  `acknowledged` and does not require the receipt on the card at either size.
+  Asserting "on the card" there is a false pass waiting to happen, so the cell is
+  asserted per surface, with the card's *absence* of a receipt as the contract.
+  At 120×40 (usable 17) and 80×24 (usable 21) the ladder keeps the receipt, so both
+  surfaces are required and no clause applies.
 - **U6 @ 60×16** — same shape (C3): the queue count is carried by the tasks panel,
   not the card. A test that greps the card for `×2` will fail against a correct
   floor; a test that greps the *tasks panel* is the right one.
@@ -340,13 +348,15 @@ current, not inherited.
 | Per-mode focus-mode rect read-back | U7 | not present — no `focus_mode`/`FocusMode` anywhere in `src/`; `ui::team_area`/`sidebar_area` return the resting rects only |
 | Connection state (`connected`/`reconnecting`/`down`) | U10 | not present — no such state in `src/`; connection is a glyph (B9) |
 | Receipt **state** (`queued → sent → acknowledged → completed`) | U12 | not present — no `Receipt`/`acknowledged` state in `App`, `Task`, or `Message` |
-| Admission-id minting | U12 | **exists** — `harness::admission_id` (`src/harness.rs:212`), with `ADMISSION_PREFIX` (`:188`) and the stability rule its own unit tests pin (`:269`, `:311`). U12's "re-sends the same id" is assertable today; only the *visible* receipt state is missing |
+| Admission-id minting | U12 | **exists, but the retry does not reuse it** — `harness::admission_id` (`src/harness.rs:212`) with `ADMISSION_PREFIX` (`:188`) and same-delivery stability pinned by its unit tests (`:269`, `:315`). The retry path is not that case: `retry_or_abandon` bumps `attempt` (`src/app.rs:3429`) and re-sends through `send_to_employee` → `Outgoing::new`, which mints a **fresh** `delivery_token` (`src/app.rs:101-108`), with the kind changed to `PromptKind::Retry` (`:3446`) — three of the five id inputs differ, so the retry gets a different id and the service admits a second message rather than deduplicating. `src/harness.rs:279` said this as a blanket claim ("a retry of the same hand-off is a *different* delivery"), corrected in `acceptance-ux.md` rev 17 to the narrower true statement. U12's "re-sends the same id" is therefore **not** assertable today: the visible receipt state is missing *and* the retry path must be changed to preserve the original token, attempt, and kind |
 | Error class + stable id | U11 | `push_error_log` takes a free-form `String` (`src/app.rs:4231`) — B8 |
 
 **Two line-number corrections against an earlier draft of this file** (recorded,
 not silently fixed): `ADMISSION_PREFIX` is at `src/harness.rs:188`, not `:182`, and
-the uniqueness rule is evidenced by the unit tests at `:269`/`:311`, not by a
-`:195-204` range. The seam itself is unaffected.
+the uniqueness rule is evidenced by the unit tests at `:269`/`:315`, not by a
+`:195-204` range. The seam itself is unaffected. (The prefix test read `:311`
+before spec rev 17; the four comment lines rev 17 added above the attempt-bump
+assertion shifted it to `:315`, which is where `docs/architecture.md` cites it.)
 
 **Marker-absence re-check.** §2's "absent today" column was re-measured on
 `src/ui/` for this revision. All of `actions`, `focus mode`, `hidden`,
@@ -359,12 +369,14 @@ is asserted on structure rather than on a substring.
 
 ### 4.4 Frozen-name coverage — 29 of 34 new names back a cell
 
-`acceptance-ux.md` §6 lists **37 symbols: 34 new names plus 3 pre-existing tests
+`acceptance-ux.md` §6 lists **38 symbols: 34 new names plus 4 pre-existing tests
 cited as guards** (rev 9 added `u5_notice_survives_the_thinking_state`, making 32
 new where there were 31; rev 10 added the two `main`-height guards; rev 15 added
 `u4_help_search_filters_in_place` and `u4_help_dismiss_key_has_no_side_effects`,
-making 34). The audit below covers the **34 new names**, because only those are
-obligations — the 3 guards already exist and are cited to stay green, so they can
+making 34; rev 17 added `admission_ids_are_stable_per_delivery_and_distinct_across_deliveries`,
+`src/harness.rs:269`, as the fourth guard). The audit below covers the **34 new
+names**, because only those are
+obligations — the 4 guards already exist and are cited to stay green, so they can
 back no cell by construction. Scripted cross-check against the 48 cells in §3 — and
 **only** §3, since a citation means a cell cites the symbol: **29 of 34 new names
 back a cell; 3 are named only in §4.3's seam table; 2 are named by no cell.**
@@ -375,8 +387,16 @@ back a cell; 3 are named only in §4.3's seam table; 2 are named by no cell.**
 | **Named only in §4.3's seam table** | **3** | `every_action_has_a_label_and_a_context`, `action_ids_are_unique`, `deprecated_bindings_still_resolve` — all `src/ui/actions.rs` |
 | **Named by no cell** | **2** | `hint_bar_keeps_the_help_hint` (`src/ui/mod.rs` — U3(c) at unit level), `u5_notice_survives_the_thinking_state` (`tests/ux.rs` — the reserved-row seam, see below) |
 | | **34** | new names audited |
-| **Pre-existing guards (outside this audit)** | **3** | `clicking_outside_a_target_keeps_the_selection` (`src/app/tests.rs:4219`), `the_prompt_band_does_not_shrink_the_panels` (`src/app/tests.rs:2205`), `the_roster_prompt_band_comes_out_of_the_log` (`src/ui/layout.rs:213`) — all exist; cited to stay green, not to evidence a cell |
-| | **37** | total §6 symbols |
+| **Pre-existing guards (outside this audit)** | **4** | `clicking_outside_a_target_keeps_the_selection` (`src/app/tests.rs:4219`), `the_prompt_band_does_not_shrink_the_panels` (`src/app/tests.rs:2205`), `the_roster_prompt_band_comes_out_of_the_log` (`src/ui/layout.rs:213`), and — added in rev 17 — `admission_ids_are_stable_per_delivery_and_distinct_across_deliveries` (`src/harness.rs:269`) — all exist; cited to stay green, not to evidence a cell |
+| | **38** | total §6 symbols |
+
+**Rev 17 added the fourth guard without adding a frozen name.**
+`admission_ids_are_stable_per_delivery_and_distinct_across_deliveries`
+(`src/harness.rs:269`) already exists, so §6 cites it as-is: it backs no cell and
+is not one of the 34 obligations, which is why the audit above is unchanged at
+**34 new names** while the as-is inventory reads **34 new + 4 existing** (38
+symbols). It guards a *claim*, not a surface — the corrected admission-id claim
+behind U12's dedup clause (§4.3).
 
 **Rev 15 moved `help_overlay_is_a_window` into the cited column.** It was
 previously "named by no cell"; it is now cited by all four U4 cells because the
@@ -512,7 +532,7 @@ measurement.
 | **C2** | `acceptance-ux.md` U6 + U6 @ 100×30 | At 13 columns (usable 11) the **marker** `waiting on` (10) is required and the **target** drops. "Ellipsised, never dropped" could not hold: marker + one target character is 12 > 11. |
 | **C3** | `acceptance-ux.md` U6 + U6 @ 60×16 | At the floor the **glyph** is required; the **queue count** is carried by the tasks panel. `▶ ×2` is 4 cells against 3 usable, so "glyph **and** count" was impossible. |
 | **C4** | already closed (§4.1) | U5/U9 unblocked at 60×16 by the notice row. |
-| **C5** | `acceptance-ux.md` U12 + U12 @ 60×16 | The **tasks panel** carries the receipt at the floor; the card carries none, because a receipt glyph makes the entry 4 cells against 3. |
+| **C5** | `acceptance-ux.md` U12 + U12 @ 60×16 and 100×30 | The **tasks panel** carries the receipt wherever the card cannot: at the floor, because a receipt glyph makes the entry 4 cells against 3; at 100×30, because `keymap.md` §2.7's ladder drops the receipt at usable 10–11. Since spec rev 17 this is **U12's own §3 scope clause**, not a cell-level amendment. |
 | **C6** | `acceptance-ux.md` §3 + this matrix §1 | The 60×16 `card` cell now reads `3 · rows 1`, marked **frameless at the floor**. |
 
 **The 60×16 column is where a false pass was most likely, and the re-run found
@@ -612,7 +632,7 @@ Not per size — skeleton only, so the slots exist before T1.1.
 
 | Run | Date | Sizes | Result | Notes |
 |---|---|---|---|---|
-| — | — | — | **skeleton** | 48 cells defined, 0 filled, 48 `not evidenced`, 0 `blocked` (rev 5 decided the last two). Regenerated at rev 13 of the spec; rev 9's reserved-row clause is carried in the U5/U9 @ 60×16 cells. |
+| — | — | — | **skeleton** | 48 cells defined, 0 filled, 48 `not evidenced`, 0 `blocked` (rev 5 decided the last two). Regenerated at **rev 17** of the spec; rev 9's reserved-row clause is carried in the U5/U9 @ 60×16 cells, and rev 17's U12 scope clause in the four U12 cells. |
 
 ### Suite claim in `acceptance-ux.md` §8 — **confirmed**
 
@@ -650,5 +670,5 @@ fill a cell at all.
 | 5 | Notice row implemented in the log band, **reserved** while thinking (`notice.is_none()` term in `Regions::of`) | **open** (rev 9) |
 | 6 | Focus-mode rect read-back for U7 | **open** |
 | 7 | Connection state for U10 | **open** |
-| 8 | Receipt state for U12 (admission id already exists) | **partly open** |
+| 8 | Receipt state for U12, **and** a retry path that reuses the admission id | **open** — the id is minted (`src/harness.rs:212`) but the retry bumps the attempt and mints a fresh token (`src/app.rs:3429`, `:101-108`, `:3446`), so it does not reuse it (spec rev 17, §4.3) |
 | 9 | U4's `searchable /` and "any dismiss key closes it without side effects" have a frozen §6 name (or §4 U4 drops them) — §4.4.1 | **closed** (spec rev 15: two names added, U4 unchanged) |

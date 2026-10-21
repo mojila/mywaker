@@ -222,6 +222,190 @@ against out-of-band context.
 
 ---
 
+## M9 — Per-employee queue surface (U6 · U12)
+
+> **Acceptance note.** Spec: [`acceptance-ux.md`](acceptance-ux.md) U6 and U12,
+> drawn to [`keymap.md`](keymap.md) §2.7 (the card ladder) and §6.4 (the card row
+> grammar), with the tasks panel's row grammar in
+> [`phase-b-queue-rows.md`](phase-b-queue-rows.md). **Status: the model layer and the
+> tasks-panel queue block are built and green; the card surface is not.** The
+> milestone stays open. No box flips on inspection: each needs a symbol that exists
+> *and* was observed passing (`acceptance-ux.md` §7 rule 2). The gate is stated once,
+> below, in this milestone's own **Acceptance** subsection.
+
+The surface has three parts: the prompt **model** (built), the **tasks-panel queue
+block** (built — Phase C), and the **card** surface (not built).
+
+**What the user must be able to read off the roster.** While an employee is
+`Working`, its card answers three questions without opening chat: *what is it
+waiting on* — `waiting on <target>`, when the wait is on another employee or a
+session; *how much is stacked behind it* — `×<n>`, the prompt depth; and *is it
+stuck* — `stalled`, after 30 s with no event. Separately, every prompt carries a
+delivery receipt — queued → sent → `acknowledged` → completed — drawn per employee
+on the card and in the tasks panel, and a failed delivery offers an in-place retry
+that re-sends the **same** admission id, so the service deduplicates it and a
+retried prompt is never delivered twice (U12).
+
+**Where each part is drawn is width-dependent**, and the ladder is frozen in
+`keymap.md` §2.7: at usable width ≥ 21 the head reads `▶ Aria ◐ ×2` with
+`waiting on researcher` on the activity row; 12–20 keeps both and ellipsises the
+target; 10–11 drops the receipt but keeps `×2` and the bare marker `waiting on`;
+7–9 drops both and keeps the name; 4–6 and below keep the glyph. At the 60×16 floor
+the card is a 1-row frameless entry 3 columns wide, so the **glyph** is the only
+required part there and the count and receipt are carried by the tasks panel
+(`keymap.md` §8, C3).
+
+- [x] 💻 **Per-employee prompt queue (model).** `Chat::queue_running: Vec<String>`
+  (`src/app.rs:182`) holds the prompts typed while an employee is mid-turn or its
+  session is not yet ready. One predicate gates both queue points — `App::can_prompt`
+  (`:2202`, ready session **and** not busy) — so "queue it instead of sending it" has
+  one definition. `App::enqueue_prompt` (`:2214`) records the prompt, logs
+  `queued for <name>`, and asks for a session; `App::next_queued` (`:2247`) pops the
+  oldest only when `can_prompt` holds; `App::pump_employee_queue` (`:2233`) drains
+  one prompt per completed turn, hooked into transcript completion (`:2789`), session
+  creation (`:2110`), and delivery failure (`:3536`). `/new` drops the queue with the
+  old conversation (`:1863`).
+- [x] 💻 **Admission policy (separate layer, already built).** `Delivery::{Steer,Queue}`
+  (`src/opencode/mod.rs:28`) is the wire-level knob — `steer` interrupts the running
+  turn, `queue` admits behind it — and `harness::delivery_for` is the one place the
+  choice is made. This is *not* the same thing as `queue_running`: one is what
+  OpenCode is told, the other is what mywaker holds before it can tell it anything.
+- [x] 💻 **Aggregate readout (model + sidebar).** `App::queued_prompts()` (`:4727`)
+  sums `queue_running` across chats, and the sidebar's inspector draws it as
+  `session live · N queued` (`src/ui/sidebar.rs:530-531`). Both figures there are
+  **team-wide**: `live_sessions()` counts every live chat and `queued_prompts()` sums
+  every queue, so the row reads as a roll-up even though it sits in the
+  selected-employee block. It is not a per-employee depth and is not drawn on any
+  card.
+- [ ] 💻 **Card head: queue depth `×<n>` and the receipt glyph.** Not built.
+  `node_head` (`src/ui/pipeline.rs:794`) emits exactly glyph + space + name; there is
+  no count span, no receipt span, and no rendered `×` anywhere in `src/` (the
+  character appears only in comments describing terminal sizes).
+- [ ] 💻 **Card activity row: `waiting on <target>` and `stalled`.** Not built.
+  Neither literal appears in `src/`; the activity row draws only the status word and
+  the progress bar.
+- [x] 💻 **Per-employee queue accessors.** `App::queued_prompts_for(employee)`
+  (`src/app.rs`) is the per-employee counterpart of `queued_prompts()`, so a card or
+  a row can read its own depth instead of reaching into `App::chats`;
+  `App::tasks_for(employee)` returns that employee's persisted tasks in the panel's
+  own order, `App::held_tasks()` counts `Paused` only (not `Pending` behind a paused
+  gate, not `Retrying`), and `App::unassigned_tasks()` is the `—` group. Pinned by
+  `queued_prompts_for_reads_one_employee`, `tasks_for_returns_one_employees_tasks_in_queue_order`,
+  `held_tasks_counts_only_paused` and `unassigned_tasks_are_the_dash_group`.
+- [x] 💻 **Tasks-panel queue block** — the block now draws the per-employee queue
+  proper, to [`phase-b-queue-rows.md`](phase-b-queue-rows.md): a group header per
+  employee carrying its **true** depth (`● Aria ×3`), one glyph-led row per task
+  with the frozen status word (`▷ running  <goal>`), a single `+N more` overflow row
+  in the detail column, a trailing held row (`⏸ paused  ×3`), a closing blank, and a
+  height cap at `⌊H/2⌋` so the board can never be pushed off the panel. Every row
+  sums to the panel's 30 usable cells. Pinned by
+  `the_block_never_outgrows_its_allowance`,
+  `the_overflow_count_reconciles_with_the_group_depths`,
+  `the_block_is_closed_by_one_blank_row`,
+  `the_floor_draws_a_whole_queue_as_one_count`,
+  `the_floor_keeps_the_held_row_beside_the_count`,
+  `renders_a_mixed_queue_with_groups_overflow_and_held_row`, and the row-grammar unit
+  tests in `src/ui/tasks.rs`.
+- [ ] 💻 **Delivery receipt state** (`queued → sent → acknowledged → completed`).
+  Not built — there is no `Receipt` type and no `acknowledged` state in `App`,
+  `Task`, or `Message`. The id a retry must reuse is minted by
+  `harness::admission_id` (`src/harness.rs:212`, prefix at `:188`), but the retry
+  path does **not** reuse it today: `retry_or_abandon` bumps `attempt`
+  (`src/app.rs:3429`) and re-sends through `send_to_employee` → `Outgoing::new`,
+  which mints a fresh `delivery_token` (`src/app.rs:101-108`), with the kind set
+  to `PromptKind::Retry` (`:3446`). So a retry is admitted as a new message rather
+  than deduplicated — this is a code change, not only a missing test.
+- [x] 💻 **Tasks-panel host for the queue count** — the block's group header carries
+  the employee's true depth as `×N`, which is U6's queue count on this panel and the
+  reason `keymap.md` §8 C3 puts the count here at the 60×16 floor. The **receipt**
+  half of that fallback is still missing with the receipt state itself (below).
+- [ ] 💻 **Card head: queue depth `×<n>` and the receipt glyph.** Not built on the
+  **card**. `node_head` (`src/ui/pipeline.rs:794`) emits exactly glyph + space +
+  name; there is no count span and no receipt span. The count now has a host in the
+  tasks panel (above), so U6's clause is satisfied on a surface — but not on the
+  card at the widths where `keymap.md` §2.7 says it belongs there.
+- [ ] 💻 **Card activity row: `waiting on <target>` and `stalled`.** Not built.
+  Neither literal appears in `src/`; the activity row draws only the status word and
+  the progress bar.
+- [ ] 🧪 **The five frozen symbols.** None exists:
+  `u6_card_names_what_it_waits_on`, `u6_stalled_after_30s_without_an_event`,
+  `u12_receipt_walks_queued_to_completed`, `u12_retry_reuses_the_admission_id` (all
+  `tests/ux.rs`, which does not exist), and `card_keeps_its_glyph_below_twelve_columns`
+  (`src/ui/pipeline.rs`). `u12_retry_reuses_the_admission_id` is not test-only
+  work: the behaviour it asserts does not exist, because the retry mints a new id
+  (above). The harness's own id test
+  `admission_ids_are_stable_per_delivery_and_distinct_across_deliveries`
+  (`src/harness.rs:269`) does exist, but it pins the narrower same-delivery
+  stability, so it is cited as-is rather than counted as this symbol.
+- [x] 🧪 **The queue model's own tests, which do pass** — `send_prompt_queues_when_employee_is_busy`
+  (`src/app/tests.rs:3729`), `next_queued_requires_idle_and_ready_session` (`:3751`),
+  `pump_is_a_noop_without_a_client` (`:3778`),
+  `enqueue_prompt_starts_a_session_once_and_keeps_the_queue` (`:3920`), and
+  `aggregate_accessors_count_states` (`:4769`, which pins `queued_prompts()` at 3
+  across two chats). These cover the **model**, and not one of them draws a card.
+
+**Why a green suite does not close this.** The full suite passes at `296a163` — 490
+passed, 0 failed, 4 ignored; `cargo fmt --check` and `clippy -D warnings` clean — but
+**no test asserts any of the unticked clauses above**. Green here means the queue
+*model* still works; it is not evidence that the surface was drawn, which is why
+`acceptance-ux.md` §4.1 still records **0/48** evidenced. The reviewer's run 2, not
+this checklist, is what may flip a box.
+
+### Acceptance
+
+The criteria for this milestone are frozen in [`acceptance-ux.md`](acceptance-ux.md)
+§4 — **U6** (card legibility) and **U12** (delivery receipts) — and drawn to
+[`keymap.md`](keymap.md) §2.7 (the card ladder) and §6.4 (the card row grammar).
+The reviewer verifies against those files, not against out-of-band context; this
+section records the contract and the evidence rule, and claims nothing the tree
+cannot show.
+
+**What "accepted" means here.** Each of the three readings must be answerable from
+the card alone, at the four pinned sizes (`acceptance-ux.md` §3), with the width
+relaxation belonging to the criteria and not to the implementation
+(`acceptance-ux.md` §4 U6 and U12, `keymap.md` §8 C3/C5 — the card keeps its glyph,
+and the **tasks panel** carries the count and the receipt wherever the card cannot:
+the 60×16 floor, and 100×30's usable 11):
+
+- `waiting on <target>` while the employee waits on another employee or a session;
+- `×<n>` when prompts are stacked behind it;
+- `stalled` after 30 s with no event.
+
+U12 adds the delivery receipt per employee — queued → sent → `acknowledged` →
+completed, on the card *and* in the tasks panel, except where the card cannot hold
+it: below `MIN_CELL_WIDTH` and at usable width 10–11 the tasks panel carries it
+alone (`acceptance-ux.md` §3's scope clause) — with an in-place retry that re-sends
+the **same** admission id, so the service deduplicates it and a retried prompt is
+never delivered twice. The retry does **not** yet do that: it bumps the attempt and
+mints a fresh token (see the delivery-receipt item above).
+
+**How a clause is evidenced.** Only by a test symbol that exists *and* was observed
+passing, cited with test name, file:line, and output (`acceptance-ux.md` §7
+rule 2). The 48-cell matrix is the tester's to generate (§7 rule 5); editing a cell
+by hand is a bug, and a cell with no covering test is recorded *not evidenced*
+rather than marked pass on inspection.
+
+**The gate is five symbols**, none of which is in the tree:
+`u6_card_names_what_it_waits_on`, `u6_stalled_after_30s_without_an_event`,
+`u12_receipt_walks_queued_to_completed`, `u12_retry_reuses_the_admission_id` (all
+`tests/ux.rs`, which does not exist) and
+`card_keeps_its_glyph_below_twelve_columns` (`src/ui/pipeline.rs`). Until they
+exist and pass, every **card-surface** box in this milestone stays unticked. The
+ticked boxes describe the model layer and the tasks-panel block, both complete and
+green — but a milestone is accepted whole, and the criteria are written about the
+card as well.
+
+**Status: 0 of 48 cells evidenced** — all 48 *not evidenced* in `acceptance-ux.md`
+§4.1, with no §6 symbol resolving. The milestone is therefore **open by
+construction**, not by neglect: the model layer and the tasks-panel block are
+complete and green; the card surface and the delivery receipt are not built.
+Closing it needs, in order: `Receipt` state on `Message`/`App` with an id-preserving
+retry, the two card rows and the head spans drawn to the §2.7 ladder, the receipt's
+host on the tasks panel, and then the five symbols plus a reviewer run that fills
+the matrix.
+
+---
+
 ## Definition of done (each milestone)
 
 - [x] Compiles with `cargo build`

@@ -116,6 +116,24 @@ pub fn thinking_indicator(
     (status == EmployeeStatus::Thinking).then(|| thinking_line(tick, tail, width))
 }
 
+/// The frozen glyph for a persisted task's status (`keymap.md` §2.6).
+///
+/// `Running` is `▷`, deliberately **not** `▶`: the tasks panel draws the
+/// employee's `▶` in the same surface, so a task's mark must differ or the two
+/// states would collide within one panel (§2.7 rule 1). `Paused`/`Retrying`
+/// share a colour but not a glyph; `Succeeded`/`Failed` share `✓`/`✕` with the
+/// employee's `Done`/`Error`, which §2.6 allows because the blocks are separate.
+pub fn task_glyph(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "○",
+        TaskStatus::Running => "▷",
+        TaskStatus::Paused => "⏸",
+        TaskStatus::Retrying => "◐",
+        TaskStatus::Succeeded => "✓",
+        TaskStatus::Failed => "✕",
+    }
+}
+
 /// The accent colour for a persisted task's status (the queue panel).
 pub fn task_color(status: TaskStatus) -> Color {
     match status {

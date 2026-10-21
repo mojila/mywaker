@@ -91,6 +91,12 @@ pub enum Mode {
 /// The `token` is minted here, once, so a re-flush of this exact queued prompt
 /// re-sends the same admission id (the service deduplicates it) while the next
 /// prompt — even to the same employee — gets a fresh one.
+///
+/// That is what makes a **resend** idempotent: the queued `Outgoing` keeps its
+/// token, so a delivery that never landed is offered again under the same
+/// admission id and the service cannot admit the same work twice. The token is
+/// deliberately *not* reused when a silent worker is asked again — that is new
+/// work, and it goes through [`Outgoing::new`] like any other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Outgoing {
     kind: harness::PromptKind,
@@ -99,6 +105,8 @@ struct Outgoing {
 }
 
 impl Outgoing {
+    /// A **new** delivery: mints its own token, so it can never collide with a
+    /// delivery already admitted.
     fn new(kind: harness::PromptKind, text: impl Into<String>) -> Self {
         Self {
             kind,
@@ -907,6 +915,9 @@ impl App {
                 self.client = Some(client);
                 self.server_info = Some(info);
                 self.push_log(format!("connected to OpenCode v{version}"));
+                if self.config.prewarm_sessions {
+                    self.prewarm_sessions();
+                }
             }
             Message::ConnectionFailed(reason) => {
                 self.connection_error = Some(reason.clone());
@@ -2035,6 +2046,29 @@ impl App {
         self.load_transcript(employee, id);
     }
 
+    /// Create a session for every employee up front, so the first delegation hop
+    /// to any of them starts instantly instead of paying an on-demand
+    /// `create_session` round-trip on the chain's critical path. Idempotent —
+    /// [`Self::begin_session`] skips anyone who already has (or is making) a
+    /// session — and gated by `config.prewarm_sessions`. Each session creation is
+    /// spawned independently, so they warm concurrently rather than one at a time.
+    fn prewarm_sessions(&mut self) {
+        if self.client.is_none() {
+            return;
+        }
+        let count = self.team.employees().len();
+        if count == 0 {
+            return;
+        }
+        self.push_log(format!("pre-warming {count} sessions…"));
+        for employee in 0..count {
+            // Ensure the chat entry exists so `begin_session` records `creating`
+            // and `handle_session_created` can store the returned session id.
+            self.chats.entry(employee).or_default();
+            self.begin_session(employee);
+        }
+    }
+
     /// Create the OpenCode session backing `employee`'s chat. A no-op when one
     /// already exists or is already being created, so callers may ask
     /// unconditionally.
@@ -2277,7 +2311,6 @@ impl App {
             session_id,
             prompt,
             harness::PromptKind::UserPrompt,
-            0,
             &harness::delivery_token(),
         );
     }
@@ -2289,7 +2322,10 @@ impl App {
     /// [`harness::delivery_for`]) and the admission id, so a resend of the same
     /// logical delivery is deduplicated rather than admitted twice. `token` is
     /// the delivery's identity: the same token re-sends the same admission id,
-    /// a new token makes a new delivery.
+    /// a new token makes a new delivery. The retry **attempt** is deliberately
+    /// not an argument here — it is the sender's budget, not part of what is
+    /// being delivered, and folding it into the id made every resend a new
+    /// admission.
     ///
     /// A transport error comes back as [`Message::DeliveryFailed`], so the
     /// caller's retry and queue logic sees it as the turn ending badly rather
@@ -2300,7 +2336,6 @@ impl App {
         session_id: String,
         prompt: String,
         kind: harness::PromptKind,
-        attempt: u8,
         token: &str,
     ) {
         let Some(client) = self.client.clone() else {
@@ -2313,7 +2348,7 @@ impl App {
             .map(|e| e.agent_id().to_string())
             .unwrap_or_else(|| employee.to_string());
         let depth = self.chain_depth(employee);
-        let options = harness::prompt_options(kind, &id, depth, attempt, token);
+        let options = harness::prompt_options(kind, &id, depth, token);
 
         let tx = self.tx.clone();
         let target = employee;
@@ -2964,6 +2999,40 @@ impl App {
         }
     }
 
+    /// Re-offer a delivery under its original identity, in its original session.
+    ///
+    /// This is the resend path: `kind` and `token` are the ones the delivery was
+    /// first queued with, so the admission id repeats and a service that already
+    /// admitted the first attempt deduplicates this one instead of running the
+    /// work twice. It targets the session the delivery was queued against for the
+    /// same reason — the id is only deduplicated inside the session that holds
+    /// it, so a resend that started a new session would be admitted afresh.
+    fn resend_to_employee(
+        &mut self,
+        employee: usize,
+        instruction: String,
+        kind: harness::PromptKind,
+        token: String,
+    ) {
+        self.push_to_chat(employee, TranscriptRole::Info, format!("📩 {instruction}"));
+        self.chats
+            .entry(employee)
+            .or_default()
+            .outbox
+            .push(Outgoing {
+                kind,
+                text: instruction,
+                token,
+            });
+        if self.session_ready(employee) {
+            self.flush_outbox(employee);
+        } else {
+            // No session to resend into: creating one would change the admission
+            // context, so the delivery waits for the original session instead.
+            self.begin_session(employee);
+        }
+    }
+
     /// Record one hand-off for the wires, dropping the oldest once the window is
     /// full. The cap is what keeps a long chain from growing the trace list
     /// without bound; TTL expiry is [`Self::tick_traces`]' job.
@@ -3036,15 +3105,16 @@ impl App {
             };
             self.team.set_status(employee, EmployeeStatus::Thinking);
             // Track the hand-off so a silent worker can be retried/abandoned. The
-            // stored instruction stays preamble-free (the original goal).
+            // stored instruction stays preamble-free (the original goal), and the
+            // kind + token are kept so a resend can repeat the admission id.
             if let Some(chat) = self.chats.get_mut(&employee) {
-                chat.pending = Some(PendingDelivery::new(instruction));
+                chat.pending = Some(PendingDelivery::new(instruction, kind, token.clone()));
                 if let Some(pending) = chat.pending.as_mut() {
                     pending.attempts = attempts;
                 }
             }
             let session_id = session_id.clone();
-            self.spawn_prompt(employee, session_id, prompt, kind, attempts, &token);
+            self.spawn_prompt(employee, session_id, prompt, kind, &token);
         }
     }
 
@@ -3391,12 +3461,27 @@ impl App {
             .map(|(&employee, _)| employee)
             .collect();
         for employee in expired {
-            self.retry_or_abandon(employee, "timed out");
+            self.retry_or_abandon(employee, "timed out", false);
         }
     }
 
     /// A hand-off failed or timed out: retry it (bounded) or abandon it.
-    fn retry_or_abandon(&mut self, employee: usize, reason: &str) {
+    ///
+    /// `resend` distinguishes the two causes, because they are not the same
+    /// operation and the admission id is what tells them apart:
+    ///
+    /// - **`resend: true` — the delivery never landed.** A transport failure means
+    ///   the service rejected or could not accept the prompt, so the delivery is
+    ///   *re-offered under its original identity*: same kind, same token, same
+    ///   session, therefore the same admission id. If the first attempt was in
+    ///   fact admitted, the service deduplicates this one; if it was not, this is
+    ///   the first admission. Either way the work runs once.
+    /// - **`resend: false` — a silent worker.** The previous attempt was admitted
+    ///   and then went quiet, so asking again is new work and must produce a new
+    ///   admission. Reusing the identity here would be silently swallowed as a
+    ///   duplicate and the worker would never be asked again; a fresh token is
+    ///   minted instead.
+    fn retry_or_abandon(&mut self, employee: usize, reason: &str, resend: bool) {
         let exhausted = self
             .chats
             .get(&employee)
@@ -3420,14 +3505,19 @@ impl App {
         // Bump the stored attempt count and re-send the original instruction. The
         // follow-on `flush_outbox` preserves `attempts` and prepends the retry
         // preamble, so a repeatedly-silent worker can't loop forever.
-        let (instruction, attempts) = match self
+        let (instruction, attempts, kind, token) = match self
             .chats
             .get_mut(&employee)
             .and_then(|c| c.pending.as_mut())
         {
             Some(pending) => {
                 pending.bump();
-                (pending.instruction.clone(), pending.attempts)
+                (
+                    pending.instruction.clone(),
+                    pending.attempts,
+                    pending.kind,
+                    pending.token.clone(),
+                )
             }
             None => return,
         };
@@ -3443,7 +3533,13 @@ impl App {
             Some(employee),
             format!("attempt {attempts} of {} — {reason}", harness::MAX_ATTEMPTS),
         );
-        self.send_to_employee(employee, instruction, harness::PromptKind::Retry);
+
+        if resend {
+            // Re-offer the *same* delivery: same kind, same token, same session.
+            self.resend_to_employee(employee, instruction, kind, token);
+        } else {
+            self.send_to_employee(employee, instruction, harness::PromptKind::Retry);
+        }
     }
 
     /// Give up on `employee`'s hand-off and record a deterministic `⚠` deliverable
@@ -3527,7 +3623,10 @@ impl App {
             .get(&target)
             .is_some_and(|chat| chat.pending.is_some());
         if has_pending {
-            self.retry_or_abandon(target, &reason);
+            // A transport failure never landed, so this is a resend of the same
+            // delivery: it keeps its identity and is deduplicated if the service
+            // did in fact admit the first attempt.
+            self.retry_or_abandon(target, &reason, true);
         } else {
             self.team.set_status(target, EmployeeStatus::Error);
         }
@@ -4731,6 +4830,67 @@ impl App {
             .sum()
     }
 
+    /// How many prompts are queued behind **one** employee's current turn.
+    ///
+    /// The per-employee counterpart of [`Self::queued_prompts`], so a card or a
+    /// tasks-panel row can read its own depth instead of reaching into
+    /// `App::chats`. `0` for an employee with no chat yet.
+    pub fn queued_prompts_for(&self, employee: usize) -> usize {
+        self.chats
+            .get(&employee)
+            .map_or(0, |chat| chat.queue_running.len())
+    }
+
+    /// Every persisted task assigned to `employee`, in `order_tasks` order —
+    /// active work first, then terminal, newest-first within each.
+    ///
+    /// The per-employee slice of the queue block: an employee's own work in the
+    /// panel's own order, so the block and the board cannot disagree about what
+    /// is "first". Unassigned tasks (`assigned_to == None`) belong to no
+    /// employee and are therefore never returned here.
+    pub fn tasks_for(&self, employee: usize) -> Vec<&Task> {
+        let Some(id) = self.team.employees().get(employee).map(|e| e.id.as_str()) else {
+            return Vec::new();
+        };
+        let mut mine: Vec<&Task> = self
+            .store
+            .tasks
+            .iter()
+            .filter(|task| task.assigned_to.as_deref() == Some(id))
+            .collect();
+        mine.sort_by_key(|task| task_order_key(task));
+        mine
+    }
+
+    /// How many persisted tasks are held — `Paused`, and nothing else.
+    ///
+    /// Deliberately excludes `Pending` work sitting behind a paused engine gate
+    /// (queued, not held) and `Retrying` work (the app is acting on it). This is
+    /// the number the queue block's trailing row reports, so it must mean "needs
+    /// a human", not "is not currently moving".
+    pub fn held_tasks(&self) -> usize {
+        self.store
+            .tasks
+            .iter()
+            .filter(|task| task.status == TaskStatus::Paused)
+            .count()
+    }
+
+    /// The unassigned tasks — `assigned_to == None` — in `order_tasks` order.
+    ///
+    /// They have no employee to group under, so the queue block draws them as a
+    /// final group under the `—` placeholder.
+    pub fn unassigned_tasks(&self) -> Vec<&Task> {
+        let mut mine: Vec<&Task> = self
+            .store
+            .tasks
+            .iter()
+            .filter(|task| task.assigned_to.is_none())
+            .collect();
+        mine.sort_by_key(|task| task_order_key(task));
+        mine
+    }
+
     /// A roll-up of the persisted task queue by status.
     pub fn task_stats(&self) -> TaskStats {
         let mut stats = TaskStats::default();
@@ -4781,12 +4941,16 @@ pub(crate) fn task_summary(text: &str) -> String {
 /// borrowing the original slice.
 pub(crate) fn order_tasks(tasks: &[Task]) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..tasks.len()).collect();
-    indices.sort_by_key(|&index| {
-        let task = &tasks[index];
-        let terminal = matches!(task.status, TaskStatus::Succeeded | TaskStatus::Failed);
-        (terminal, Reverse(task.created_at))
-    });
+    indices.sort_by_key(|&index| task_order_key(&tasks[index]));
     indices
+}
+
+/// The one definition of "active first, then newest-first" — shared by
+/// [`order_tasks`] and the per-employee accessors so a filtered list can never
+/// order differently from the whole-queue view.
+pub(crate) fn task_order_key(task: &Task) -> (bool, Reverse<i64>) {
+    let terminal = matches!(task.status, TaskStatus::Succeeded | TaskStatus::Failed);
+    (terminal, Reverse(task.created_at))
 }
 
 /// The roster status implied by a completed turn's message list: the last
@@ -4903,7 +5067,6 @@ async fn run_task_attempt(
     let options = harness::prompt_options(
         harness::PromptKind::AutonomousTask,
         agent.unwrap_or_default(),
-        0,
         0,
         &harness::delivery_token(),
     );

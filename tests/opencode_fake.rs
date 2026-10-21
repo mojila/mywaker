@@ -342,7 +342,7 @@ async fn a_harness_admission_id_is_accepted_by_the_service_contract() {
         mywaker::harness::PromptKind::Retry,
         mywaker::harness::PromptKind::AutonomousTask,
     ] {
-        let options = mywaker::harness::prompt_options(kind, "writer", 1, 0, "abc123");
+        let options = mywaker::harness::prompt_options(kind, "writer", 1, "abc123");
         client
             .prompt_with("ses_test", "hand-off", &options)
             .await

@@ -1489,6 +1489,112 @@ async fn every_admission_id_starts_with_msg_() {
     }
 }
 
+/// A delivery that never landed is re-offered under its **original** identity:
+/// same admission id, same session. The service deduplicates it if the first
+/// attempt was in fact admitted, so the work runs once rather than twice.
+///
+/// The `attempt` counter is deliberately not part of the id — folding it in is
+/// what made this impossible before, since every retry looked like a new message.
+#[tokio::test]
+async fn a_resend_reuses_the_admission_id_in_the_same_session() {
+    let (client, server) = recorder::start().await;
+
+    let (mut app, _rx) = make_app();
+    app.client = Some(client);
+
+    let writer = employee(&app, "writer");
+    app.chats.entry(writer).or_default().session_id = Some("ses_w".into());
+    open_chat(&mut app, writer);
+
+    // First delivery, then the transport reports it failed.
+    app.send_to_employee(
+        writer,
+        "polish the intro".to_string(),
+        harness::PromptKind::Delegation,
+    );
+    recorder::wait_for_prompts(&server, 1).await;
+    let first = server.admission_ids.lock().unwrap().clone();
+    let first_session = server.attempts.lock().unwrap()[0].0.clone();
+
+    app.update(Message::DeliveryFailed {
+        target: writer,
+        reason: "connection reset".into(),
+    });
+    recorder::wait_for_prompts(&server, 2).await;
+
+    let ids = server.admission_ids.lock().unwrap().clone();
+    let attempts = server.attempts.lock().unwrap().clone();
+    assert_eq!(ids.len(), 2, "the resend was delivered");
+    assert_eq!(
+        ids[0], ids[1],
+        "a resend must repeat the admission id so the service deduplicates it"
+    );
+    assert_eq!(
+        attempts[0].0, attempts[1].0,
+        "a resend must target the same session — a new one is a new admission"
+    );
+    assert_eq!(
+        attempts[1].0, first_session,
+        "the resend must not open a second session"
+    );
+    assert_eq!(
+        *server.sessions.lock().unwrap(),
+        0,
+        "a resend reuses the existing session rather than creating one"
+    );
+    assert!(first[0].as_deref().unwrap_or("").starts_with("msg_"));
+}
+
+/// A silent worker is asked again as **new** work: the previous attempt was
+/// admitted and then went quiet, so the re-issue must take a new admission id.
+/// Reusing the old one would be silently swallowed as a duplicate, and the
+/// worker would never be asked again.
+#[tokio::test]
+async fn a_silent_worker_reissue_mints_a_new_admission_id() {
+    let (client, server) = recorder::start().await;
+
+    let (mut app, _rx) = make_app();
+    app.client = Some(client);
+
+    let writer = employee(&app, "writer");
+    app.chats.entry(writer).or_default().session_id = Some("ses_w".into());
+    open_chat(&mut app, writer);
+
+    app.send_to_employee(
+        writer,
+        "polish the intro".to_string(),
+        harness::PromptKind::Delegation,
+    );
+    recorder::wait_for_prompts(&server, 1).await;
+
+    // The delivery started executing and then went silent past the deadline.
+    {
+        let pending = app
+            .chats
+            .get_mut(&writer)
+            .unwrap()
+            .pending
+            .as_mut()
+            .unwrap();
+        pending.arm();
+        pending.since =
+            Instant::now() - harness::HANDOFF_TIMEOUT - std::time::Duration::from_secs(1);
+    }
+    app.tick_reliability();
+    recorder::wait_for_prompts(&server, 2).await;
+
+    let ids = server.admission_ids.lock().unwrap().clone();
+    assert_eq!(ids.len(), 2, "the re-issue was delivered");
+    assert_ne!(
+        ids[0], ids[1],
+        "a silent-worker re-issue is new work and must not reuse the admission id"
+    );
+    assert!(
+        ids[1].as_deref().unwrap_or("").contains("retry"),
+        "the re-issue is sent as a retry kind: {ids:?}"
+    );
+}
+
 /// Two user prompts to the same employee are two deliveries, so they must not
 /// share an admission id. A repeat would be silently deduplicated by the
 /// service (same session) or rejected with a 409 (another session) — either way
@@ -2302,6 +2408,8 @@ fn renders_shutdown_overlay_without_panicking() {
 fn stale_pending(instruction: &str, attempts: u8) -> PendingDelivery {
     PendingDelivery {
         instruction: instruction.into(),
+        kind: harness::PromptKind::Delegation,
+        token: "tok_stale".into(),
         attempts,
         since: Instant::now() - harness::HANDOFF_TIMEOUT - std::time::Duration::from_secs(1),
         // Armed: the delivery started executing and then went silent, which is
@@ -2865,8 +2973,244 @@ fn tasks_accessor_exposes_persisted_tasks() {
     assert_eq!(goals, vec!["write the changelog", "sweep the inbox"]);
 }
 
-/// The persisted queue section renders above the per-employee board without
-/// panicking, showing each task's status and a goal summary.
+/// `queued_prompts_for` is the per-employee counterpart of the team-wide
+/// `queued_prompts`: it reads one employee's own held prompts, and `0` for an
+/// employee with no chat yet.
+#[test]
+fn queued_prompts_for_reads_one_employee() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    let researcher = employee(&app, "researcher");
+
+    // No chat at all yet → 0, not a panic and not the aggregate.
+    assert_eq!(app.queued_prompts_for(writer), 0);
+
+    app.chats.entry(writer).or_default().queue_running = vec!["first".into(), "second".into()];
+    app.chats.entry(researcher).or_default().queue_running = vec!["only".into()];
+
+    assert_eq!(app.queued_prompts_for(writer), 2);
+    assert_eq!(app.queued_prompts_for(researcher), 1);
+    // The aggregate still sums both — the two accessors agree.
+    assert_eq!(app.queued_prompts(), 3);
+
+    // An employee index that does not exist is empty, not a panic.
+    assert_eq!(app.queued_prompts_for(99), 0);
+}
+
+/// `tasks_for` returns exactly one employee's tasks, in the panel's own
+/// `order_tasks` order, and never an unassigned task.
+#[test]
+fn tasks_for_returns_one_employees_tasks_in_queue_order() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    let researcher = employee(&app, "researcher");
+
+    let mut old_done = Task::new("old writer success", Some("writer".into()));
+    old_done.status = TaskStatus::Succeeded;
+    old_done.created_at = 5;
+    let mut running = Task::new("writer running", Some("writer".into()));
+    running.status = TaskStatus::Running;
+    running.created_at = 30;
+    let mut pending = Task::new("writer pending", Some("writer".into()));
+    pending.created_at = 20;
+    let mut theirs = Task::new("researcher pending", Some("researcher".into()));
+    theirs.created_at = 40;
+    let unassigned = Task::new("nobody's task", None);
+
+    for task in [old_done, running, pending, theirs, unassigned] {
+        app.store.upsert_task(task);
+    }
+
+    let mine: Vec<&str> = app
+        .tasks_for(writer)
+        .into_iter()
+        .map(|task| task.goal.as_str())
+        .collect();
+    // Active first (newest-first), then terminal — the panel's order, not
+    // insertion order, and nothing belonging to another employee.
+    assert_eq!(
+        mine,
+        vec!["writer running", "writer pending", "old writer success"]
+    );
+
+    let theirs: Vec<&str> = app
+        .tasks_for(researcher)
+        .into_iter()
+        .map(|task| task.goal.as_str())
+        .collect();
+    assert_eq!(theirs, vec!["researcher pending"]);
+
+    // An index with no employee is empty rather than a panic.
+    assert!(app.tasks_for(99).is_empty());
+}
+
+/// `held_tasks` counts `Paused` only: not `Pending` behind a paused gate, and
+/// not `Retrying`.
+#[test]
+fn held_tasks_counts_only_paused() {
+    let (mut app, _rx) = make_app();
+    assert_eq!(app.held_tasks(), 0);
+
+    app.store
+        .upsert_task(Task::new("queued but not held", None));
+
+    let mut paused = Task::new("held by the user", Some("writer".into()));
+    assert!(paused.pause(), "pending → paused is a legal edge");
+    app.store.upsert_task(paused);
+
+    let mut retrying = Task::new("retrying", Some("writer".into()));
+    retrying.status = TaskStatus::Retrying;
+    app.store.upsert_task(retrying);
+
+    let mut done = Task::new("done", Some("writer".into()));
+    done.status = TaskStatus::Succeeded;
+    app.store.upsert_task(done);
+
+    // A paused engine gate alone does not make a task held.
+    app.store.paused = true;
+    assert_eq!(
+        app.held_tasks(),
+        1,
+        "only the Paused task is held; Pending/Retrying/Succeeded are not"
+    );
+}
+
+/// `unassigned_tasks` is the `—` group: tasks with no employee, in queue order.
+#[test]
+fn unassigned_tasks_are_the_dash_group() {
+    let (mut app, _rx) = make_app();
+    assert!(app.unassigned_tasks().is_empty());
+
+    let mut old = Task::new("old unassigned", None);
+    old.status = TaskStatus::Succeeded;
+    old.created_at = 5;
+    let mut new = Task::new("new unassigned", None);
+    new.status = TaskStatus::Running;
+    new.created_at = 30;
+    app.store.upsert_task(old);
+    app.store.upsert_task(new);
+    app.store
+        .upsert_task(Task::new("assigned", Some("writer".into())));
+
+    let goals: Vec<&str> = app
+        .unassigned_tasks()
+        .into_iter()
+        .map(|task| task.goal.as_str())
+        .collect();
+    assert_eq!(goals, vec!["new unassigned", "old unassigned"]);
+}
+
+/// **Regression: the panel must not print the same goal twice.** A scheduled
+/// task appears in the queue block, and the employee who is running it also
+/// carries the same text as their board `last_task` — so the goal was drawn on
+/// two rows of one panel, which reads as two separate pieces of work.
+///
+/// The rule this pins: **a goal is drawn at most once per panel.** When a goal
+/// is listed in the queue block, the board block for that same employee does not
+/// repeat it; when the queue does not list it (no scheduled task, or the block is
+/// not drawn), the board still shows it.
+#[test]
+fn a_goal_is_never_drawn_twice_in_the_tasks_panel() {
+    let (mut app, _rx) = make_app();
+
+    // A goal short enough to survive the 16-cell summary budget untruncated, so
+    // both rows would draw the identical string if the duplicate existed. A long
+    // goal would pass this test vacuously: the queue row ellipsises it, and the
+    // two rows would no longer share an exact substring.
+    const GOAL: &str = "update readme";
+
+    // An autonomous task for the writer, dispatched so the employee's board row
+    // latches the same goal — the exact shape that duplicated.
+    app.update(Message::WatchedTask {
+        employee: "writer".into(),
+        goal: GOAL.into(),
+    });
+    let writer = employee(&app, "writer");
+    assert_eq!(
+        app.team().employees()[writer].last_task.as_deref(),
+        Some(GOAL),
+        "the fixture must latch the goal on the board too, or it proves nothing"
+    );
+
+    let text = screen(&app, 120, 40);
+    let occurrences = text.matches(GOAL).count();
+    assert_eq!(
+        occurrences, 1,
+        "the goal was drawn {occurrences} times; it must appear exactly once \
+         (queue block or board row, never both)"
+    );
+}
+
+/// A goal that is *not* in the queue block still reaches the board, so dropping
+/// the duplicate cannot silently hide work.
+#[test]
+fn the_board_still_shows_a_goal_the_queue_does_not_list() {
+    let (mut app, _rx) = make_app();
+    let writer = employee(&app, "writer");
+    // Short enough that the board row's own 26-cell budget does not ellipsise it,
+    // so the assertion is about presence rather than about truncation.
+    app.team
+        .set_last_task(writer, Some("a chat task".into()));
+
+    let text = screen(&app, 120, 40);
+    assert!(
+        text.contains("a chat task"),
+        "a board-only goal must still be drawn: {text}"
+    );
+}
+
+/// The heading names what the block actually holds. `Succeeded`/`Failed` rows are
+/// not queued work — they are finished — so the heading must not call the block a
+/// queue while it lists them.
+#[test]
+fn the_heading_does_not_call_finished_work_a_queue() {
+    let (mut app, _rx) = make_app();
+    let mut done = Task::new("ship it", Some("writer".into()));
+    done.status = TaskStatus::Succeeded;
+    app.store.upsert_task(done);
+
+    // Read the tasks panel's own column band: the sidebar prints
+    // `vitals queue empty`, so a whole-frame substring search for `queue` would
+    // report a false positive from a different surface.
+    let panel = tasks_panel_text(&app, 120, 40);
+    assert!(
+        panel.contains("succeeded"),
+        "the fixture must list the finished row: {panel}"
+    );
+    assert!(
+        !panel.contains("queue"),
+        "the block lists finished work but is titled `queue`: {panel}"
+    );
+}
+
+/// The tasks panel's own 32-column band, one row per line — so an assertion can
+/// say "in this panel" instead of "anywhere on the frame".
+fn tasks_panel_text(app: &App, width: u16, height: u16) -> String {
+    let main = ui::layout::Regions::of(
+        ratatui::layout::Rect::new(0, 0, width, height),
+        app.mode(),
+        false,
+    )
+    .main;
+    let panel = ui::layout::roster_areas(main)[2];
+
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    (panel.y..panel.y + panel.height)
+        .map(|row| {
+            let line: String = (panel.x..panel.x + panel.width)
+                .map(|col| buffer[(col, row)].symbol())
+                .collect();
+            format!("{line}\n")
+        })
+        .collect()
+}
+
+/// The persisted queue block renders above the per-employee board, glyph-led
+/// with no status word on item rows (§2.2), and the board below still draws.
 #[test]
 fn renders_task_queue_without_panicking() {
     let (mut app, _rx) = make_app();
@@ -2877,10 +3221,283 @@ fn renders_task_queue_without_panicking() {
         .upsert_task(Task::new("write the changelog", None));
 
     let text = screen(&app, 120, 40);
-    assert!(text.contains("queue"), "task queue heading missing");
-    assert!(text.contains("running"), "queued task status missing");
+    assert!(text.contains("scheduled"), "scheduled block heading missing");
     assert!(text.contains("sweep the inbox"), "queued goal missing");
-    assert!(text.contains("pending"), "pending task status missing");
+    // The summary budget is 16 (the word column takes 9), so a longer goal is
+    // ellipsised — with `…`, never silently cut (§4.2).
+    assert!(
+        text.contains("write the chang…"),
+        "unassigned goal missing or unellipsised"
+    );
+    // Every row carries the frozen §2.6 triple: the glyph **and** the padded
+    // status word (`keymap.md` §7 freezes this row). The word column is rigid, so
+    // `running` and `pending` are drawn padded to 9.
+    assert!(text.contains("▷"), "running glyph missing");
+    assert!(text.contains("○"), "pending glyph missing");
+    assert!(
+        text.contains(&format!("{:<9}", "running")),
+        "item rows must print the padded status word"
+    );
+    assert!(
+        text.contains(&format!("{:<9}", "pending")),
+        "item rows must print the padded status word"
+    );
+    // The `—` group carries unassigned work.
+    assert!(
+        text.contains("unassigned"),
+        "unassigned group header missing"
+    );
+}
+
+/// §5.2's counting invariant, on a real frame: **Σ(drawn item rows) + N =
+/// Σ(R0 `×N`)**. A `+N more` that disagrees with the headers above it is the
+/// defect the overflow row exists to prevent.
+#[test]
+fn the_overflow_count_reconciles_with_the_group_depths() {
+    let (mut app, _rx) = make_app();
+    // 8 for Bruno (more than the panel can draw), then 2 each for Aria, Cleo and
+    // Dex — enough later groups that at least one is dropped *whole*, which is
+    // the path a naive accumulator forgets.
+    for n in 0..8 {
+        app.store
+            .upsert_task(Task::new(format!("w{n}"), Some("writer".into())));
+    }
+    for (id, prefix) in [("researcher", "r"), ("reviewer", "c"), ("planner", "d")] {
+        for n in 0..2 {
+            app.store
+                .upsert_task(Task::new(format!("{prefix}{n}"), Some(id.into())));
+        }
+    }
+
+    let text = screen(&app, 100, 30);
+
+    // The header depths are the *true* sizes, not the rows drawn (§3).
+    assert!(text.contains("×8"), "writer depth missing: {text}");
+
+    // Read `+N more` off the frame and reconcile it with the drawn rows.
+    let hidden: usize = text
+        .split('+')
+        .find_map(|tail| {
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+            (!digits.is_empty() && tail[digits.len()..].starts_with(" more"))
+                .then(|| digits.parse().ok())
+                .flatten()
+        })
+        .unwrap_or_else(|| panic!("no overflow row on the frame: {text}"));
+    assert!(hidden > 0, "expected an overflow at 100x30: {text}");
+
+    // Σ(drawn items) = Σ(depths) − N. Count the drawn goal rows by their goals.
+    let drawn = (0..8).filter(|n| text.contains(&format!("w{n}"))).count()
+        + ["r", "c", "d"]
+            .iter()
+            .map(|p| (0..2).filter(|n| text.contains(&format!("{p}{n}"))).count())
+            .sum::<usize>();
+    assert_eq!(
+        drawn + hidden,
+        14,
+        "drawn {drawn} + hidden {hidden} must equal the 14 queued tasks"
+    );
+}
+
+/// The block is always closed by exactly one blank row, so the held row never
+/// sits directly above the board's head and reads as a queue row for that
+/// employee (F7).
+#[test]
+fn the_block_is_closed_by_one_blank_row() {
+    let (mut app, _rx) = make_app();
+    app.store
+        .upsert_task(Task::new("only one", Some("writer".into())));
+
+    // Read the tasks panel's own column band, not the whole frame: the panel is
+    // 32 wide on the right, so a full-width slice would mix in the grid.
+    let (width, height) = (120u16, 40u16);
+    let tasks = ui::layout::roster_areas(
+        ui::layout::Regions::of(
+            ratatui::layout::Rect::new(0, 0, width, height),
+            app.mode(),
+            false,
+        )
+        .main,
+    )[2];
+
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| ui::render(frame, &app)).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let row_text = |row: u16| -> String {
+        (tasks.x..tasks.x + tasks.width)
+            .map(|col| buffer[(col, row)].symbol())
+            .collect()
+    };
+
+    let item_row = (tasks.y..tasks.y + tasks.height)
+        .find(|&row| row_text(row).contains("only one"))
+        .expect("the queue item was not drawn");
+    // The panel's own borders are not content: strip them, then the row must be
+    // blank. A `│   │` with nothing inside is exactly the closing row we want.
+    let inner = |row: u16| -> String {
+        let text = row_text(row);
+        let mut chars = text.chars();
+        chars.next();
+        let rest: String = chars.collect();
+        rest.chars()
+            .take(rest.chars().count().saturating_sub(1))
+            .collect()
+    };
+    assert!(
+        inner(item_row + 1).trim().is_empty(),
+        "no blank row closes the block: {:?}",
+        inner(item_row + 1)
+    );
+}
+
+#[test]
+fn renders_a_mixed_queue_with_groups_overflow_and_held_row() {
+    let (mut app, _rx) = make_app();
+
+    // Writer: three tasks spanning active and terminal states.
+    let mut running = Task::new("run it", Some("writer".into()));
+    running.status = TaskStatus::Running;
+    running.created_at = 30;
+    let mut failed = Task::new("fail it", Some("writer".into()));
+    failed.status = TaskStatus::Failed;
+    failed.created_at = 20;
+    let mut paused = Task::new("hold it", Some("writer".into()));
+    paused.created_at = 10;
+    assert!(paused.pause());
+    for task in [running, failed, paused] {
+        app.store.upsert_task(task);
+    }
+
+    // Researcher: one pending task.
+    app.store
+        .upsert_task(Task::new("pend it", Some("researcher".into())));
+
+    let text = screen(&app, 120, 40);
+
+    // Both employees get a header with their own task under it.
+    assert!(text.contains("run it"), "{text}");
+    assert!(text.contains("pend it"), "{text}");
+    // The three state glyphs are drawn, and the words are carried too.
+    assert!(text.contains("▷"), "running glyph missing");
+    assert!(text.contains("✕"), "failed glyph missing");
+    assert!(text.contains("⏸"), "paused glyph missing");
+    // The held row is last and counts exactly the Paused task, trailing as `×N`.
+    assert!(text.contains("×1"), "held row missing: {text}");
+    // No overflow row when everything fits.
+    assert!(!text.contains(" more"), "unexpected overflow row: {text}");
+}
+
+/// A long queue is height-capped and reports what it hid — the board below is
+/// never clipped off the panel (D1).
+#[test]
+fn a_long_queue_overflows_with_a_count_instead_of_growing() {
+    let (mut app, _rx) = make_app();
+    for n in 0..20 {
+        app.store
+            .upsert_task(Task::new(format!("queued goal {n}"), Some("writer".into())));
+    }
+
+    let text = screen(&app, 100, 30);
+    assert!(text.contains("+"), "overflow count missing: {text}");
+    assert!(text.contains(" more"), "overflow row missing: {text}");
+    // The count is exact and unrounded: 20 queued, some drawn, the rest counted.
+    let drawn = (0..20)
+        .filter(|n| text.contains(&format!("queued goal {n}")))
+        .count();
+    assert!(
+        drawn < 20,
+        "the block drew every row, so it was never capped"
+    );
+    assert!(
+        text.contains(&format!("+{} more", 20 - drawn)),
+        "expected +{} more for {drawn} drawn rows: {text}",
+        20 - drawn
+    );
+    // The board still draws: employees are visible below the block.
+    assert!(text.contains("Bruno"), "the board was clipped away: {text}");
+}
+
+/// `count == 0` draws no held row at all — not even the blank separator before
+/// it (§5.2; the same rule as U9's forbidden `hidden 0`).
+#[test]
+fn no_held_row_when_nothing_is_held() {
+    let (mut app, _rx) = make_app();
+    app.store
+        .upsert_task(Task::new("just pending", Some("writer".into())));
+
+    let text = screen(&app, 120, 40);
+    assert!(text.contains("scheduled"), "{text}");
+    assert!(
+        !text.contains("×0"),
+        "a zero held row must not be drawn: {text}"
+    );
+}
+
+/// The engine gate and the held count are different facts: the heading says
+/// `engine paused` while the held row counts the Paused tasks, and only the row
+/// carries the `⏸` glyph (§5.4).
+#[test]
+fn paused_engine_heading_drops_the_glyph_the_held_row_carries() {
+    let (mut app, _rx) = make_app();
+    let mut paused = Task::new("held work", Some("writer".into()));
+    assert!(paused.pause());
+    app.store.upsert_task(paused);
+    app.store.paused = true;
+
+    let text = screen(&app, 120, 40);
+    assert!(text.contains("engine paused"), "{text}");
+    assert!(text.contains("×1"), "{text}");
+}
+
+/// §10 item 5 — the 60×16 floor. The block has room for the heading, the
+/// overflow row and the held row, and **no** item rows; `N` is then the whole
+/// queue, because `N` counts rows not drawn. `+7 more` with nothing above it is
+/// correct, not a bug (§6.3), and it is what makes U6's floor clause true: the
+/// count lives on this panel because the card cannot hold it.
+#[test]
+fn the_floor_draws_a_whole_queue_as_one_count() {
+    let (mut app, _rx) = make_app();
+    for n in 0..7 {
+        app.store
+            .upsert_task(Task::new(format!("queued goal {n}"), Some("writer".into())));
+    }
+
+    let text = screen(&app, 60, 16);
+    assert!(text.contains("scheduled"), "the heading is dropped: {text}");
+    assert!(
+        text.contains("+7 more"),
+        "the whole queue is not counted: {text}"
+    );
+    // No item row survives at the floor — the count stands in for all of them.
+    assert!(
+        !text.contains("queued goal 0"),
+        "an item row was drawn where the spec allows none: {text}"
+    );
+}
+
+/// The same queue at the floor with one task held: the held row still fits
+/// beside the count, and still reports only the `Paused` task — not the seven
+/// queued ones (§5.2).
+#[test]
+fn the_floor_keeps_the_held_row_beside_the_count() {
+    let (mut app, _rx) = make_app();
+    for n in 0..6 {
+        app.store
+            .upsert_task(Task::new(format!("queued goal {n}"), Some("writer".into())));
+    }
+    let mut held = Task::new("held at the floor", Some("writer".into()));
+    assert!(held.pause());
+    app.store.upsert_task(held);
+
+    let text = screen(&app, 60, 16);
+    assert!(text.contains("+7 more"), "count should cover all 7: {text}");
+    assert!(text.contains("×1"), "held row missing: {text}");
+    assert!(
+        !text.contains("×0"),
+        "a zero held row must never be drawn: {text}"
+    );
 }
 
 /// AC1: while the engine is paused, an autonomous fire is recorded as queued
@@ -3712,7 +4329,10 @@ fn renders_paused_engine_and_task() {
     app.store.paused = true;
 
     let text = screen(&app, 120, 40);
-    assert!(text.contains("⏸ paused"), "engine pause indicator missing");
+    assert!(
+        text.contains("engine paused"),
+        "engine pause indicator missing"
+    );
 
     app.store.paused = false;
     let mut held = Task::new("hold me", Some("researcher".into()));
@@ -4764,6 +5384,55 @@ fn pulse_keeps_the_last_48_ticks() {
     assert_eq!(pulse.samples(), &[3], "the baseline was cleared too");
 }
 
+/// Connecting pre-warms a session for every employee: the connect handler kicks
+/// off one `create_session` per employee (concurrently), so a delegation hop to
+/// any of them doesn't pay an on-demand session creation on the chain's critical
+/// path. A second connect does not double-create.
+#[tokio::test]
+async fn connecting_prewarms_a_session_for_every_employee() {
+    let (client, server) = recorder::start().await;
+
+    let (mut app, _rx) = make_app();
+    app.update(Message::Connected {
+        client: client.clone(),
+        info: ServerInfo {
+            version: "2.0.32".into(),
+            pid: None,
+            urls: Vec::new(),
+        },
+    });
+
+    let wanted = app.team.employees().len();
+    // The connect handler spawns each create; wait for them all to land.
+    for _ in 0..400 {
+        if *server.sessions.lock().unwrap() >= wanted {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        *server.sessions.lock().unwrap(),
+        wanted,
+        "one session per employee, warmed up front"
+    );
+
+    // A second connect is a no-op: the sessions are already being created.
+    app.update(Message::Connected {
+        client,
+        info: ServerInfo {
+            version: "2.0.32".into(),
+            pid: None,
+            urls: Vec::new(),
+        },
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        *server.sessions.lock().unwrap(),
+        wanted,
+        "re-connecting must not double-create sessions"
+    );
+}
+
 /// SB4: the aggregate accessors agree with a synthetic team and task set.
 #[test]
 fn aggregate_accessors_count_states() {
@@ -4771,6 +5440,11 @@ fn aggregate_accessors_count_states() {
     // `connecting` fallback — every other render test in the suite runs
     // disconnected, which left that branch unexercised.
     let (mut app, _rx) = make_app();
+    // This test is about the aggregate accessors, not session warm-up; keep
+    // sessions lazy so `Connected` doesn't spawn session creation (a `tokio`
+    // runtime is absent in a sync `#[test]`, and a connected-but-unwarmed app
+    // is what the "fresh roster, no sessions" assertions below describe).
+    app.config.prewarm_sessions = false;
     app.update(Message::Connected {
         client: OpenCode::with_base(
             reqwest::Url::parse("http://127.0.0.1:1").expect("a valid base url"),
@@ -5234,3 +5908,17 @@ fn log_band_error_prose_is_body_text_not_red() {
         "K7: the ✕ marker lost its error colour"
     );
 }
+
+#[test]
+fn zz_probe_geom() {
+    for (w, h) in [(120u16, 40u16), (100, 30), (80, 24), (60, 16)] {
+        let main = ui::team_area((w, h));
+        println!(
+            "PROBE {w}x{h} main_h={} H={} A={}",
+            main.height,
+            main.height - 2,
+            (main.height - 2) / 2
+        );
+    }
+}
+
