@@ -12,7 +12,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -20,6 +20,7 @@ use ratatui::{
 use crate::app::App;
 
 use super::input;
+use super::theme;
 
 /// The prefix on the content row, matching the chat input.
 const PREFIX: &str = "> ";
@@ -30,11 +31,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let focused = app.prompt_focused();
-    let accent = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
+    let accent = if focused { theme::ACCENT } else { theme::MUTED };
 
     let block = Block::default()
         .borders(Borders::TOP)
@@ -86,7 +83,7 @@ fn left_title(app: &App) -> Vec<Span<'static>> {
         Span::styled(
             " to ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -96,7 +93,7 @@ fn left_title(app: &App) -> Vec<Span<'static>> {
     ];
 
     if let Some(status) = app.prompt_employee_status() {
-        spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled("· ", Style::default().fg(theme::MUTED)));
         spans.push(Span::styled(
             format!("{} ", status.label()),
             Style::default().fg(super::status::color(status)),
@@ -104,10 +101,10 @@ fn left_title(app: &App) -> Vec<Span<'static>> {
     }
 
     if let Some(model) = app.prompt_employee_model() {
-        spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled("· ", Style::default().fg(theme::MUTED)));
         spans.push(Span::styled(
             format!("{model} "),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme::ACCENT),
         ));
     }
 
@@ -122,12 +119,10 @@ fn right_badge(app: &App) -> Option<Vec<Span<'static>>> {
         return None;
     }
     Some(vec![
-        Span::styled("◆ ", Style::default().fg(Color::Yellow)),
+        Span::styled("◆ ", Style::default().fg(theme::WARN)),
         Span::styled(
             format!("{count} active "),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::DIM),
+            Style::default().fg(theme::WARN).add_modifier(Modifier::DIM),
         ),
     ])
 }

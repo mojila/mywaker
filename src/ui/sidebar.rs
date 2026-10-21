@@ -19,11 +19,12 @@ use std::time::Duration;
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 
+use super::theme;
 use crate::app::App;
 use crate::ui::robot::{MINI_NAMEPLATE, RobotState, render_mini};
 use crate::ui::status;
@@ -351,11 +352,11 @@ fn truncate_spans(spans: Vec<(String, Style)>, width: usize) -> Line<'static> {
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Color::DarkGray)
+        .border_style(theme::BORDER)
         .title(Span::styled(
             TITLE,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -444,7 +445,7 @@ fn avatar(app: &App) -> Vec<Row> {
         *nameplate = vec![(
             MINI_NAMEPLATE.to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         )];
     }
@@ -464,15 +465,15 @@ fn avatar(app: &App) -> Vec<Row> {
 /// A5 is a structural assertion; A4's narrow-width clause accepts the glyph.
 fn now_row(app: &App, width: usize) -> Row {
     let (glyph, text, color) = if app.connection_error().is_some() {
-        ("✕", "offline".to_string(), Color::Red)
+        ("✕", "offline".to_string(), theme::ERR)
     } else if !app.is_connected() {
         (
             status::spinner(app.frame()),
             "connecting".to_string(),
-            Color::Yellow,
+            theme::WARN,
         )
     } else if app.is_paused() {
-        ("⏸", "paused".to_string(), Color::Yellow)
+        ("⏸", "paused".to_string(), theme::WARN)
     } else {
         let busy = app.busy_count();
         let thinking = app.thinking_count();
@@ -485,9 +486,9 @@ fn now_row(app: &App, width: usize) -> Row {
             if thinking > 0 {
                 parts.push(format!("{thinking} thinking"));
             }
-            ("▶", parts.join(" · "), Color::Cyan)
+            ("▶", parts.join(" · "), theme::ACCENT)
         } else {
-            ("●", "idle".to_string(), Color::DarkGray)
+            ("●", "idle".to_string(), theme::MUTED)
         }
     };
 
@@ -499,7 +500,7 @@ fn now_row(app: &App, width: usize) -> Row {
     // appending it to the marker could still overflow the panel, which the
     // terminal would clip mid-word.
     let mut spans = vec![
-        ("now ".to_string(), Style::default().fg(Color::DarkGray)),
+        ("now ".to_string(), Style::default().fg(theme::MUTED)),
         (glyph.to_string(), Style::default().fg(color)),
     ];
     if width >= 10 {
@@ -514,7 +515,7 @@ fn inspector(app: &App) -> Vec<Row> {
     let Some(employee) = app.team().employees().get(app.selected()) else {
         return vec![vec![(
             "who — no employee".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         )]];
     };
 
@@ -543,7 +544,7 @@ fn inspector(app: &App) -> Vec<Row> {
 
     vec![
         vec![
-            ("who ".to_string(), Style::default().fg(Color::DarkGray)),
+            ("who ".to_string(), Style::default().fg(theme::MUTED)),
             (
                 status::icon_span(employee.status, app.frame()).to_string(),
                 Style::default(),
@@ -552,18 +553,18 @@ fn inspector(app: &App) -> Vec<Row> {
             (
                 employee.name.clone(),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT_BRIGHT)
                     .add_modifier(Modifier::BOLD),
             ),
         ],
-        vec![(employee.role.clone(), Style::default().fg(Color::DarkGray))],
+        vec![(employee.role.clone(), Style::default().fg(theme::MUTED))],
         vec![
-            ("doing ".to_string(), Style::default().fg(Color::DarkGray)),
+            ("doing ".to_string(), Style::default().fg(theme::MUTED)),
             doing,
         ],
         vec![(
             employee.model.clone().unwrap_or_else(|| "none".to_string()),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme::ACCENT),
         )],
         vec![
             (
@@ -571,10 +572,10 @@ fn inspector(app: &App) -> Vec<Row> {
                     .model_provider
                     .clone()
                     .unwrap_or_else(|| "—".to_string()),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(theme::TEXT),
             ),
-            (" · ".to_string(), Style::default().fg(Color::DarkGray)),
-            (live, Style::default().fg(Color::Gray)),
+            (" · ".to_string(), Style::default().fg(theme::MUTED)),
+            (live, Style::default().fg(theme::TEXT)),
         ],
     ]
 }
@@ -584,10 +585,10 @@ fn pulse_row(app: &App, width: usize) -> Row {
     let label = "pulse ";
     let room = width.saturating_sub(label.chars().count());
     vec![
-        (label.to_string(), Style::default().fg(Color::DarkGray)),
+        (label.to_string(), Style::default().fg(theme::MUTED)),
         (
             sparkline(app.pulse(), room),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme::ACCENT),
         ),
     ]
 }
@@ -626,32 +627,32 @@ fn vitals(app: &App, _width: usize) -> Vec<Row> {
         let ratio = stats.succeeded as f32 / finished as f32;
         let track = bar(ratio, 8);
         DoneRow::Rich(vec![
-            ("health ".to_string(), Style::default().fg(Color::DarkGray)),
-            (track, Style::default().fg(Color::Green)),
+            ("health ".to_string(), Style::default().fg(theme::MUTED)),
+            (track, Style::default().fg(theme::OK)),
             (
                 format!(" {}✓", stats.succeeded),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme::OK),
             ),
             (
                 format!(" {}✕", stats.failed),
                 Style::default().fg(if stats.failed > 0 {
-                    Color::Red
+                    theme::ERR
                 } else {
-                    Color::DarkGray
+                    theme::MUTED
                 }),
             ),
         ])
     };
 
     vec![vec![
-        ("vitals ".to_string(), Style::default().fg(Color::DarkGray)),
-        (in_flight, Style::default().fg(Color::Gray)),
+        ("vitals ".to_string(), Style::default().fg(theme::MUTED)),
+        (in_flight, Style::default().fg(theme::TEXT)),
     ]]
     .into_iter()
     .chain(
         // `done` is either one row (no finished work) or a rich coloured row.
         match done {
-            DoneRow::Plain(text) => vec![vec![(text, Style::default().fg(Color::Gray))]],
+            DoneRow::Plain(text) => vec![vec![(text, Style::default().fg(theme::TEXT))]],
             DoneRow::Rich(row) => vec![row],
         },
     )
@@ -680,21 +681,17 @@ fn runtime(app: &App, _width: usize) -> Vec<Row> {
 
     let mut rows = vec![
         vec![
-            ("uptime ".to_string(), Style::default().fg(Color::DarkGray)),
-            (uptime, Style::default().fg(Color::Gray)),
+            ("uptime ".to_string(), Style::default().fg(theme::MUTED)),
+            (uptime, Style::default().fg(theme::TEXT)),
         ],
-        vec![(jev, Style::default().fg(Color::Gray))],
+        vec![(jev, Style::default().fg(theme::TEXT))],
     ];
     if let Some((up, total)) = app.mcp_summary() {
         rows.push(vec![
-            ("mcp ".to_string(), Style::default().fg(Color::DarkGray)),
+            ("mcp ".to_string(), Style::default().fg(theme::MUTED)),
             (
                 format!("{up}/{total}"),
-                Style::default().fg(if up == total {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                }),
+                Style::default().fg(if up == total { theme::OK } else { theme::WARN }),
             ),
         ]);
     }
@@ -705,20 +702,20 @@ fn runtime(app: &App, _width: usize) -> Vec<Row> {
 fn alerts(app: &App, _width: usize) -> Vec<Row> {
     let failure = match app.last_failure() {
         Some(goal) => vec![
-            ("alert ".to_string(), Style::default().fg(Color::DarkGray)),
-            ("✕ ".to_string(), Style::default().fg(Color::Red)),
-            (goal.to_string(), Style::default().fg(Color::Red)),
+            ("alert ".to_string(), Style::default().fg(theme::MUTED)),
+            ("✕ ".to_string(), Style::default().fg(theme::ERR)),
+            (goal.to_string(), Style::default().fg(theme::ERR)),
         ],
         None => vec![
-            ("alert ".to_string(), Style::default().fg(Color::DarkGray)),
-            ("✓ none".to_string(), Style::default().fg(Color::DarkGray)),
+            ("alert ".to_string(), Style::default().fg(theme::MUTED)),
+            ("✓ none".to_string(), Style::default().fg(theme::MUTED)),
         ],
     };
     let connection = match app.connection_error() {
-        Some(err) => vec![(err.to_string(), Style::default().fg(Color::Red))],
+        Some(err) => vec![(err.to_string(), Style::default().fg(theme::ERR))],
         None => vec![(
             "connection ok".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         )],
     };
     vec![failure, connection]
@@ -886,7 +883,10 @@ mod tests {
     #[test]
     fn narrow_nameplate_is_ellipsised_not_dropped() {
         let line = truncate_spans(
-            vec![(MINI_NAMEPLATE.to_string(), Style::default().fg(Color::Cyan))],
+            vec![(
+                MINI_NAMEPLATE.to_string(),
+                Style::default().fg(theme::ACCENT),
+            )],
             6,
         );
         let nameplate = line.to_string();

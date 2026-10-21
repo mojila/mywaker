@@ -1059,11 +1059,13 @@ impl App {
                     self.model_filter.clear();
                     self.mode = Mode::Roster;
                 }
-                KeyCode::Up => {
+                // `k`/`j` mirror `↑`/`↓`, matching the project picker
+                // (`docs/keymap.md` §3.8 K1).
+                KeyCode::Up | KeyCode::Char('k') => {
                     self.model_selected =
                         move_selection(self.model_selected, -1, self.filtered_models().len());
                 }
-                KeyCode::Down => {
+                KeyCode::Down | KeyCode::Char('j') => {
                     self.model_selected =
                         move_selection(self.model_selected, 1, self.filtered_models().len());
                 }

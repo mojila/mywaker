@@ -9,11 +9,12 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
 
+use super::theme;
 use crate::app::{self, App};
 use crate::task::Task;
 use crate::team::Employee;
@@ -26,7 +27,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Color::DarkGray)
+        .border_style(theme::BORDER)
         .title(" tasks ".bold().cyan());
 
     if order.is_empty() {
@@ -64,14 +65,14 @@ fn queue_heading(paused: bool) -> Line<'static> {
     let mut spans = vec![Span::styled(
         " queue",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     )];
     if paused {
         spans.push(Span::styled(
             " · ⏸ paused",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARN)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -87,7 +88,7 @@ fn queued_task_line(task: &Task) -> Line<'static> {
             format!("{:<9}", task.status.label()),
             Style::default().fg(status::task_color(task.status)),
         ),
-        Span::styled(truncate(&app::task_summary(&task.goal), 18), Color::Gray),
+        Span::styled(truncate(&app::task_summary(&task.goal), 18), theme::TEXT),
     ])
 }
 
@@ -95,7 +96,7 @@ fn queued_task_line(task: &Task) -> Line<'static> {
 fn employee_header(employee: &Employee, tick: u64, selected: bool) -> Line<'static> {
     let name_style = if selected {
         Style::default()
-            .fg(Color::White)
+            .fg(theme::TEXT_BRIGHT)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
@@ -104,8 +105,8 @@ fn employee_header(employee: &Employee, tick: u64, selected: bool) -> Line<'stat
         status::icon_span(employee.status, tick),
         Span::raw(" "),
         Span::styled(truncate(&employee.name, 18), name_style),
-        Span::styled(" · ", Color::DarkGray),
-        Span::styled(employee.role.clone(), Color::DarkGray),
+        Span::styled(" · ", theme::MUTED),
+        Span::styled(employee.role.clone(), theme::MUTED),
     ])
 }
 
@@ -119,6 +120,6 @@ fn task_line(employee: &Employee) -> Line<'static> {
                 Style::default().fg(status::text_color(employee.status)),
             ),
         ]),
-        None => Line::from(Span::styled("  —", Color::DarkGray)),
+        None => Line::from(Span::styled("  —", theme::MUTED)),
     }
 }

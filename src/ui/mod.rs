@@ -15,6 +15,7 @@ pub mod sidebar;
 mod status;
 pub use status::thinking_line;
 mod tasks;
+pub(crate) mod theme;
 mod wires;
 
 pub use hit::Target;
@@ -22,7 +23,7 @@ pub use hit::Target;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
@@ -169,8 +170,8 @@ fn render_title(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 " mywaker ",
                 Style::default()
-                    .bg(Color::Cyan)
-                    .fg(Color::Black)
+                    .bg(theme::ACCENT)
+                    .fg(theme::ON_ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -179,7 +180,7 @@ fn render_title(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ];
         if let Some(project) = app.active_project() {
-            spans.push(Span::styled(format!(" · {}", project.name), Color::Gray));
+            spans.push(Span::styled(format!(" · {}", project.name), theme::TEXT));
         }
         spans
     });
@@ -194,20 +195,20 @@ fn render_title(frame: &mut Frame, app: &App, area: Rect) {
 fn connection_line(app: &App) -> Line<'static> {
     if let Some(err) = app.connection_error() {
         return Line::from(vec![
-            Span::styled("✕ ", Color::Red),
-            Span::styled(err.to_string(), Color::Red),
+            Span::styled("✕ ", theme::ERR),
+            Span::styled(err.to_string(), theme::ERR),
         ]);
     }
     if let Some(version) = app.server_version() {
         return Line::from(vec![
-            Span::styled("● ", Color::Green),
+            Span::styled("● ", theme::OK),
             Span::raw(format!("opencode v{version}")),
-            Span::styled(format!(" · {} agents", app.agent_count()), Color::Gray),
+            Span::styled(format!(" · {} agents", app.agent_count()), theme::TEXT),
         ]);
     }
     Line::from(vec![
-        Span::styled(spinner_at(app.frame()).to_string(), Color::Yellow),
-        Span::styled(" connecting…".to_string(), Color::Gray),
+        Span::styled(spinner_at(app.frame()).to_string(), theme::WARN),
+        Span::styled(" connecting…".to_string(), theme::TEXT),
     ])
 }
 
@@ -232,15 +233,21 @@ fn render_log(frame: &mut Frame, app: &App, area: Rect) {
 
     // The latest error leads the panel: a failed turn must never be invisible
     // because the roster's log has room for little else, so it is surfaced here
-    // in the error colour rather than buried in the dim progress lines.
+    // rather than buried in the dim progress lines.
+    //
+    // K7 (`docs/keymap.md` §3.8): the glyph and the class word carry the error
+    // colour, but the **prose is body text**. Drawing the whole line in `Red`
+    // measured 2.85:1 against the terminal's background; `err` is reserved for
+    // the marker and the word, which is what a reader scans for.
     let latest_error = app.log().iter().rev().find(|line| line.error).cloned();
     if let Some(error) = &latest_error {
         text.push(Line::from(vec![
             Span::styled(
                 "✕ ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(error.text.clone(), Style::default().fg(Color::Red)),
+            Span::styled("error ", Style::default().fg(theme::ERR)),
+            Span::styled(error.text.clone(), Style::default().fg(theme::TEXT)),
         ]));
     }
 
@@ -263,9 +270,9 @@ fn render_log(frame: &mut Frame, app: &App, area: Rect) {
             continue;
         }
         let style = if line.error {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme::MUTED)
         };
         text.push(Line::from(Span::styled(line.text.clone(), style)));
         budget -= 1;
@@ -273,7 +280,7 @@ fn render_log(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Color::DarkGray)
+        .border_style(theme::BORDER)
         .title(" log ".bold().cyan());
 
     frame.render_widget(Paragraph::new(text).block(block), area);
@@ -290,70 +297,86 @@ fn telemetry_stats(app: &App) -> Line<'static> {
     let hit = usage.cache_hit_rate() * 100.0;
 
     Line::from(vec![
-        Span::styled(" usage ", Color::Cyan),
+        Span::styled(" usage ", theme::ACCENT),
         Span::styled(
             format!(
                 "{}/{} in/out",
                 fmt_count(usage.input_tokens),
                 fmt_count(usage.output_tokens)
             ),
-            Color::Gray,
+            theme::TEXT,
         ),
         Span::raw(" · "),
         Span::styled(
             format!("cache {hit:.0}% ({})", fmt_count(usage.cache_read_tokens)),
-            Color::Gray,
+            theme::TEXT,
         ),
         Span::raw(" · "),
-        Span::styled(format!("ram {ram}"), Color::Gray),
+        Span::styled(format!("ram {ram}"), theme::TEXT),
         Span::raw(" · "),
-        Span::styled(format!("cpu {:.1}%", metrics.cpu_percent()), Color::Gray),
+        Span::styled(format!("cpu {:.1}%", metrics.cpu_percent()), theme::TEXT),
     ])
 }
 
 fn stream_stats(app: &App) -> Line<'static> {
     let mut spans: Vec<Span> = vec![
-        Span::styled(" stream ", Color::Cyan),
-        Span::styled(format!("{} agents", app.agent_count()), Color::Gray),
+        Span::styled(" stream ", theme::ACCENT),
+        Span::styled(format!("{} agents", app.agent_count()), theme::TEXT),
         Span::raw(" · "),
-        Span::styled(format!("{} events", app.event_count()), Color::Gray),
+        Span::styled(format!("{} events", app.event_count()), theme::TEXT),
     ];
     if let Some(event) = app.last_event() {
         spans.push(Span::raw(" · "));
-        spans.push(Span::styled(format!("last: {event}"), Color::Gray));
+        spans.push(Span::styled(format!("last: {event}"), theme::TEXT));
     }
     Line::from(spans)
 }
 
-/// The bottom hint bar: the active screen's keys, as `(key, description)` pairs
-/// in display order. The bar is data so a screen's hints are one list, not a run
-/// of hand-built spans.
-fn hint_bar(app: &App) -> Line<'static> {
+/// The bottom hint bar: at most five key pairs for the focused region, with
+/// `? help` reserved first (`docs/help-palette.md` §4.1–§4.2, `docs/keymap.md`
+/// §3.2).
+///
+/// Two rules make this decidable rather than taste:
+///
+/// 1. **Keys only.** `wheel`/`click` are pointer hints, not `KeyCode`s, so they
+///    live in a separate list (`docs/keymap.md` §3.9) and are admitted only after
+///    every key hint — they never displace `? help`.
+/// 2. **Whole pairs drop, never a clipped pair** (U3b). The bar is composed by
+///    measuring, so a narrow terminal loses pairs from the bottom of the priority
+///    order instead of cutting one mid-description — today's failure, where the
+///    terminal cut `Ctrl-Y copy` and then `m`.
+fn hint_bar(app: &App, width: usize) -> Line<'static> {
+    // `? help` is reserved out of the budget before anything else is admitted,
+    // so U3(c) cannot fail by arithmetic (§3.2's reading of the two rules).
+    const HELP: (&str, &str) = ("?", "help");
+    let help_width = pair_width(HELP);
+
+    // Priority order: the roster's frozen five-slot list (§3.2) leads, and each
+    // mode's own hints follow in the order a user needs them.
     let hints: &[(&str, &str)] = match app.mode() {
+        Mode::Roster if app.prompt_focused() => &[
+            ("Enter", "send"),
+            ("↑/↓", "recall"),
+            ("Esc", "back"),
+            ("Ctrl-F", "focus"),
+        ],
         Mode::Roster => &[
             ("↑↓←→", "move"),
-            ("wheel", "scroll"),
             ("i", "goal"),
             ("Enter", "chat"),
-            ("p", "projects"),
-            ("m", "model"),
+            ("f", "focus"),
             ("Space", "pause"),
-            ("s", "task"),
-            ("Ctrl-Y", "copy log"),
-            ("?", "help"),
-            ("q", "quit"),
         ],
         Mode::Models => &[
             ("type", "search"),
-            ("Ctrl-U", "clear"),
-            ("↑", "/"),
-            ("↓", "move"),
+            ("↑/k", "up"),
+            ("↓/j", "down"),
             ("Enter", "assign"),
             ("Esc", "back"),
         ],
         Mode::Projects => &[
-            ("↑/k", "move"),
-            ("↓/j", "move"),
+            ("↑/k", "up"),
+            ("↓/j", "down"),
             ("Enter", "select"),
             ("Esc", "back"),
         ],
@@ -361,28 +384,62 @@ fn hint_bar(app: &App) -> Line<'static> {
             ("Enter", "send"),
             ("↑/↓", "history"),
             ("PgUp/PgDn", "scroll"),
-            ("/trace", "trace"),
-            ("/copy", "copy log"),
             ("Esc", "back"),
             ("Ctrl-C", "stop"),
         ],
     };
-    hint_line(hints)
-}
 
-/// One hint bar line: every key in bold cyan with its padding, every description
-/// dim and trailing a space, so the pairs run together without gaps.
-fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
-    let mut spans = Vec::with_capacity(hints.len() * 2);
-    for (key, description) in hints {
-        spans.push(format!(" {key} ").bold().cyan());
-        spans.push(format!("{description} ").dim());
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = help_width;
+
+    // Admit whole pairs in priority order until the next would overflow. The cap
+    // of five slots is inclusive of the reserved help slot, so at most four
+    // others are drawn.
+    for (key, description) in hints.iter().take(4) {
+        let width_needed = pair_width((key, description));
+        if used + width_needed > width {
+            break;
+        }
+        used += width_needed;
+        spans.push(format!(" {key} ").bold().fg(theme::ACCENT));
+        spans.push(format!("{description} ").fg(theme::MUTED));
     }
+
+    // Pointer hints come last, and only if they fit after every admitted key
+    // hint — never at the expense of `? help` (§3.9).
+    for (key, description) in pointer_hints(app) {
+        let width_needed = pair_width((key, description));
+        if used + width_needed > width {
+            break;
+        }
+        used += width_needed;
+        spans.push(format!(" {key} ").fg(theme::MUTED));
+        spans.push(format!("{description} ").fg(theme::MUTED));
+    }
+
+    spans.push(format!(" {} ", HELP.0).bold().fg(theme::ACCENT));
+    spans.push(format!("{} ", HELP.1).fg(theme::MUTED));
+
     Line::from(spans)
 }
 
+/// The display width of one ` key ` + `description ` pair.
+fn pair_width((key, description): (&str, &str)) -> usize {
+    1 + key.chars().count() + 1 + description.chars().count() + 1
+}
+
+/// Pointer hints for the focused region — not keys, so they are a separate kind
+/// (`docs/keymap.md` §3.9).
+fn pointer_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+    match app.mode() {
+        Mode::Roster if !app.prompt_focused() => &[("wheel", "scroll"), ("click", "select")],
+        Mode::Chat => &[("wheel", "scroll")],
+        _ => &[],
+    }
+}
+
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
-    frame.render_widget(Paragraph::new(hint_bar(app)), area);
+    frame.render_widget(Paragraph::new(hint_bar(app, area.width as usize)), area);
 }
 
 /// Centre a fixed-size popup within `area`, clamped to the terminal size.
@@ -412,7 +469,7 @@ pub(crate) fn key_hint(key: &'static str, description: &'static str) -> Line<'st
         Span::styled(
             key,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("  {description}")),
@@ -426,27 +483,39 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(Span::styled(
             t,
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARN)
                 .add_modifier(Modifier::BOLD),
         ))
     };
 
     vec![
         head(" global"),
-        key("q · Esc", "quit (any screen)"),
-        key("?", "this help overlay"),
-        key("click · wheel", "select · scroll"),
+        // K3: `q` quits from anywhere, but `Esc` does not — it restores focus
+        // mode, dismisses an overlay, or closes chat first (§3.6's precedence).
+        // The old single row `q · Esc — quit (any screen)` was false.
+        key("q", "quit (any screen)"),
+        key("Esc", "back · restore"),
+        // K3: `?` is roster-only help; in chat the discovery path is `/help`,
+        // and in a text field `?` types a `?`.
+        key("?", "help (roster · chat via /help)"),
+        key("Ctrl-P", "command palette"),
         Line::from(""),
         head(" roster"),
         key("↑↓←→ h/j/k/l", "move around the employee grid"),
         key("PgUp/PgDn", "move a page of cards"),
-        key("wheel", "scroll the grid (the selection stays put)"),
         key("i · Tab", "type a goal for the selected employee"),
         key("Enter", "chat with the selected employee"),
-        key("m", "pick a model"),
-        key("p", "choose the working project"),
+        key("m · M", "pick a model"),
+        key("p · P", "choose the working project"),
         key("Space", "pause / resume the task engine"),
         key("s", "pause / resume the selected employee's task"),
+        key("f", "focus mode (Ctrl-F in a text field)"),
+        Line::from(""),
+        head(" pointer"),
+        // §3.9: pointer hints are their own kind, so they get their own section
+        // rather than sitting among the keys.
+        key("click", "select"),
+        key("wheel", "scroll (the selection stays put)"),
         Line::from(""),
         head(" goal prompt"),
         key("Enter", "send the goal · Shift+Enter newline"),
@@ -476,8 +545,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let popup = centered(area, 68, 30);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Color::Cyan)
-        .bg(Color::Black)
+        .border_style(theme::ACCENT)
+        .bg(theme::ON_ACCENT)
         .title(" help ".bold().cyan());
     frame.render_widget(Paragraph::new(help_lines()).block(block), popup);
 }
@@ -495,27 +564,27 @@ fn render_shutdown(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 spinner.to_string(),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::WARN)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "  shutting down…",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::WARN)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             "flushing state…",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         )),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Color::DarkGray)
-        .bg(Color::Black)
+        .border_style(theme::BORDER)
+        .bg(theme::ON_ACCENT)
         .title(" mywaker ".bold().cyan());
 
     frame.render_widget(
@@ -524,4 +593,102 @@ fn render_shutdown(frame: &mut Frame, app: &App, area: Rect) {
             .alignment(Alignment::Center),
         popup,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::message::Message;
+
+    /// A disconnected app: enough to render the hint bar and the help overlay,
+    /// which read mode, focus and the team — not the service.
+    fn app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(16);
+        App::new(Config::default(), tx)
+    }
+
+    /// The pair's width is `1 + key + 1 + description + 1` (`help-palette.md`
+    /// §4.2). Pinned because the hint bar's budget arithmetic depends on it.
+    #[test]
+    fn pair_width_counts_its_padding() {
+        assert_eq!(pair_width(("i", "goal")), 8);
+        assert_eq!(pair_width(("↑↓←→", "move")), 11);
+        assert_eq!(pair_width(("Ctrl-Y", "copy log")), 17);
+    }
+
+    /// K4/U3: the bar advertises at most five pairs **including** the reserved
+    /// `? help`, and the roster's four lead pairs are the frozen ones from
+    /// `docs/keymap.md` §3.2 — 48 columns total, so nothing is clipped at 60×16.
+    #[test]
+    fn hint_bar_is_five_pairs_and_never_clips() {
+        let app = app();
+        let line = hint_bar(&app, 60);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.chars().count() <= 60,
+            "bar is {} columns: {text}",
+            text.chars().count()
+        );
+        assert!(
+            text.ends_with("? help "),
+            "the escape hatch is last: {text:?}"
+        );
+        for expected in ["↑↓←→ move", "i goal", "Enter chat", "f focus"] {
+            assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+        }
+    }
+
+    /// U3(b): a pair is never cut mid-description. At a width too narrow for
+    /// every pair, whole pairs drop and `? help` survives.
+    #[test]
+    fn hint_bar_drops_whole_pairs_and_keeps_help() {
+        let app = app();
+        let line = hint_bar(&app, 30);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.chars().count() <= 30,
+            "bar is {} columns: {text}",
+            text.chars().count()
+        );
+        assert!(text.ends_with("? help "), "help survives: {text:?}");
+        // Every drawn description is whole: `focus` never appears as `focu…`.
+        for partial in ["focu ", "focu…", "cha ", "ch…"] {
+            assert!(!text.contains(partial), "clipped pair in {text:?}");
+        }
+    }
+
+    /// K3: the help overlay no longer claims `Esc` quits from any screen, and it
+    /// says `?` is roster-only.
+    #[test]
+    fn help_copy_scopes_esc_and_question_mark() {
+        let lines: Vec<String> = help_lines()
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let body = lines.join("\n");
+        // The false row was the *combined* one; `q` alone may still say
+        // "quit (any screen)", which is true.
+        assert!(!body.contains("q · Esc"), "K3: combined quit row: {body}");
+        assert!(body.contains("back · restore"), "K3: {body}");
+        assert!(
+            body.contains("help (roster · chat via /help)"),
+            "K3: {body}"
+        );
+    }
+
+    /// K3/§3.9: pointer hints are their own section, not mixed into the keys.
+    #[test]
+    fn help_separates_pointer_hints() {
+        let lines: Vec<String> = help_lines()
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let body = lines.join("\n");
+        assert!(body.contains(" pointer"), "no pointer section: {body}");
+        assert!(
+            !body.contains("click · wheel"),
+            "pointer still mixed in: {body}"
+        );
+    }
 }

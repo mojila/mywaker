@@ -7,8 +7,9 @@
 //! keeps the two cursors from drifting apart (one showing a character the other
 //! would have scrolled past).
 
+use super::theme;
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -84,12 +85,12 @@ pub(crate) fn line<'a>(
     show_cursor: bool,
 ) -> Line<'a> {
     let window = window(text, cursor, scroll);
-    let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::Cyan))];
+    let mut spans = vec![Span::styled(prefix, Style::default().fg(theme::ACCENT))];
     if !window.before.is_empty() {
         spans.push(Span::raw(window.before));
     }
     if show_cursor {
-        spans.push(Span::styled(CURSOR, Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(CURSOR, Style::default().fg(theme::ACCENT)));
     }
     if !window.after.is_empty() {
         spans.push(Span::raw(window.after));

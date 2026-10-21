@@ -17,6 +17,8 @@ use crate::task::TaskStatus;
 use crate::team::EmployeeStatus;
 use crate::ui::truncate;
 
+use super::theme;
+
 /// Braille spinner frames, indexed by the app tick (in sync with the avatar).
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -28,12 +30,13 @@ pub fn spinner(tick: u64) -> &'static str {
 /// The accent colour for an employee status — its border, title, and status
 /// text.
 pub fn color(status: EmployeeStatus) -> Color {
+    // Lookups into the palette, not a second table (`docs/keymap.md` §2.2 rule 3).
     match status {
-        EmployeeStatus::Idle => Color::DarkGray,
-        EmployeeStatus::Thinking => Color::Yellow,
-        EmployeeStatus::Working => Color::Cyan,
-        EmployeeStatus::Done => Color::Green,
-        EmployeeStatus::Error => Color::Red,
+        EmployeeStatus::Idle => theme::MUTED,
+        EmployeeStatus::Thinking => theme::WARN,
+        EmployeeStatus::Working => theme::ACCENT,
+        EmployeeStatus::Done => theme::OK,
+        EmployeeStatus::Error => theme::ERR,
     }
 }
 
@@ -41,7 +44,7 @@ pub fn color(status: EmployeeStatus) -> Color {
 /// as [`color`], brightened out of the dim idle grey so the text stays legible.
 pub fn text_color(status: EmployeeStatus) -> Color {
     match status {
-        EmployeeStatus::Idle => Color::Gray,
+        EmployeeStatus::Idle => theme::TEXT,
         other => color(other),
     }
 }
@@ -76,12 +79,12 @@ pub fn thinking_line(tick: u64, tail: &str, width: usize) -> Line<'static> {
     let mut spans = vec![
         Span::styled(
             format!("{} ", spinner(tick)),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARN),
         ),
         Span::styled(
             "thinking",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARN)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -94,7 +97,7 @@ pub fn thinking_line(tick: u64, tail: &str, width: usize) -> Line<'static> {
         spans.push(Span::styled(
             truncate(tail, room),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(theme::MUTED)
                 .add_modifier(Modifier::DIM),
         ));
     }
@@ -116,17 +119,18 @@ pub fn thinking_indicator(
 /// The accent colour for a persisted task's status (the queue panel).
 pub fn task_color(status: TaskStatus) -> Color {
     match status {
-        TaskStatus::Pending => Color::DarkGray,
-        TaskStatus::Running => Color::Cyan,
-        TaskStatus::Paused => Color::Yellow,
-        TaskStatus::Retrying => Color::Yellow,
-        TaskStatus::Succeeded => Color::Green,
-        TaskStatus::Failed => Color::Red,
+        TaskStatus::Pending => theme::MUTED,
+        TaskStatus::Running => theme::ACCENT,
+        TaskStatus::Paused => theme::WARN,
+        TaskStatus::Retrying => theme::WARN,
+        TaskStatus::Succeeded => theme::OK,
+        TaskStatus::Failed => theme::ERR,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::theme;
     use super::*;
 
     #[test]
@@ -150,7 +154,7 @@ mod tests {
     /// latched task summary stays readable.
     #[test]
     fn body_text_color_only_diverges_from_the_accent_when_idle() {
-        assert_eq!(text_color(EmployeeStatus::Idle), Color::Gray);
+        assert_eq!(text_color(EmployeeStatus::Idle), theme::TEXT);
         assert_ne!(
             text_color(EmployeeStatus::Idle),
             color(EmployeeStatus::Idle),
@@ -169,12 +173,12 @@ mod tests {
 
     #[test]
     fn task_colors_track_task_status() {
-        assert_eq!(task_color(TaskStatus::Pending), Color::DarkGray);
-        assert_eq!(task_color(TaskStatus::Running), Color::Cyan);
-        assert_eq!(task_color(TaskStatus::Paused), Color::Yellow);
-        assert_eq!(task_color(TaskStatus::Retrying), Color::Yellow);
-        assert_eq!(task_color(TaskStatus::Succeeded), Color::Green);
-        assert_eq!(task_color(TaskStatus::Failed), Color::Red);
+        assert_eq!(task_color(TaskStatus::Pending), theme::MUTED);
+        assert_eq!(task_color(TaskStatus::Running), theme::ACCENT);
+        assert_eq!(task_color(TaskStatus::Paused), theme::WARN);
+        assert_eq!(task_color(TaskStatus::Retrying), theme::WARN);
+        assert_eq!(task_color(TaskStatus::Succeeded), theme::OK);
+        assert_eq!(task_color(TaskStatus::Failed), theme::ERR);
         // Active work reads brighter than terminal work.
         assert_ne!(
             task_color(TaskStatus::Running),

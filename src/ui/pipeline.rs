@@ -27,6 +27,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use super::theme;
 use crate::app::App;
 use crate::opencode::{ToolClass, ToolUse};
 use crate::team::{Employee, EmployeeStatus};
@@ -595,12 +596,12 @@ fn render_title(frame: &mut Frame, grid: &Grid) {
         Span::styled(
             " team ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("· {}", grid.count),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         ),
     ];
 
@@ -614,7 +615,7 @@ fn render_title(frame: &mut Frame, grid: &Grid) {
     if working > 0 && working_text.chars().count() <= room_for(head.chars().count()) {
         spans.push(Span::styled(
             working_text.clone(),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme::OK),
         ));
     }
 
@@ -630,7 +631,7 @@ fn render_title(frame: &mut Frame, grid: &Grid) {
         .into_iter()
         .find(|text| text.chars().count() <= room_for(used));
         if let Some(text) = text {
-            spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(text, Style::default().fg(theme::MUTED)));
         }
     }
 
@@ -644,8 +645,8 @@ fn render_heading(frame: &mut Frame, section: Section, area: Rect, count: usize)
         return;
     }
     let accent = match section {
-        Section::Active => Color::Green,
-        Section::Idle => Color::DarkGray,
+        Section::Active => theme::OK,
+        Section::Idle => theme::MUTED,
     };
     let mut spans = vec![
         Span::styled(
@@ -665,7 +666,7 @@ fn render_heading(frame: &mut Frame, section: Section, area: Rect, count: usize)
         + tail.chars().count()
         <= area.width as usize
     {
-        spans.push(Span::styled(tail, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(tail, Style::default().fg(theme::MUTED)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -688,11 +689,7 @@ fn render_strip(frame: &mut Frame, app: &App, area: Rect) {
 /// The strip's content: on/off and, when there is room, its decision model.
 fn jev_spans(app: &App) -> Vec<Span<'static>> {
     let enabled = app.jev_enabled();
-    let accent = if enabled {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
+    let accent = if enabled { theme::ACCENT } else { theme::MUTED };
     let mut spans = vec![
         Span::styled(
             "jev ",
@@ -701,17 +698,13 @@ fn jev_spans(app: &App) -> Vec<Span<'static>> {
         Span::styled("◆", Style::default().fg(accent)),
         Span::styled(
             if enabled { " on — @jev " } else { " off " },
-            Style::default().fg(if enabled {
-                Color::Green
-            } else {
-                Color::DarkGray
-            }),
+            Style::default().fg(if enabled { theme::OK } else { theme::MUTED }),
         ),
     ];
     if enabled && let Some(model) = app.jev_model() {
         spans.push(Span::styled(
             format!("· {model} "),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme::ACCENT),
         ));
     }
     spans
@@ -727,7 +720,7 @@ fn render_bus(frame: &mut Frame, grid: &Grid) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let style = Style::default().fg(Color::DarkGray);
+    let style = Style::default().fg(theme::MUTED);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             wires::BUS.repeat(area.width as usize),
@@ -752,7 +745,7 @@ fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, s
     );
     let border = if selected {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(accent)
@@ -764,12 +757,9 @@ fn render_stage(frame: &mut Frame, app: &App, employee: &Employee, area: Rect, s
             &employee.name,
             width,
         ),
-        Line::from(Span::styled(
-            truncate(&employee.role, width),
-            Color::DarkGray,
-        )),
+        Line::from(Span::styled(truncate(&employee.role, width), theme::MUTED)),
         activity_line(employee.status, tick, width, accent),
-        model_line(employee.model.as_deref(), width, Color::Cyan),
+        model_line(employee.model.as_deref(), width, theme::ACCENT),
         tool_line(employee.last_tool.as_ref(), width),
     ];
 
@@ -868,7 +858,7 @@ fn model_line(model: Option<&str>, inner_width: usize, accent: Color) -> Line<'s
         None => Line::from(Span::styled(
             "none",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(theme::MUTED)
                 .add_modifier(Modifier::DIM),
         )),
     }
@@ -898,7 +888,7 @@ fn model_line(model: Option<&str>, inner_width: usize, accent: Color) -> Line<'s
 /// therefore all plain ASCII.
 fn tool_line(tool: Option<&ToolUse>, inner_width: usize) -> Line<'static> {
     const PREFIX: &str = "tool ";
-    let label = Style::default().fg(Color::DarkGray);
+    let label = Style::default().fg(theme::MUTED);
     let room = inner_width.saturating_sub(PREFIX.chars().count());
 
     let Some(tool) = tool else {
@@ -914,7 +904,7 @@ fn tool_line(tool: Option<&ToolUse>, inner_width: usize) -> Line<'static> {
     if room == 0 {
         return Line::from(Span::styled(
             truncate(&tool.label(), inner_width),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         ));
     }
 
@@ -930,7 +920,7 @@ fn tool_line(tool: Option<&ToolUse>, inner_width: usize) -> Line<'static> {
         ));
         spans.push(Span::styled(
             truncate(&tool.name, name_room),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         ));
     } else {
         // The prefix would not survive truncation, so it is dropped whole rather
@@ -939,7 +929,7 @@ fn tool_line(tool: Option<&ToolUse>, inner_width: usize) -> Line<'static> {
         // gloss.
         spans.push(Span::styled(
             truncate(&tool.name, room),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         ));
     }
     Line::from(spans)
@@ -949,13 +939,13 @@ fn tool_line(tool: Option<&ToolUse>, inner_width: usize) -> Line<'static> {
 /// enough not to compete with the card's status border.
 fn tool_class_style(class: ToolClass) -> Style {
     let color = match class {
-        ToolClass::Skill => Color::Cyan,
-        ToolClass::Subagent => Color::Magenta,
+        ToolClass::Skill => theme::ACCENT,
+        ToolClass::Subagent => theme::INFO,
         ToolClass::Mcp => Color::Blue,
-        ToolClass::Plugin => Color::Yellow,
+        ToolClass::Plugin => theme::WARN,
         // No prefix is drawn for these, so the colour is never seen; gray keeps
         // the mapping total.
-        ToolClass::Builtin | ToolClass::Namespaced => Color::Gray,
+        ToolClass::Builtin | ToolClass::Namespaced => theme::TEXT,
     };
     Style::default().fg(color)
 }
@@ -1453,14 +1443,14 @@ mod tests {
         use crate::team::EmployeeStatus;
 
         let width = 30;
-        let done = activity_line(EmployeeStatus::Done, 0, width, Color::Green);
+        let done = activity_line(EmployeeStatus::Done, 0, width, theme::OK);
         let text: String = done.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("done"), "{text}");
         assert!(text.contains('█'), "a done card's bar is full: {text}");
         // Bar cells + label + a gap: 23 + 4 + 1 at this width.
         assert_eq!(text.chars().count(), 28, "the row fills the card: {text}");
 
-        let idle = activity_line(EmployeeStatus::Idle, 0, width, Color::DarkGray);
+        let idle = activity_line(EmployeeStatus::Idle, 0, width, theme::MUTED);
         let text: String = idle.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("idle"), "{text}");
         assert!(
@@ -1470,8 +1460,8 @@ mod tests {
 
         // Working is mid-fill and animates with the tick: two different ticks
         // produce different bars, so the card visibly moves.
-        let a = activity_line(EmployeeStatus::Working, 2, width, Color::Cyan);
-        let b = activity_line(EmployeeStatus::Working, 7, width, Color::Cyan);
+        let a = activity_line(EmployeeStatus::Working, 2, width, theme::ACCENT);
+        let b = activity_line(EmployeeStatus::Working, 7, width, theme::ACCENT);
         let a_text: String = a.spans.iter().map(|s| s.content.as_ref()).collect();
         let b_text: String = b.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_ne!(a_text, b_text, "working bars should animate");
@@ -1479,7 +1469,7 @@ mod tests {
         // Narrow cards keep the label; the bar shrinks to what remains.
         // `bar_width = 12 - len("working") - 3 = 2` (the `.max(2)` floor), so the
         // row is bar + gap + label = 2 + 1 + 7 = 10 columns.
-        let narrow = activity_line(EmployeeStatus::Working, 0, 12, Color::Cyan);
+        let narrow = activity_line(EmployeeStatus::Working, 0, 12, theme::ACCENT);
         let text: String = narrow.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("working"), "{text}");
         assert_eq!(text.chars().count(), 10, "{text}");
@@ -1518,14 +1508,14 @@ mod tests {
     /// width — and a dimmed `none` when nothing is assigned.
     #[test]
     fn model_row_truncates_to_the_inner_width_and_placeholders_none() {
-        let assigned = model_line(Some("deepseek-v4.1-flash-free"), 40, Color::Cyan);
+        let assigned = model_line(Some("deepseek-v4.1-flash-free"), 40, theme::ACCENT);
         assert_eq!(assigned.spans[0].content, "deepseek-v4.1-flash-free");
 
-        let clipped = model_line(Some("deepseek-v4.1-flash-free"), 10, Color::Cyan);
+        let clipped = model_line(Some("deepseek-v4.1-flash-free"), 10, theme::ACCENT);
         assert_eq!(clipped.spans[0].content, "deepseek-…");
         assert!(clipped.spans[0].content.chars().count() <= 10);
 
-        let unassigned = model_line(None, 40, Color::Cyan);
+        let unassigned = model_line(None, 40, theme::ACCENT);
         assert_eq!(unassigned.spans[0].content, "none");
     }
 
@@ -1574,7 +1564,7 @@ mod tests {
         assert!(absent.spans[0].content.is_ascii());
         assert_eq!(
             absent.spans[0].style.fg,
-            Some(Color::DarkGray),
+            Some(theme::MUTED),
             "the placeholder is dim, like the sidebar's empty rows"
         );
         assert!(
@@ -1593,24 +1583,24 @@ mod tests {
     #[test]
     fn tool_row_renders_each_class_label() {
         let cases = [
-            (ToolUse::builtin("shell"), "", "shell", Color::Gray),
+            (ToolUse::builtin("shell"), "", "shell", theme::TEXT),
             (
                 ToolUse::new(ToolClass::Skill, "opencode"),
                 "skill:",
                 "opencode",
-                Color::Cyan,
+                theme::ACCENT,
             ),
             (
                 ToolUse::new(ToolClass::Subagent, "backend"),
                 "subagent:",
                 "backend",
-                Color::Magenta,
+                theme::INFO,
             ),
             (
                 ToolUse::new(ToolClass::Namespaced, "db-audit.run_select_query"),
                 "",
                 "db-audit.run_select_query",
-                Color::Gray,
+                theme::TEXT,
             ),
         ];
 
@@ -1622,12 +1612,12 @@ mod tests {
                 // One gray name: no prefix span to colour.
                 assert_eq!(line.spans.len(), 2, "{}", tool.label());
                 assert_eq!(line.spans[1].content, name);
-                assert_eq!(line.spans[1].style.fg, Some(Color::Gray));
+                assert_eq!(line.spans[1].style.fg, Some(theme::TEXT));
             } else {
                 assert_eq!(line.spans[1].content, prefix, "{}", tool.label());
                 assert_eq!(line.spans[1].style.fg, Some(color), "{}", tool.label());
                 assert_eq!(line.spans[2].content, name, "{}", tool.label());
-                assert_eq!(line.spans[2].style.fg, Some(Color::Gray));
+                assert_eq!(line.spans[2].style.fg, Some(theme::TEXT));
             }
         }
     }

@@ -6,13 +6,14 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem as WidgetListItem, ListState, Paragraph},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::theme;
 use crate::app::{App, TranscriptLine, TranscriptRole};
 use crate::ui::truncate;
 
@@ -58,11 +59,11 @@ fn render_transcript(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Color::DarkGray)
+        .border_style(theme::BORDER)
         .title(title)
         .title_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -94,10 +95,10 @@ fn transcript_lines(
             &mut lines,
             "◔ ",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARN)
                 .add_modifier(Modifier::BOLD),
             streaming,
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARN),
             None,
             width,
         );
@@ -152,7 +153,7 @@ fn tagged_block(
         {
             spans.push(Span::styled(
                 format!(" · {meta}"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::MUTED),
             ));
         }
         lines.push(Line::from(spans));
@@ -167,7 +168,7 @@ fn role_mapping(role: TranscriptRole, name: Option<&str>) -> (String, Style, Sty
         TranscriptRole::User => (
             "you ".to_string(),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
             Style::default(),
         ),
@@ -178,21 +179,19 @@ fn role_mapping(role: TranscriptRole, name: Option<&str>) -> (String, Style, Sty
                 .unwrap_or("assistant");
             (
                 format!("{label} "),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::OK).add_modifier(Modifier::BOLD),
                 Style::default(),
             )
         }
         TranscriptRole::Error => (
             "error ".to_string(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme::ERR).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::ERR),
         ),
         TranscriptRole::Info => (
             "".to_string(),
             Style::default(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         ),
     }
 }
@@ -207,8 +206,8 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_code = false;
     let mut list_indent: Option<usize> = None;
-    let marker_style = Style::default().fg(Color::Cyan);
-    let gutter = Style::default().fg(Color::DarkGray);
+    let marker_style = Style::default().fg(theme::ACCENT);
+    let gutter = Style::default().fg(theme::MUTED);
 
     for raw in text.lines() {
         let trimmed = raw.trim_start();
@@ -226,7 +225,7 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
                     out.push(Line::from(Span::styled(
                         format!("─ {lang} "),
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(theme::ACCENT)
                             .add_modifier(Modifier::BOLD),
                     )));
                 }
@@ -248,7 +247,9 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
                     Span::styled("│ ", gutter),
                     Span::styled(
                         seg,
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                        Style::default()
+                            .fg(theme::ACCENT)
+                            .add_modifier(Modifier::DIM),
                     ),
                 ]));
             }
@@ -268,7 +269,7 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
         {
             out.push(Line::from(Span::styled(
                 "─".repeat(width),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::MUTED),
             )));
             list_indent = None;
             continue;
@@ -346,7 +347,7 @@ fn markdown_lines(text: &str, width: usize, base: Style) -> Vec<Line<'static>> {
         if trimmed.starts_with('>') {
             let body = trimmed.strip_prefix('>').unwrap_or(trimmed).trim_start();
             for seg in wrap_text(body, width.saturating_sub(2)) {
-                let mut spans = vec![Span::styled("▌ ", Style::default().fg(Color::Cyan))];
+                let mut spans = vec![Span::styled("▌ ", Style::default().fg(theme::ACCENT))];
                 spans.extend(inline_line(&seg, base.add_modifier(Modifier::DIM)).spans);
                 out.push(Line::from(spans));
             }
@@ -554,7 +555,7 @@ fn inline_line(seg: &str, base: Style) -> Line<'static> {
             flush(&mut spans, &mut cur);
             spans.push(Span::styled(
                 chars[i + 1..j].iter().collect::<String>(),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme::ACCENT),
             ));
             i = j + 1;
             continue;
@@ -604,7 +605,7 @@ fn inline_line(seg: &str, base: Style) -> Line<'static> {
             spans.push(Span::styled(
                 chars[i + 1..j].iter().collect::<String>(),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::ACCENT)
                     .add_modifier(Modifier::UNDERLINED),
             ));
             i = k + 1;
@@ -703,7 +704,7 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     let line = super::input::line(text, cursor, scroll, "> ", true);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Color::DarkGray);
+        .border_style(theme::BORDER);
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
@@ -739,10 +740,10 @@ fn render_command_menu(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(
                     format!("{:<12}", opt.command),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme::ACCENT)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(opt.description, Style::default().fg(Color::Gray)),
+                Span::styled(opt.description, Style::default().fg(theme::TEXT)),
             ]))
         })
         .collect();
@@ -754,17 +755,19 @@ fn render_command_menu(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Color::DarkGray)
+                .border_style(theme::BORDER)
                 .title(" commands ")
                 .title_style(
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme::WARN)
                         .add_modifier(Modifier::BOLD),
                 ),
         )
         .highlight_style(
+            // K8: `selected_bg` **and** `selected_fg` (9.40:1).
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(super::theme::SELECTED_BG)
+                .fg(super::theme::SELECTED_FG)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("» ");
@@ -811,9 +814,9 @@ fn render_session_picker(frame: &mut Frame, app: &App, area: Rect) {
         items.push(WidgetListItem::new(Line::from(vec![
             Span::styled(
                 if fresh { "✚ " } else { "↺ " },
-                Style::default().fg(if fresh { Color::Green } else { Color::Cyan }),
+                Style::default().fg(if fresh { theme::OK } else { theme::ACCENT }),
             ),
-            Span::styled(label, Style::default().fg(Color::White)),
+            Span::styled(label, Style::default().fg(theme::TEXT_BRIGHT)),
         ])));
     }
 
@@ -824,23 +827,25 @@ fn render_session_picker(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Color::Cyan)
+                .border_style(theme::ACCENT)
                 .title(" previous sessions ")
                 .title_style(
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme::WARN)
                         .add_modifier(Modifier::BOLD),
                 ),
         )
         .highlight_style(
+            // K8: `selected_bg` **and** `selected_fg` (9.40:1).
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(super::theme::SELECTED_BG)
+                .fg(super::theme::SELECTED_FG)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("» ");
 
     let hints = super::key_hint("↑/↓ move · Enter open · n fresh · Esc back", "")
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(theme::MUTED));
 
     frame.render_widget(Clear, popup);
     // The hint sits inside the border: render the list into the full popup, then
@@ -918,7 +923,7 @@ mod tests {
         let line = inline_line("run `cargo test` now", Style::default());
         let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
         assert_eq!(texts, vec!["run ", "cargo test", " now"]);
-        assert_eq!(line.spans[1].style.fg, Some(Color::Cyan));
+        assert_eq!(line.spans[1].style.fg, Some(theme::ACCENT));
     }
 
     #[test]
@@ -927,7 +932,7 @@ mod tests {
         let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
         // The `(url)` is dropped; `text` is cyan and underlined.
         assert_eq!(texts, vec!["see ", "the docs", " here"]);
-        assert_eq!(line.spans[1].style.fg, Some(Color::Cyan));
+        assert_eq!(line.spans[1].style.fg, Some(theme::ACCENT));
         assert!(
             line.spans[1]
                 .style
@@ -964,7 +969,7 @@ mod tests {
     fn role_mapping_labels_assistant_with_employee_name() {
         let (tag, style, base) = role_mapping(TranscriptRole::Assistant, Some("writer"));
         assert_eq!(tag, "writer ");
-        assert_eq!(style.fg, Some(Color::Green));
+        assert_eq!(style.fg, Some(theme::OK));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(base, Style::default());
 
@@ -983,7 +988,7 @@ mod tests {
     fn role_mapping_expands_error_tag() {
         let (tag, _style, base) = role_mapping(TranscriptRole::Error, None);
         assert_eq!(tag, "error ");
-        assert_eq!(base.fg, Some(Color::Red));
+        assert_eq!(base.fg, Some(theme::ERR));
     }
 
     #[test]
@@ -1213,7 +1218,7 @@ mod tests {
             ]
         );
         // The bullet is cyan; the continuation indent is unstyled.
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme::ACCENT));
         assert_eq!(lines[1].spans[0].style, Style::default());
     }
 

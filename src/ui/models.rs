@@ -5,14 +5,14 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
 use crate::app::App;
 
-use super::layout;
+use super::{layout, theme};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let [header_area, search_area, list_area] = layout::model_areas(area);
@@ -22,14 +22,14 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let assigned = employee.and_then(|e| e.model.as_deref());
 
     let header = Paragraph::new(Line::from(vec![
-        Span::styled("model ", Color::Cyan),
-        Span::styled(format!(" for {employee_name}"), Color::Gray),
+        Span::styled("model ", theme::ACCENT),
+        Span::styled(format!(" for {employee_name}"), theme::TEXT),
         Span::styled(
             match assigned {
                 Some(model) => format!("  (assigned: {model})"),
                 None => "  (Enter to assign)".to_string(),
             },
-            Color::DarkGray,
+            theme::MUTED,
         ),
     ]));
     frame.render_widget(header, header_area);
@@ -37,17 +37,17 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let matches = app.filtered_models().len();
     let total = app.models().len();
     let search = Paragraph::new(Line::from(vec![
-        Span::styled(" search ", Color::Cyan),
-        Span::styled(app.model_filter().to_string(), Color::Yellow),
-        Span::styled("▏", Color::DarkGray),
-        Span::styled(format!("  ({matches}/{total})"), Color::DarkGray),
+        Span::styled(" search ", theme::ACCENT),
+        Span::styled(app.model_filter().to_string(), theme::WARN),
+        Span::styled("▏", theme::MUTED),
+        Span::styled(format!("  ({matches}/{total})"), theme::MUTED),
     ]));
     frame.render_widget(search, search_area);
 
     if total == 0 {
         let empty = Paragraph::new(Line::from(vec![Span::styled(
             "no models — make sure OpenCode has providers configured".to_string(),
-            Color::DarkGray,
+            theme::MUTED,
         )]))
         .block(
             Block::default()
@@ -72,7 +72,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or_else(|| "free".to_string());
             ListItem::new(Line::from(vec![
                 if active {
-                    Span::styled("✓ ", Color::Green)
+                    Span::styled("✓ ", theme::OK)
                 } else {
                     Span::raw("  ")
                 },
@@ -80,9 +80,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                     model.id.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  [{provider}]"), Color::DarkGray),
-                Span::styled(format!(" {name}"), Color::DarkGray),
-                Span::styled(format!("  {cost}"), Color::DarkGray),
+                Span::styled(format!("  [{provider}]"), theme::MUTED),
+                Span::styled(format!(" {name}"), theme::MUTED),
+                Span::styled(format!("  {cost}"), theme::MUTED),
             ]))
         })
         .collect();
@@ -90,7 +90,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     if items.is_empty() {
         let empty = Paragraph::new(Line::from(vec![Span::styled(
             format!("no models match \"{}\"", app.model_filter()),
-            Color::DarkGray,
+            theme::MUTED,
         )]))
         .block(
             Block::default()
@@ -114,8 +114,12 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                 .title(" models ".bold().cyan()),
         )
         .highlight_style(
+            // K8: `selected_bg` **and** `selected_fg` (9.40:1). The old
+            // `bg(DarkGray)` kept the item's own foreground, which fell to 3.18:1
+            // where that foreground was `Gray`.
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme::SELECTED_BG)
+                .fg(theme::SELECTED_FG)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");

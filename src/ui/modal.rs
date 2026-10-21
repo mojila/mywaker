@@ -8,13 +8,14 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use crate::app::App;
 
+use super::theme;
 use super::{centered, key_hint};
 
 /// Draw the reopen prompt over `area` — a no-op when there is no prompt to show.
@@ -33,12 +34,12 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(
             format!("{count} {noun} paused when mywaker closed."),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARN)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "They will be re-run from the beginning.",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::TEXT),
         )),
         Line::from(""),
         key_hint("y · Enter", "resume all"),
@@ -47,8 +48,8 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Color::Yellow)
-        .bg(Color::Black)
+        .border_style(theme::WARN)
+        .bg(theme::ON_ACCENT)
         .title(" resume paused tasks ".bold().cyan());
 
     frame.render_widget(

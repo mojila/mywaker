@@ -5124,3 +5124,113 @@ fn ctrl_y_copies_the_error_log_from_the_roster() {
     let last = app.log().last().unwrap();
     assert!(last.text.contains("error-log"), "{}", last.text);
 }
+
+// --- K1: models picker `j`/`k` (docs/keymap.md §3.8) ---
+
+/// `k`/`j` move the model selection, matching the project picker. The models
+/// filter is a text field, so this deliberately claims the two letters before the
+/// catch-all `Char(c)` arm that would otherwise type them into the query.
+#[test]
+fn model_picker_moves_with_k_and_j() {
+    let (mut app, _rx) = make_app();
+    app.models = model_list(4);
+    app.mode = Mode::Models;
+    app.model_selected = 2;
+
+    press(&mut app, KeyCode::Char('k'));
+    assert_eq!(app.model_selected, 1, "k moves up");
+
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.model_selected, 2, "j moves down");
+
+    // The letters are navigation, not filter input.
+    assert!(
+        app.model_filter().is_empty(),
+        "k/j must not reach the filter: {:?}",
+        app.model_filter()
+    );
+}
+
+/// The arrow keys still work, so the alias is additive rather than a swap.
+#[test]
+fn model_picker_arrows_still_move() {
+    let (mut app, _rx) = make_app();
+    app.models = model_list(4);
+    app.mode = Mode::Models;
+    app.model_selected = 1;
+
+    press(&mut app, KeyCode::Down);
+    assert_eq!(app.model_selected, 2);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.model_selected, 1);
+}
+
+// --- K7: the log band's error prose is body text, not error colour ---
+
+/// §3.8 K7: drawing the whole error line in `Red` measured 2.85:1. The glyph and
+/// the class word carry `err`; the **prose** is `text`. This reads the drawn
+/// buffer's cell styles rather than the source, so a revert to one red span fails.
+#[test]
+fn log_band_error_prose_is_body_text_not_red() {
+    use ratatui::style::Color;
+
+    let (mut app, _rx) = make_app();
+    app.update(Message::Resize(100, 30));
+    app.push_error_log("delivery to Aria failed".to_string());
+
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &app))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    // The error row is the log band's first content row: find the row holding the
+    // message, then read the cell where the prose starts.
+    let area = crate::ui::layout::Regions::of(
+        ratatui::layout::Rect::new(0, 0, 100, 30),
+        Mode::Roster,
+        false,
+    )
+    .log;
+    let mut found = None;
+    for y in area.y..area.y + area.height {
+        let row: String = (area.x..area.x + area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        if row.contains("delivery to Aria failed") {
+            let x = area.x
+                + row
+                    .find("delivery to Aria failed")
+                    .expect("row contains the message") as u16;
+            found = Some((x, y));
+            break;
+        }
+    }
+    let (x, y) = found.expect("the error is drawn in the log band");
+
+    // The prose is not red...
+    assert_ne!(
+        buffer[(x, y)].fg,
+        Color::Red,
+        "K7: error prose is still drawn in Red"
+    );
+    // ...and it is the palette's body text.
+    assert_eq!(
+        buffer[(x, y)].fg,
+        crate::ui::theme::TEXT,
+        "K7: prose is not `text`"
+    );
+    // The marker keeps the error colour, so the row still reads as a failure.
+    // It sits just inside the left border, so locate the glyph rather than
+    // assuming an offset from the panel edge.
+    let row: String = (area.x..area.x + area.width)
+        .map(|x| buffer[(x, y)].symbol().to_string())
+        .collect();
+    let marker_x = area.x + row.find('✕').expect("the ✕ marker is drawn") as u16;
+    assert_eq!(
+        buffer[(marker_x, y)].fg,
+        crate::ui::theme::ERR,
+        "K7: the ✕ marker lost its error colour"
+    );
+}

@@ -20,7 +20,7 @@
 use ratatui::{
     Frame,
     layout::{Position, Rect},
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -28,6 +28,7 @@ use ratatui::{
 use crate::app::{App, DelegationTrace};
 
 use super::pipeline::Grid;
+use super::theme;
 
 /// One cell of the dashed bus. `┄` is the horizontal dashed line, which reads as
 /// a wire rather than as a border.
@@ -150,7 +151,7 @@ fn render_risers(frame: &mut Frame, grid: &Grid) {
     if bus.height == 0 {
         return;
     }
-    let style = Style::default().fg(Color::DarkGray);
+    let style = Style::default().fg(theme::MUTED);
     let mut drawn: Vec<u16> = Vec::new();
     for cell in &grid.cells {
         // One riser per column, not one per card: a column of three cards hangs
@@ -239,7 +240,7 @@ fn put(frame: &mut Frame, at: Position, symbol: &str, style: Style) {
 /// The colour a trace is drawn in — exposed so tests can assert the mapping
 /// without reaching into the renderer.
 #[cfg(test)]
-pub fn trace_color(kind: crate::app::TraceKind) -> Color {
+pub fn trace_color(kind: crate::app::TraceKind) -> ratatui::style::Color {
     kind.color()
 }
 
@@ -366,9 +367,9 @@ mod tests {
     #[test]
     fn trace_kinds_have_distinct_colours() {
         use crate::app::TraceKind;
-        assert_eq!(trace_color(TraceKind::Out), Color::Cyan);
-        assert_eq!(trace_color(TraceKind::Report), Color::Green);
-        assert_eq!(trace_color(TraceKind::Fanout), Color::Yellow);
+        assert_eq!(trace_color(TraceKind::Out), theme::ACCENT);
+        assert_eq!(trace_color(TraceKind::Report), theme::OK);
+        assert_eq!(trace_color(TraceKind::Fanout), theme::WARN);
     }
 
     /// A path with no cells has no head, rather than panicking on the empty case.

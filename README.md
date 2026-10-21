@@ -214,14 +214,20 @@ the designer would name a skill it cannot load.
 | `PgUp` / `PgDn` | Move a viewport of cards (the selection follows and is revealed) |
 | `Enter` | Chat with the selected employee |
 | `i` / `Tab` | Type a goal for the selected employee without leaving the roster |
-| `m` | Pick a model for the selected employee |
-| `p` | Choose the working project |
+| `m` / `M` | Pick a model for the selected employee (`M` is a deprecated alias) |
+| `p` / `P` | Choose the working project (`P` is a deprecated alias) |
 | `Space` | Pause / resume the autonomous-task engine (new cron/watch fires queue) |
 | `s` | Pause / resume the selected employee's task |
+| `f` | Toggle focus mode — the sidebar and tasks panel collapse |
+| `Ctrl-F` | Toggle focus mode while a text field has the keyboard |
+| `Ctrl-P` / `Ctrl-K` | Open the command palette (not bound in the goal prompt or a picker's filter) |
+| `Ctrl-R` | Retry the bound error (when it is `actionable`) |
+| `Ctrl-Y` | Copy the error log, or the bound error |
+| `Ctrl-O` | Open the error detail panel |
 | `y` / `n` (reopen prompt) | Resume all / keep paused the tasks mywaker held at the last close |
-| `?` | Open the keybindings help overlay |
-| `Esc` | Back / leave chat |
-| `q` / `Ctrl-C` | Quit |
+| `?` | Open the keybindings help overlay — on the roster; in chat use `/help`, and in a text field `?` types a `?` |
+| `Esc` | Back / leave chat / restore focus mode. On the roster it quits only when no overlay, palette, error panel, or focus mode is up |
+| `q` / `Ctrl-C` | Quit (`Ctrl-C` interrupts instead, in chat) |
 | Click | Select the employee, project, or model you clicked |
 | Wheel | Scroll the employee grid, or page the chat transcript |
 
@@ -230,6 +236,10 @@ while dragging to copy text as usual. Clicking only moves the selection: opening
 a chat, adopting a project, and assigning a model still take `Enter`, so a stray
 click can't change anything. The wheel scrolls the grid's viewport without moving
 the selection, so looking around never changes what `Enter` would open.
+
+`M`, `P`, `Q`, `h`/`j`/`k`/`l`, and a bare `r` are **deprecated aliases**: they
+work through 0.22 and are marked `(deprecated)` in the help overlay. Removal is a
+0.23 change. `docs/keymap.md` §3.7 is the register.
 
 ## Model selection
 

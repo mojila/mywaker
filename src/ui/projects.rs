@@ -4,14 +4,14 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style, Stylize},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
 use crate::app::App;
 
-use super::layout;
+use super::{layout, theme};
 
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let [header_area, list_area] = layout::project_areas(area);
@@ -25,14 +25,14 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         .join(", ");
 
     let header = Paragraph::new(Line::from(vec![
-        Span::styled("projects ", Color::Cyan),
-        Span::styled(format!(" {}", roots), Color::Gray),
+        Span::styled("projects ", theme::ACCENT),
+        Span::styled(format!(" {}", roots), theme::TEXT),
         Span::styled(
             match active_name {
                 Some(name) => format!("  (selected: {name})"),
                 None => "  (Enter to select)".to_string(),
             },
-            Color::DarkGray,
+            theme::MUTED,
         ),
     ]));
     frame.render_widget(header, header_area);
@@ -44,7 +44,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             let active = active_name == Some(project.name.as_str());
             ListItem::new(Line::from(vec![
                 if active {
-                    Span::styled("✓ ", Color::Green)
+                    Span::styled("✓ ", theme::OK)
                 } else {
                     Span::raw("  ")
                 },
@@ -52,7 +52,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                     project.name.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!("  {}", project.path.display()), Color::DarkGray),
+                Span::styled(format!("  {}", project.path.display()), theme::MUTED),
             ]))
         })
         .collect();
@@ -60,7 +60,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     if items.is_empty() {
         let empty = Paragraph::new(Line::from(vec![Span::styled(
             "no projects — create a directory there and reopen with  p".to_string(),
-            Color::DarkGray,
+            theme::MUTED,
         )]))
         .block(
             Block::default()
@@ -84,8 +84,10 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                 .title(" projects ".bold().cyan()),
         )
         .highlight_style(
+            // K8: `selected_bg` **and** `selected_fg` (9.40:1).
             Style::default()
-                .bg(Color::DarkGray)
+                .bg(theme::SELECTED_BG)
+                .fg(theme::SELECTED_FG)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
